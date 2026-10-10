@@ -13787,3 +13787,61 @@ fn import_binding_references_record_uses_of_an_exported_wrapper_in_its_module() 
         .count();
     assert_eq!(direct, 3);
 }
+
+#[test]
+fn class_member_remediation_awaited_destructure_preserves_factory_boundaries() {
+    let info = parse(
+        r"
+        class Service { used() {} promiseOnly() {} generatorOnly() {} }
+        async function make() { return new Service(); }
+        function* generate() { return new Service(); }
+        const { used: alias } = await make();
+        const { promiseOnly } = make();
+        const { generatorOnly } = await generate();
+        ",
+    );
+    assert!(has_member_access(&info, "Service", "used"));
+    assert!(!has_member_access(&info, "Service", "promiseOnly"));
+    assert!(!has_member_access(&info, "Service", "generatorOnly"));
+
+    let imported = parse(
+        "import { make } from './service'; const { used } = await make(); const { promiseOnly } = make();",
+    );
+    let facts: Vec<_> = imported
+        .semantic_facts
+        .iter()
+        .filter_map(|fact| match fact {
+            SemanticFact::FactoryFnMemberAccess(access) => Some((
+                access.callee_name.as_str(),
+                access.member.as_str(),
+                access.awaited,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        facts,
+        [("make", "used", true), ("make", "promiseOnly", false)]
+    );
+}
+
+#[test]
+fn class_member_remediation_map_iteration_keeps_value_bindings_scoped() {
+    let info = parse(
+        r"
+        import { Item } from './lib';
+        const items = new Map<string, Item>();
+        for (const [, value] of items.entries()) value.entriesUsed();
+        items.forEach(value => value.callbackUsed());
+        items.forEach((other, value) => value.keyOnly());
+        for (const [value] of items.entries()) value.keyOnly();
+        function unrelated(items: unknown) {
+            items.forEach(value => value.unknownOnly());
+        }
+        ",
+    );
+    assert!(has_member_access(&info, "Item", "entriesUsed"));
+    assert!(has_member_access(&info, "Item", "callbackUsed"));
+    assert!(!has_member_access(&info, "Item", "keyOnly"));
+    assert!(!has_member_access(&info, "Item", "unknownOnly"));
+}

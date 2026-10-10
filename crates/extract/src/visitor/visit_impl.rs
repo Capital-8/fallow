@@ -5,7 +5,7 @@ use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_ast_visit::walk;
 use oxc_semantic::ScopeFlags;
-use oxc_span::Span;
+use oxc_span::{GetSpan, Span};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::path::PathBuf;
 
@@ -314,15 +314,17 @@ impl ModuleInfoExtractor {
             // direct factory-result access per statically named key. Dropping this
             // shape is what reported every member of a destructured factory result
             // as unused.
-            BindingPattern::ObjectPattern(pattern) if !awaited => {
+            BindingPattern::ObjectPattern(pattern) => {
                 let Some(keys) = super::destructured_factory_keys(pattern) else {
                     // A rest element or computed key can read any property.
-                    self.factory_whole_object_candidates.push(callee_name);
+                    if !awaited {
+                        self.factory_whole_object_candidates.push(callee_name);
+                    }
                     return;
                 };
                 for key in keys {
                     self.factory_unnamed_result_accesses
-                        .push((callee_name.clone(), key));
+                        .push((callee_name.clone(), key, awaited));
                 }
             }
             _ => {}
@@ -531,7 +533,13 @@ impl ModuleInfoExtractor {
         // A `this.<field>()` / `this.<field>` iteration receiver is class-scoped
         // so it matches the same class's qualified query-list key (issue #1821).
         let receiver_name = self.qualify_this_scope(&receiver_name);
-        let Some(element_type) = self.iterable_element_type_for(&receiver_name) else {
+        let map_value_type = (method_name == "forEach")
+            .then(|| self.map_value_type_for(&receiver_name))
+            .flatten();
+        let Some(element_type) = map_value_type
+            .clone()
+            .or_else(|| self.iterable_element_type_for(&receiver_name))
+        else {
             return;
         };
         let Some(first_arg) = expr.arguments.first() else {
@@ -553,7 +561,18 @@ impl ModuleInfoExtractor {
             _ => None,
         };
         if let Some(name) = param_name {
-            self.insert_class_binding_target(name, element_type);
+            if map_value_type.is_some() {
+                self.map_callback_value_bindings
+                    .insert(first_arg.span().start, (name, element_type));
+            } else {
+                self.insert_class_binding_target(name, element_type);
+            }
+        }
+    }
+
+    fn bind_map_callback_value(&mut self, start: u32) {
+        if let Some((binding, class_name)) = self.map_callback_value_bindings.remove(&start) {
+            self.record_scoped_class_binding(&binding, class_name);
         }
     }
 
@@ -587,21 +606,39 @@ impl ModuleInfoExtractor {
     }
 
     fn record_map_binding_value_type(&mut self, binding: String, value: String) {
-        if self.is_module_scope() {
+        let root = binding
+            .split_once('.')
+            .map_or(binding.as_str(), |(root, _)| root);
+        if let Some(index) = self
+            .scoped_direct_object_binding_roots
+            .iter()
+            .rposition(|roots| roots.contains(root))
+        {
+            self.scoped_map_binding_value_types[index].insert(binding, value);
+        } else {
             self.map_binding_value_types.insert(binding, value);
-        } else if let Some(scope) = self.scoped_map_binding_value_types.last_mut() {
-            scope.insert(binding, value);
         }
     }
 
     /// The value class of a map-typed receiver name (already `this`-qualified).
     fn map_value_type_for(&self, receiver_name: &str) -> Option<String> {
-        self.scoped_map_binding_value_types
+        let root = receiver_name
+            .split_once('.')
+            .map_or(receiver_name, |(root, _)| root);
+        for (scope, roots) in self
+            .scoped_map_binding_value_types
             .iter()
+            .zip(&self.scoped_direct_object_binding_roots)
             .rev()
-            .find_map(|scope| scope.get(receiver_name))
-            .or_else(|| self.map_binding_value_types.get(receiver_name))
-            .cloned()
+        {
+            if let Some(value) = scope.get(receiver_name) {
+                return Some(value.clone());
+            }
+            if roots.contains(root) {
+                return None;
+            }
+        }
+        self.map_binding_value_types.get(receiver_name).cloned()
     }
 
     /// The value class `V` of a `map.get(key)` expression when `map` is a
@@ -715,6 +752,31 @@ impl ModuleInfoExtractor {
             && let BindingPattern::BindingIdentifier(id) = &declarator.id
         {
             self.insert_class_binding_target(id.name.to_string(), element_type);
+        }
+    }
+
+    /// `Map.entries()` yields `[key, value]`; only the second binding has `V`.
+    fn bind_for_of_map_value(&mut self, stmt: &ForOfStatement<'_>) {
+        let Some(receiver_name) = static_member_object_name(&stmt.right) else {
+            return;
+        };
+        let Some(map_name) = receiver_name.strip_suffix(".entries()") else {
+            return;
+        };
+        let Some(value_type) = self.map_value_type_for(&self.qualify_this_scope(map_name)) else {
+            return;
+        };
+        let ForStatementLeft::VariableDeclaration(declaration) = &stmt.left else {
+            return;
+        };
+        let Some(declarator) = declaration.declarations.first() else {
+            return;
+        };
+        let BindingPattern::ArrayPattern(pattern) = &declarator.id else {
+            return;
+        };
+        if let Some(Some(BindingPattern::BindingIdentifier(value))) = pattern.elements.get(1) {
+            self.record_scoped_class_binding(value.name.as_str(), value_type);
         }
     }
 
@@ -1986,8 +2048,6 @@ impl<'a> ModuleInfoExtractor {
         if self.namespace_depth == 0 {
             self.scoped_array_binding_element_types
                 .push(FxHashMap::default());
-            self.scoped_map_binding_value_types
-                .push(FxHashMap::default());
             self.preseed_nested_declarations(statements);
         }
         self.preseed_direct_object_binding_targets(statements);
@@ -2007,7 +2067,6 @@ impl<'a> ModuleInfoExtractor {
         }
         if self.namespace_depth == 0 {
             self.scoped_array_binding_element_types.pop();
-            self.scoped_map_binding_value_types.pop();
         }
     }
 
@@ -2387,6 +2446,13 @@ impl<'a> ModuleInfoExtractor {
         declarator: &VariableDeclarator<'a>,
     ) {
         self.record_variable_declarator_metadata(declarator);
+        if let BindingPattern::BindingIdentifier(id) = &declarator.id {
+            self.record_map_binding_from_declaration(
+                id.name.to_string(),
+                declarator.type_annotation.as_deref(),
+                declarator.init.as_ref(),
+            );
+        }
 
         let Some(init) = &declarator.init else {
             self.record_uninitialized_variable_bindings(declarator);
@@ -2429,11 +2495,6 @@ impl<'a> ModuleInfoExtractor {
             self.record_object_array_member_binding_types(
                 id.name.as_str(),
                 declarator.type_annotation.as_deref(),
-            );
-            self.record_map_binding_from_declaration(
-                id.name.to_string(),
-                declarator.type_annotation.as_deref(),
-                Some(init),
             );
             if declarator.type_annotation.is_none()
                 && let Some(value) = self.map_get_value_type(init)
@@ -3149,8 +3210,6 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 .push(FxHashSet::default());
             self.scoped_array_binding_element_types
                 .push(FxHashMap::default());
-            self.scoped_map_binding_value_types
-                .push(FxHashMap::default());
             self.sanitizer_binding_stack.push(FxHashMap::default());
             self.literal_allowlist_binding_stack
                 .push(FxHashMap::default());
@@ -3173,7 +3232,6 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.nested_declaration_stack.pop();
             self.scoped_namespace_binding_names.pop();
             self.scoped_array_binding_element_types.pop();
-            self.scoped_map_binding_value_types.pop();
             self.sanitizer_binding_stack.pop();
             self.literal_allowlist_binding_stack.pop();
             self.risky_regex_binding_stack.pop();
@@ -3276,6 +3334,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         }
         self.push_var_owner_direct_object_binding_scope(direct_roots);
         self.push_function_declaration_scope(&func.params);
+        self.bind_map_callback_value(func.span.start);
         self.deferred_function_var_binding_roots.push(var_roots);
         self.function_depth += 1;
         let component_pushed = self.react_enter_function(func);
@@ -3318,6 +3377,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             .collect();
         self.push_var_owner_direct_object_binding_scope(direct_roots);
         self.push_function_declaration_scope(&expr.params);
+        self.bind_map_callback_value(expr.span.start);
         self.deferred_function_var_binding_roots.push(var_roots);
         self.function_depth += 1;
         let component_pushed = self.react_enter_arrow(expr);
@@ -3925,9 +3985,6 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.loop_object_property_values.push(objects);
         }
 
-        self.visit_for_statement_left(&stmt.left);
-        self.visit_expression(&stmt.right);
-
         let mut roots = FxHashSet::default();
         if let ForStatementLeft::VariableDeclaration(declaration) = &stmt.left
             && declaration.kind.is_lexical()
@@ -3941,6 +3998,9 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             );
         }
         self.push_direct_object_binding_scope(roots);
+        self.visit_for_statement_left(&stmt.left);
+        self.visit_expression(&stmt.right);
+        self.bind_for_of_map_value(stmt);
         self.visit_statement(&stmt.body);
         self.pop_direct_object_binding_scope();
 
@@ -4211,8 +4271,11 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             // first-level member belongs to the factory's class: in `f().a.b`, `b` is
             // read off whatever type `a` has, and the outer member expression's
             // object is a member expression, not a call, so it never matches here.
-            self.factory_unnamed_result_accesses
-                .push((callee_name, expr.property.name.to_string()));
+            self.factory_unnamed_result_accesses.push((
+                callee_name,
+                expr.property.name.to_string(),
+                false,
+            ));
         }
         if let Some(store_factory) = Self::inline_store_factory_receiver(&expr.object) {
             // `useFooStore().member` with no bound local: the generic receiver

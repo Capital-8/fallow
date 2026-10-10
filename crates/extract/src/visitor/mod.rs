@@ -448,9 +448,11 @@ pub(crate) struct ModuleInfoExtractor {
     /// binding name -> value class name. Class fields use the class-scoped
     /// `this@<id>.` key. A `<binding>.get(...)` result is then a receiver of `V`.
     map_binding_value_types: FxHashMap<String, String>,
-    /// Block/function-scoped map value types, with the same scoping as
-    /// `scoped_array_binding_element_types`.
+    /// Map value types aligned with `scoped_direct_object_binding_roots`, so
+    /// every lexical binding can hide an outer map even when its type is unknown.
     scoped_map_binding_value_types: Vec<FxHashMap<String, String>>,
+    /// Map callbacks awaiting their function scope, keyed by callback start.
+    map_callback_value_bindings: FxHashMap<u32, (String, String)>,
     /// Top-level local function name -> declared return element class
     /// (`Promise<T>` / `T`, non-builtin). Populated by a `visit_program` pre-pass
     /// so `Promise.all(arr.map(cb))` can type its result from a map callback whose
@@ -577,9 +579,9 @@ pub(crate) struct ModuleInfoExtractor {
     /// Callees of a factory call destructured opaquely (`const { a, ...rest } = f()`,
     /// a computed key). The returned class must be credited wholesale.
     factory_whole_object_candidates: Vec<String>,
-    /// `(callee, member)` for a factory result read without ever being named:
-    /// `f().member`, `const { member } = f()`.
-    factory_unnamed_result_accesses: Vec<(String, String)>,
+    /// `(callee, member, awaited)` for a factory result read without being named:
+    /// `f().member`, `const { member } = await f()`.
+    factory_unnamed_result_accesses: Vec<(String, String, bool)>,
     factory_return_candidates: Vec<FactoryReturnCandidate>,
     /// Same-file functions whose body returns a bare identifier (e.g.
     /// `useApi() { return api }`). Resolved against `binding_target_names` at
@@ -2336,9 +2338,9 @@ impl ModuleInfoExtractor {
             .map(|import| import.local_name.as_str())
             .collect();
         let mut deferred_facts = Vec::new();
-        for (callee_name, member) in inline_accesses {
+        for (callee_name, member, awaited) in inline_accesses {
             if let Some(class_name) = self.factory_return_functions.get(&callee_name) {
-                if !self.call_result_is_returned_value(&callee_name, false) {
+                if !self.call_result_is_returned_value(&callee_name, awaited) {
                     continue;
                 }
                 let object = class_name.clone();
@@ -2346,11 +2348,11 @@ impl ModuleInfoExtractor {
                 continue;
             }
             if imported_locals.contains(callee_name.as_str()) {
-                deferred_facts.push((callee_name, member));
+                deferred_facts.push((callee_name, member, awaited));
             }
         }
-        for (callee_name, member) in deferred_facts {
-            self.record_factory_fn_member_fact(callee_name, member, false);
+        for (callee_name, member, awaited) in deferred_facts {
+            self.record_factory_fn_member_fact(callee_name, member, awaited);
         }
     }
 
