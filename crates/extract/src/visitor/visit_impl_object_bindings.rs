@@ -503,6 +503,15 @@ impl ModuleInfoExtractor {
             .saturating_add(self.direct_object_binding_target_count)
     }
 
+    pub(super) fn record_scoped_class_binding(&mut self, binding: &str, class_name: String) {
+        self.record_direct_object_binding_target(
+            binding,
+            binding.to_string(),
+            class_name,
+            DirectObjectBindingScope::BindingOwner,
+        );
+    }
+
     fn record_direct_object_binding_target(
         &mut self,
         root_name: &str,
