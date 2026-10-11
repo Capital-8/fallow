@@ -7,8 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Prop-drilling findings can enforce CI gates.** Set `rules.prop-drilling` to
+  `error` to enforce chains, or `warn` for advisory findings, including under
+  `--fail-on-issues`. Source-hop overrides and suppressions control each chain.
+  Baselines, audit attribution and changed-hop scopes support incremental
+  adoption, and CI reports show the source location. The rule stays off by
+  default, and editor diagnostics stay hints. Thanks
+  [@miky-mfw](https://github.com/miky-mfw) for the request.
+  (Closes [#3327](https://github.com/fallow-rs/fallow/issues/3327))
+
+### Changed
+
+- **Existing `prop-drilling: "error"` settings now enforce CI.** Change the rule
+  to `warn` to retain advisory analysis after upgrading. Archived JSON reports
+  with `effective_severity: "error"` also render as errors; changing the current
+  configuration does not rewrite those reports.
+
 ### Fixed
 
+- **`fallow fix` preserves package.json formatting when removing dependencies.**
+  The writer retains indentation, line endings, property order and final-newline
+  style. Duplicate dependency names are removed together, including escaped JSON
+  names. New entries in empty JSONC `ignoreExports` and `rulePacks` arrays inherit
+  the parent trailing-comma style. Thanks [@motlin](https://github.com/motlin) for
+  the report.
+  (Closes [#3323](https://github.com/fallow-rs/fallow/issues/3323))
+- **Dependencies declared in standalone nested packages are recognized.**
+  An explicit workspace list no longer makes dependency checks overlook a nested
+  package's own manifest. Workspace membership stays the same. The guidance also
+  explains why root imports of npm workspace packages need a dependency declaration.
+  Thanks [@VariableVince](https://github.com/VariableVince) for the reports.
+  (Closes [#3324](https://github.com/fallow-rs/fallow/issues/3324),
+  [#3325](https://github.com/fallow-rs/fallow/issues/3325))
+- **Interface calls through typed class arrays credit the implementing members.**
+  Instance fields and constructor parameter properties provide array element types
+  before methods are read, including readonly and private fields. Uncalled members
+  remain findings. The parse cache rebuilds once after upgrade to replace the old
+  member evidence. Thanks [@VariableVince](https://github.com/VariableVince) for the
+  reproduction. (Closes [#3326](https://github.com/fallow-rs/fallow/issues/3326))
 - **The agent gate now audits the work tree that a git command names.** A
   session in one worktree can commit in another worktree with `git -C <dir>
   commit`. The gate audited the session tree, so a finding there blocked a

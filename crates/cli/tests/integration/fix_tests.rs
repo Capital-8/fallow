@@ -7,6 +7,72 @@
 use crate::common::{fixture_path, parse_json, run_fallow, run_fallow_in_root};
 
 #[test]
+fn fix_dependency_removal_handles_duplicate_names() {
+    assert_duplicate_dependency_removal(
+        "{\"name\":\"formatting\",\"main\":\"index.js\",\"dependencies\":{\"unused-package\":\"1\",\"used-package\":\"1\",\"unused-package\":\"2\"}}",
+        "{\"name\":\"formatting\",\"main\":\"index.js\",\"dependencies\":{\"used-package\":\"1\"}}",
+    );
+}
+
+#[test]
+fn fix_dependency_removal_handles_escaped_duplicate_names() {
+    assert_duplicate_dependency_removal(
+        "{\"name\":\"formatting\",\"main\":\"index.js\",\"description\":\"keep\\u0020spelling\",\"dependencies\":{\"unused\\u002dpackage\":\"1\",\"used\\u002dpackage\":\"1\",\"unused-package\":\"2\"}}",
+        "{\"name\":\"formatting\",\"main\":\"index.js\",\"description\":\"keep\\u0020spelling\",\"dependencies\":{\"used\\u002dpackage\":\"1\"}}",
+    );
+}
+
+fn assert_duplicate_dependency_removal(original: &str, expected: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), original).unwrap();
+    std::fs::write(root.join("index.js"), "import 'used-package';\n").unwrap();
+    let preview = run_fallow_in_root("fix", root, &["--dry-run", "--format", "json", "--quiet"]);
+    assert_eq!(preview.code, 0, "{}", preview.stderr);
+    let preview = parse_json(&preview);
+    let planned: Vec<_> = preview["fixes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|fix| fix["type"] == "remove_dependency")
+        .collect();
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0]["package"], "unused-package");
+    assert_eq!(
+        std::fs::read_to_string(root.join("package.json")).unwrap(),
+        original
+    );
+    let applied = run_fallow_in_root("fix", root, &["--yes", "--format", "json", "--quiet"]);
+    assert_eq!(applied.code, 0, "{}", applied.stderr);
+    let applied = parse_json(&applied);
+    let removals: Vec<_> = applied["fixes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|fix| fix["type"] == "remove_dependency")
+        .collect();
+    assert_eq!(removals.len(), 1);
+    assert_eq!(removals[0]["package"], "unused-package");
+    assert_eq!(removals[0]["applied"], true);
+    assert_eq!(
+        std::fs::read_to_string(root.join("package.json")).unwrap(),
+        expected
+    );
+    let repeated = run_fallow_in_root("fix", root, &["--yes", "--format", "json", "--quiet"]);
+    assert_eq!(repeated.code, 0, "{}", repeated.stderr);
+    assert!(
+        parse_json(&repeated)["fixes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("package.json")).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn fix_dependency_removal_preserves_manifest_formatting() {
     let cases = [
         (
