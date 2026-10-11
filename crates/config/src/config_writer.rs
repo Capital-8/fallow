@@ -496,6 +496,21 @@ mod tests {
     }
 
     #[test]
+    fn new_jsonc_ignore_exports_inherits_parent_trailing_commas() {
+        let input = "{\n\t// keep this\n\t\"rules\": {},\n}\n";
+        let output = add_ignore_exports_rule_to_string(
+            Path::new(".fallowrc.jsonc"),
+            input,
+            &[rule("src/a.ts")],
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            "{\n\t// keep this\n\t\"rules\": {},\n\t\"ignoreExports\": [\n\t\t{\n\t\t\t\"file\": \"src/a.ts\",\n\t\t\t\"exports\": [\"*\"],\n\t\t},\n\t],\n}\n"
+        );
+    }
+
+    #[test]
     fn merges_existing_json_ignore_exports_without_reordering_or_replacing() {
         let input = "{\n  \"ignoreExports\": [\n    { \"file\": \"src/a.ts\", \"exports\": [\"*\"] }\n  ],\n  \"rules\": {}\n}\n";
         let output = add_ignore_exports_rule_to_string(
