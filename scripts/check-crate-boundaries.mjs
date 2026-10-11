@@ -15,12 +15,18 @@ const FOUNDATION_CRATES = new Set([
   "fallow-engine",
   "fallow-output",
   "fallow-process",
+  "fallow-regress",
   "fallow-api",
 ]);
 const ANALYSIS_STARTERS = new Set(["fallow-core", "fallow-engine", "fallow-api"]);
 const PROTOCOL_ADAPTERS = new Set(["fallow-cli", "fallow-lsp", "fallow-mcp", "fallow-node"]);
 
 const boundaryRules = [
+  {
+    rule: "regex-must-remain-independent",
+    matches: ({ from }) => from === "fallow-regress",
+    message: ({ to }) => `fallow-regress must not depend on workspace crate ${to}`,
+  },
   {
     rule: "process-must-remain-independent",
     matches: ({ from }) => from === "fallow-process",

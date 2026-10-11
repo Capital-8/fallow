@@ -1,0 +1,101 @@
+[package]
+name = "fallow-regress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors = ["ridiculousfish <corydoras@ridiculousfish.com>"]
+license = "MIT OR Apache-2.0"
+description = "ECMAScript regex engine with shared compilation and matching budgets"
+documentation = "https://docs.rs/fallow-regress"
+readme = "README.md"
+keywords = ["regex", "regexp", "javascript"]
+categories = ["text-processing"]
+include = ["src/**", "tests/**", "LICENSE-*", "README.md", "UPSTREAM.md", "PROVENANCE.md", "rustfmt.toml"]
+autotests = false
+
+[lib]
+name = "regress"
+path = "src/lib.rs"
+
+[features]
+alloc = ["dep:hashbrown", "memchr/alloc"]
+backend-pikevm = []
+default = ["backend-pikevm", "std"]
+index-positions = []
+pattern = []
+prohibit-unsafe = []
+std = ["memchr/std"]
+utf16 = []
+
+[dependencies]
+hashbrown = { version = ">=0.16, <0.18", optional = true }
+memchr = { version = "2.4.0", default-features = false }
+
+[[test]]
+name = "anchored_optimization"
+path = "tests/anchored_optimization.rs"
+
+[[test]]
+name = "escape_tests"
+path = "tests/escape_tests.rs"
+
+[[test]]
+name = "pattern_tests"
+path = "tests/pattern_tests.rs"
+
+[[test]]
+name = "pcre_tests"
+path = "tests/pcre_tests.rs"
+
+[[test]]
+name = "replacement_tests"
+path = "tests/replacement_tests.rs"
+
+[[test]]
+name = "syntax_error_tests"
+path = "tests/syntax_error_tests.rs"
+
+[[test]]
+name = "tests"
+path = "tests/tests.rs"
+
+[[test]]
+name = "unicode_property_escapes"
+path = "tests/unicode_property_escapes.rs"
+
+[[test]]
+name = "unicodesets"
+path = "tests/unicodesets.rs"
+
+[[test]]
+name = "budget_tests"
+path = "tests/budget_tests.rs"
+
+[[test]]
+name = "node_budget_oracle"
+path = "tests/node_budget_oracle.rs"
+
+[[test]]
+name = "compile_budget_tests"
+path = "tests/compile_budget_tests.rs"
+
+[[test]]
+name = "named_backref_oracle"
+path = "tests/named_backref_oracle.rs"
+
+[[test]]
+name = "ampersand_oracle"
+path = "tests/ampersand_oracle.rs"
+
+[[test]]
+name = "string_set_oracle"
+path = "tests/string_set_oracle.rs"
+
+[[test]]
+name = "nested_negation_oracle"
+path = "tests/nested_negation_oracle.rs"
+
+[[test]]
+name = "default_stack_tests"
+path = "tests/default_stack_tests.rs"

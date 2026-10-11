@@ -1,0 +1,1544 @@
+#![cfg(all(feature = "std", feature = "utf16"))]
+use regress::{CompileBudget, CompileError, Flags, MatchBudget, Regex};
+use std::ops::Range;
+
+// Expectations use the pinned Node oracle, except the vi singleton controls.
+// Those follow the pinned TC39 algorithms, independently supported by JavaScriptCore.
+fn check(pattern: &str, flags: &str, text: &str, expected: Option<Vec<Option<Range<usize>>>>) {
+    let text: Vec<_> = text.encode_utf16().collect();
+    for no_opt in [false, true] {
+        for bounded in [false, true] {
+            let mut flags = Flags::from(flags);
+            flags.no_opt = no_opt;
+            let regex = if bounded {
+                let mut budget = CompileBudget::new(100_000_000, 1_000_000_000, 128);
+                Regex::from_unicode_with_limits(pattern.chars().map(u32::from), flags, &mut budget)
+                    .unwrap()
+            } else {
+                Regex::with_flags(pattern, flags).unwrap()
+            };
+            let actual = regex
+                .find_from_utf16(&text, 0)
+                .next()
+                .map(|m| m.groups().collect::<Vec<_>>());
+            assert_eq!(
+                actual, expected,
+                "pattern={pattern} text={text:?} no_opt={no_opt} bounded={bounded}"
+            );
+            let mut budget = MatchBudget::new(1_000_000);
+            let actual = regex
+                .find_from_utf16_with_budget(&text, 0, &mut budget)
+                .unwrap()
+                .map(|m| m.groups().collect::<Vec<_>>());
+            assert_eq!(
+                actual, expected,
+                "bounded match pattern={pattern} text={text:?} no_opt={no_opt} bounded={bounded}"
+            );
+        }
+    }
+}
+fn syntax(pattern: &str, flags: &str) {
+    for no_opt in [false, true] {
+        let mut flags = Flags::from(flags);
+        flags.no_opt = no_opt;
+        assert!(Regex::with_flags(pattern, flags).is_err(), "{pattern}");
+        let mut budget = CompileBudget::new(100_000_000, 1_000_000_000, 128);
+        assert!(
+            matches!(
+                Regex::from_unicode_with_limits(pattern.chars().map(u32::from), flags, &mut budget),
+                Err(CompileError::Syntax(_))
+            ),
+            "{pattern}"
+        );
+    }
+}
+
+#[test]
+fn node_case_00() {
+    check(r###"[^\q{a}]"###, r###"v"###, r###""###, None);
+    check(r###"[^\q{a}]"###, r###"v"###, r###"a"###, None);
+    check(
+        r###"[^\q{a}]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a}]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a}]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a}]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a}]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(1..2)]),
+    );
+    check(
+        r###"[^\q{a}]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a}]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a}]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_01() {
+    check(r###"[^\q{a|b}]"###, r###"v"###, r###""###, None);
+    check(r###"[^\q{a|b}]"###, r###"v"###, r###"a"###, None);
+    check(
+        r###"[^\q{a|b}]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(r###"[^\q{a|b}]"###, r###"v"###, r###"b"###, None);
+    check(
+        r###"[^\q{a|b}]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a|b}]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(r###"[^\q{a|b}]"###, r###"v"###, r###"ab"###, None);
+    check(
+        r###"[^\q{a|b}]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a|b}]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a|b}]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_02() {
+    syntax(r###"[^\q{ab}]"###, r###"v"###);
+}
+
+#[test]
+fn node_case_03() {
+    syntax(r###"[^\q{}]"###, r###"v"###);
+}
+
+#[test]
+fn node_case_04() {
+    syntax(r###"[^\q{|a}]"###, r###"v"###);
+}
+
+#[test]
+fn node_case_05() {
+    syntax(r###"[^\q{a|}]"###, r###"v"###);
+}
+
+#[test]
+fn node_case_06() {
+    check(
+        r###"[\q{}]"###,
+        r###"v"###,
+        r###""###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..0)]),
+    );
+}
+
+#[test]
+fn node_case_07() {
+    check(
+        r###"[\q{|a}]"###,
+        r###"v"###,
+        r###""###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|a}]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{|a}]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|a}]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|a}]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|a}]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|a}]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{|a}]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|a}]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|a}]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..0)]),
+    );
+}
+
+#[test]
+fn node_case_08() {
+    check(
+        r###"[\q{a|}]"###,
+        r###"v"###,
+        r###""###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{a|}]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{a|}]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..0)]),
+    );
+}
+
+#[test]
+fn node_case_09() {
+    check(r###"[^[\q{ab}]&&[a]]"###, r###"v"###, r###""###, None);
+    check(
+        r###"[^[\q{ab}]&&[a]]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[a]]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[a]]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[a]]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[a]]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[a]]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[a]]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[a]]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[a]]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_10() {
+    check(r###"[^[a]&&[\q{ab}]]"###, r###"v"###, r###""###, None);
+    check(
+        r###"[^[a]&&[\q{ab}]]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]&&[\q{ab}]]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]&&[\q{ab}]]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]&&[\q{ab}]]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]&&[\q{ab}]]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]&&[\q{ab}]]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]&&[\q{ab}]]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]&&[\q{ab}]]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]&&[\q{ab}]]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_11() {
+    syntax(r###"[^[\q{ab}]--[\q{ab}]]"###, r###"v"###);
+}
+
+#[test]
+fn node_case_12() {
+    check(r###"[^[a]--[\q{ab}]]"###, r###"v"###, r###""###, None);
+    check(r###"[^[a]--[\q{ab}]]"###, r###"v"###, r###"a"###, None);
+    check(
+        r###"[^[a]--[\q{ab}]]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{ab}]]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{ab}]]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{ab}]]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{ab}]]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(1..2)]),
+    );
+    check(
+        r###"[^[a]--[\q{ab}]]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{ab}]]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{ab}]]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_13() {
+    syntax(r###"[^[\q{ab}]&&[\q{cd}]]"###, r###"v"###);
+}
+
+#[test]
+fn node_case_14() {
+    check(r###"[^[\q{ab}]&&[\q{a}]]"###, r###"v"###, r###""###, None);
+    check(
+        r###"[^[\q{ab}]&&[\q{a}]]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[\q{a}]]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[\q{a}]]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[\q{a}]]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[\q{a}]]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[\q{a}]]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[\q{a}]]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[\q{a}]]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{ab}]&&[\q{a}]]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_15() {
+    syntax(r###"[^[^\q{ab}]&&[a]]"###, r###"v"###);
+}
+
+#[test]
+fn node_case_16() {
+    check(r###"[^[^\q{a}]&&[b]]"###, r###"v"###, r###""###, None);
+    check(
+        r###"[^[^\q{a}]&&[b]]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[^\q{a}]&&[b]]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(r###"[^[^\q{a}]&&[b]]"###, r###"v"###, r###"b"###, None);
+    check(
+        r###"[^[^\q{a}]&&[b]]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[^\q{a}]&&[b]]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[^\q{a}]&&[b]]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[^\q{a}]&&[b]]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[^\q{a}]&&[b]]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[^\q{a}]&&[b]]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_17() {
+    check(r###"[^\q{a}&]"###, r###"v"###, r###""###, None);
+    check(r###"[^\q{a}&]"###, r###"v"###, r###"a"###, None);
+    check(
+        r###"[^\q{a}&]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a}&]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a}&]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(r###"[^\q{a}&]"###, r###"v"###, r###"&"###, None);
+    check(
+        r###"[^\q{a}&]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(1..2)]),
+    );
+    check(
+        r###"[^\q{a}&]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a}&]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a}&]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_18() {
+    syntax(r###"[^\q{ab}&]"###, r###"v"###);
+}
+
+#[test]
+fn node_case_19() {
+    check(
+        r###"[^[\p{RGI_Emoji}]&&[a]]"###,
+        r###"v"###,
+        r###""###,
+        None,
+    );
+    check(
+        r###"[^[\p{RGI_Emoji}]&&[a]]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\p{RGI_Emoji}]&&[a]]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\p{RGI_Emoji}]&&[a]]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\p{RGI_Emoji}]&&[a]]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\p{RGI_Emoji}]&&[a]]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\p{RGI_Emoji}]&&[a]]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\p{RGI_Emoji}]&&[a]]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\p{RGI_Emoji}]&&[a]]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\p{RGI_Emoji}]&&[a]]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_20() {
+    check(
+        r###"[^[a]--[\p{RGI_Emoji}]]"###,
+        r###"v"###,
+        r###""###,
+        None,
+    );
+    check(
+        r###"[^[a]--[\p{RGI_Emoji}]]"###,
+        r###"v"###,
+        r###"a"###,
+        None,
+    );
+    check(
+        r###"[^[a]--[\p{RGI_Emoji}]]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\p{RGI_Emoji}]]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\p{RGI_Emoji}]]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\p{RGI_Emoji}]]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\p{RGI_Emoji}]]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(1..2)]),
+    );
+    check(
+        r###"[^[a]--[\p{RGI_Emoji}]]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\p{RGI_Emoji}]]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\p{RGI_Emoji}]]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_21() {
+    syntax(r###"[^\p{RGI_Emoji}]"###, r###"v"###);
+}
+
+#[test]
+fn node_case_22() {
+    syntax(r###"[\P{RGI_Emoji}]"###, r###"v"###);
+}
+
+#[test]
+fn node_case_23() {
+    check(r###"[^[\q{}]&&[a]]"###, r###"v"###, r###""###, None);
+    check(
+        r###"[^[\q{}]&&[a]]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{}]&&[a]]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{}]&&[a]]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{}]&&[a]]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{}]&&[a]]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{}]&&[a]]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{}]&&[a]]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{}]&&[a]]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[\q{}]&&[a]]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_24() {
+    check(r###"[^[a]--[\q{}]]"###, r###"v"###, r###""###, None);
+    check(r###"[^[a]--[\q{}]]"###, r###"v"###, r###"a"###, None);
+    check(
+        r###"[^[a]--[\q{}]]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{}]]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{}]]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{}]]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{}]]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(1..2)]),
+    );
+    check(
+        r###"[^[a]--[\q{}]]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{}]]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^[a]--[\q{}]]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_25() {
+    syntax(r###"[^[\q{}]--[a]]"###, r###"v"###);
+}
+
+#[test]
+fn node_case_26() {
+    check(r###"[\q{a|b}]"###, r###"vi"###, r###""###, None);
+    check(
+        r###"[\q{a|b}]"###,
+        r###"vi"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{a|b}]"###,
+        r###"vi"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{a|b}]"###,
+        r###"vi"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{a|b}]"###,
+        r###"vi"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(r###"[\q{a|b}]"###, r###"vi"###, r###"&"###, None);
+    check(
+        r###"[\q{a|b}]"###,
+        r###"vi"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(r###"[\q{a|b}]"###, r###"vi"###, r###"cd"###, None);
+    check(r###"[\q{a|b}]"###, r###"vi"###, r###"!"###, None);
+    check(r###"[\q{a|b}]"###, r###"vi"###, r###"😀"###, None);
+}
+
+#[test]
+fn node_case_27() {
+    check(r###"[^\q{a|b}]"###, r###"vi"###, r###""###, None);
+    check(r###"[^\q{a|b}]"###, r###"vi"###, r###"a"###, None);
+    check(r###"[^\q{a|b}]"###, r###"vi"###, r###"A"###, None);
+    check(r###"[^\q{a|b}]"###, r###"vi"###, r###"b"###, None);
+    check(r###"[^\q{a|b}]"###, r###"vi"###, r###"B"###, None);
+    check(
+        r###"[^\q{a|b}]"###,
+        r###"vi"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(r###"[^\q{a|b}]"###, r###"vi"###, r###"ab"###, None);
+    check(
+        r###"[^\q{a|b}]"###,
+        r###"vi"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a|b}]"###,
+        r###"vi"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\q{a|b}]"###,
+        r###"vi"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_28() {
+    check(r###"[^\p{RGI_Emoji}&&a]"###, r###"v"###, r###""###, None);
+    check(
+        r###"[^\p{RGI_Emoji}&&a]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\p{RGI_Emoji}&&a]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\p{RGI_Emoji}&&a]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\p{RGI_Emoji}&&a]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\p{RGI_Emoji}&&a]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\p{RGI_Emoji}&&a]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\p{RGI_Emoji}&&a]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\p{RGI_Emoji}&&a]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^\p{RGI_Emoji}&&a]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_29() {
+    check(r###"[^a--\p{RGI_Emoji}]"###, r###"v"###, r###""###, None);
+    check(r###"[^a--\p{RGI_Emoji}]"###, r###"v"###, r###"a"###, None);
+    check(
+        r###"[^a--\p{RGI_Emoji}]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^a--\p{RGI_Emoji}]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^a--\p{RGI_Emoji}]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^a--\p{RGI_Emoji}]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^a--\p{RGI_Emoji}]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(1..2)]),
+    );
+    check(
+        r###"[^a--\p{RGI_Emoji}]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^a--\p{RGI_Emoji}]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[^a--\p{RGI_Emoji}]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..2)]),
+    );
+}
+
+#[test]
+fn node_case_30() {
+    check(
+        r###"[\q{}a]"###,
+        r###"v"###,
+        r###""###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}a]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{}a]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}a]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}a]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}a]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}a]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{}a]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}a]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{}a]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..0)]),
+    );
+}
+
+#[test]
+fn node_case_31() {
+    check(
+        r###"[a\q{}]"###,
+        r###"v"###,
+        r###""###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[a\q{}]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[a\q{}]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[a\q{}]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[a\q{}]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[a\q{}]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[a\q{}]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[a\q{}]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[a\q{}]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[a\q{}]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..0)]),
+    );
+}
+
+#[test]
+fn node_case_32() {
+    check(
+        r###"[\q{|ab}a]"###,
+        r###"v"###,
+        r###""###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|ab}a]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{|ab}a]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|ab}a]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|ab}a]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|ab}a]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|ab}a]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..2)]),
+    );
+    check(
+        r###"[\q{|ab}a]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|ab}a]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{|ab}a]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..0)]),
+    );
+}
+
+#[test]
+fn node_case_33() {
+    check(
+        r###"[\q{a|}b]"###,
+        r###"v"###,
+        r###""###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}b]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{a|}b]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}b]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{a|}b]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}b]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}b]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{a|}b]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}b]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|}b]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..0)]),
+    );
+}
+
+#[test]
+fn node_case_34() {
+    check(
+        r###"[\q{ab|}a]"###,
+        r###"v"###,
+        r###""###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{ab|}a]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{ab|}a]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{ab|}a]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{ab|}a]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{ab|}a]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{ab|}a]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..2)]),
+    );
+    check(
+        r###"[\q{ab|}a]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{ab|}a]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{ab|}a]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..0)]),
+    );
+}
+
+#[test]
+fn node_case_35() {
+    check(
+        r###"[\q{a|ab|}]"###,
+        r###"v"###,
+        r###""###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|ab|}]"###,
+        r###"v"###,
+        r###"a"###,
+        Some(vec![Some(0..1)]),
+    );
+    check(
+        r###"[\q{a|ab|}]"###,
+        r###"v"###,
+        r###"A"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|ab|}]"###,
+        r###"v"###,
+        r###"b"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|ab|}]"###,
+        r###"v"###,
+        r###"B"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|ab|}]"###,
+        r###"v"###,
+        r###"&"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|ab|}]"###,
+        r###"v"###,
+        r###"ab"###,
+        Some(vec![Some(0..2)]),
+    );
+    check(
+        r###"[\q{a|ab|}]"###,
+        r###"v"###,
+        r###"cd"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|ab|}]"###,
+        r###"v"###,
+        r###"!"###,
+        Some(vec![Some(0..0)]),
+    );
+    check(
+        r###"[\q{a|ab|}]"###,
+        r###"v"###,
+        r###"😀"###,
+        Some(vec![Some(0..0)]),
+    );
+}

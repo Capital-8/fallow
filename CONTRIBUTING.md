@@ -139,6 +139,7 @@ The workspace follows the ownership boundaries in
 | `crates/types/` | Shared typed contracts, issue metadata, suppressions, and envelope data. |
 | `crates/config/` | Configuration loading, typed configuration, presets, and workspace discovery. |
 | `crates/process/` | Shared child-process lifecycle and cross-platform process-tree termination. |
+| `crates/regex/` | ECMAScript regex compilation and matching with shared budgets, maintained as `fallow-regress`. |
 | `crates/extract/` | Parser-facing facts for JavaScript, TypeScript, framework files, MDX, and CSS. |
 | `crates/graph/` | Module graph construction, import resolution, dependency traversal, cycles, and impact facts. |
 | `crates/security/` | Shared security matcher catalogue and candidate helpers. |

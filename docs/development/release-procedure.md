@@ -7,6 +7,13 @@ invariants in this file.
 
 ## Preflight
 
+Before the first `fallow-regress` publication, verify the package name and the
+maintainer's publication rights or trusted-publisher configuration on crates.io.
+A successful local package build or an available name does not establish those
+rights. Publish this independent package before `fallow-graph` consumes it, and
+wait for registry index availability. A local-registry simulation is preparation;
+verify an actual crates.io-backed downstream installation after publication.
+
 1. Read `docs/development/quality-gates.md`, the release row in
    `docs/development/task-context-map.md`, and
    `docs/development/release-security.md`.

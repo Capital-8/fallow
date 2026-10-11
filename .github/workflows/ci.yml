@@ -136,6 +136,7 @@ jobs:
               - '.config/nextest.toml'
               - 'rust-toolchain.toml'
             windows-rust:
+              - 'crates/regex/**'
               - 'crates/core/src/discover/walk.rs'
               - 'crates/core/src/plugins/manifest_entries.rs'
               - 'crates/core/src/plugins/mod.rs'
@@ -669,8 +670,13 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
           retention-days: 14
+      - name: Test regex engine compatibility
+        shell: bash
+        run: |
+          cargo test -p fallow-regress --no-fail-fast
+          cargo test -p fallow-regress --no-default-features --features std,utf16 --no-fail-fast
       - name: Clippy platform-specific paths
-        run: cargo clippy -p fallow-cli -p fallow-core -p fallow-engine -p fallow-lsp -p fallow-mcp -p fallow-graph -p fallow-api -p fallow-multicall -p fallow-config -p fallow-process -p fallow-types --all-targets -- -D warnings
+        run: cargo clippy -p fallow-cli -p fallow-core -p fallow-engine -p fallow-lsp -p fallow-mcp -p fallow-graph -p fallow-api -p fallow-multicall -p fallow-config -p fallow-process -p fallow-types -p fallow-regress --all-targets -- -D warnings
 
   # The drift harness runs in its own Windows job, in parallel with the job
   # above. It has the same trigger, so a change that the job above tests also

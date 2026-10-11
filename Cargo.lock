@@ -1459,6 +1459,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fallow-regress"
+version = "3.33.1"
+dependencies = [
+ "hashbrown 0.16.1",
+ "memchr",
+]
+
+[[package]]
 name = "fallow-security"
 version = "3.33.1"
 dependencies = [

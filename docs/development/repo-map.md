@@ -8,6 +8,8 @@ Use this file for a fast architectural map before editing or reviewing.
   metadata.
 - `crates/types/`: shared discovery, extraction, reporting, and suppression
   types.
+- `crates/regex/`: maintained ECMAScript regex engine with shared compilation
+  and matching budgets. Package provenance is in `crates/regex/PROVENANCE.md`.
 - `crates/extract/`: Oxc parsing, AST extraction, caches, complexity, and
   component file handling.
 - `crates/graph/`: import resolution, module graph construction, reachability,

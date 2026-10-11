@@ -18,6 +18,7 @@ The core crates are:
 | `fallow-types` | Shared typed contracts, issue metadata, suppressions, and envelope data. |
 | `fallow-config` | Config loading and typed configuration. |
 | `fallow-process` | Shared child-process lifecycle and process-tree termination. |
+| `fallow-regress` | Independent ECMAScript regex engine with shared compilation and matching budgets. |
 | `fallow-extract` | Parser-facing facts from source files. |
 | `fallow-graph` | Module graph, dependency traversal, cycles, and impact facts. |
 | `fallow-security` | Security matcher catalogue and candidate helpers. |
@@ -35,6 +36,9 @@ The protocol adapters are `fallow-cli`, `fallow-lsp`, `fallow-mcp`, and
 - Foundation and analysis crates must not depend on protocol adapters.
 - `fallow-process` is an independent infrastructure foundation. It must not
   depend on another workspace crate.
+- `fallow-regress` is an independent foundation and must not depend on another
+  workspace crate. Its upstream licensing and maintenance boundary are described
+  in [the package provenance](../crates/regex/PROVENANCE.md).
 - `fallow-core` is a backend implementation crate, not a supported embedder
   surface. `fallow-engine` owns the adapter boundary and is the only product
   crate that may depend on it directly.

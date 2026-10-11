@@ -347,6 +347,36 @@ test("the Windows clippy step lints every crate with Windows-specific code", () 
   );
 });
 
+test("regex package changes run Windows compatibility and lint", () => {
+  const workflow = readWorkflow(".github/workflows/ci.yml");
+  const changes = indentedBlock(workflow, "windows-rust", 12);
+  const job = indentedBlock(workflow, "windows-rust", 2);
+  const paths = listedPaths(changes);
+  for (const path of [
+    "crates/regex/src/parse.rs",
+    "crates/regex/tests/budget_tests.rs",
+    "crates/regex/Cargo.toml",
+  ]) {
+    assert.ok(matchesListedPath(paths, path), `Windows coverage must run for ${path}`);
+  }
+  const compatibility = job
+    .split(/^ {6}- /mu)
+    .find((step) => step.startsWith("name: Test regex engine compatibility\n"));
+  assert.ok(compatibility, "Windows must run regex compatibility");
+  assert.match(
+    compatibility,
+    /^ {8}shell: bash$/mu,
+    "both native test commands must fail the step when either command fails",
+  );
+  assert.match(job, /cargo test -p fallow-regress --no-fail-fast/u);
+  assert.match(
+    job,
+    /cargo test -p fallow-regress --no-default-features --features std,utf16 --no-fail-fast/u,
+  );
+  const clippy = job.split("\n").find((line) => line.includes("cargo clippy"));
+  assert.match(clippy, /-p fallow-regress(?: |$)/u);
+});
+
 test("regular CI keeps affected checks on Ubuntu", () => {
   const workflow = readWorkflow(".github/workflows/ci.yml");
   const npmPackage = JSON.parse(readFileSync("npm/fallow/package.json", "utf8"));
@@ -435,7 +465,7 @@ test("regular CI keeps affected checks on Ubuntu", () => {
   assert.match(windowsRustJob, /name: nextest-junit-windows-rust/);
   assert.match(
     windowsRustJob,
-    /^[ \t]+run: cargo clippy -p fallow-cli -p fallow-core -p fallow-engine -p fallow-lsp -p fallow-mcp -p fallow-graph -p fallow-api -p fallow-multicall -p fallow-config -p fallow-process -p fallow-types --all-targets -- -D warnings$/m,
+    /^[ \t]+run: cargo clippy -p fallow-cli -p fallow-core -p fallow-engine -p fallow-lsp -p fallow-mcp -p fallow-graph -p fallow-api -p fallow-multicall -p fallow-config -p fallow-process -p fallow-types -p fallow-regress --all-targets -- -D warnings$/m,
   );
   assert.match(windowsTypeAwareJob, /needs: changes/);
   assert.match(windowsTypeAwareJob, /if: "?needs\.changes\.outputs\.windows-type-aware == 'true'/);
@@ -577,6 +607,18 @@ test("release runs Zed verification on macOS and Windows without credentials", (
   assert.match(job, /cargo test --manifest-path editors\/zed\/Cargo.toml/);
   assert.match(job, /cargo build --target wasm32-wasip2 --manifest-path editors\/zed\/Cargo.toml/);
   assert.match(job, /cargo fmt --check --manifest-path editors\/zed\/Cargo.toml/);
+});
+
+test("release publishes the independent regex package before graph", () => {
+  const job = indentedBlock(readWorkflow(".github/workflows/release.yml"), "publish-crates", 2);
+  const order =
+    job
+      .match(/for crate in ([^;]+); do/u)?.[1]
+      .trim()
+      .split(/\s+/u) ?? [];
+  assert.ok(order.includes("fallow-regress"), "regex package must be published");
+  assert.ok(order.includes("fallow-graph"), "graph package must be published");
+  assert.ok(order.indexOf("fallow-regress") < order.indexOf("fallow-graph"));
 });
 
 test("release publication waits for the aggregate verification gate", () => {

@@ -56,3 +56,29 @@ sais = "sais"
 # Candle API identifiers used by the local similar-code model implementation.
 mmaped = "mmaped"
 arange = "arange"
+
+# Preserve the upstream helper identifier and deliberate regex-match tokens.
+[type.rust.extend-identifiers]
+matc = "matc"
+FOObar = "FOObar"
+fo = "fo"
+
+# Expected PCRE substrings and Unicode general-category spelling.
+[type.regex-pcre-fixtures]
+extend-glob = ["pcre_tests.rs"]
+[type.regex-pcre-fixtures.extend-identifiers]
+Mis = "Mis"
+abd = "abd"
+ABD = "ABD"
+Nd = "Nd"
+
+# Unicode script names, aliases and category names are semantic data.
+[type.regex-unicode-data]
+extend-glob = ["unicodetables.rs", "unicode_property_escapes.rs"]
+extend-ignore-re = ['\\u\{[0-9A-Fa-f]{1,6}\}']
+[type.regex-unicode-data.extend-words]
+Nd = "Nd"
+Tham = "Tham"
+Vai = "Vai"
+Beng = "Beng"
+Maka = "Maka"

@@ -74,6 +74,31 @@ test("findCrateBoundaryViolations rejects protocol and analysis back-edges", () 
   );
 });
 
+test("regex foundation rejects workspace dependencies while graph may consume it", () => {
+  assert.deepEqual(
+    findCrateBoundaryViolations(
+      metadataFor({
+        "fallow-regress": ["memchr"],
+        "fallow-graph": ["fallow-regress"],
+      }),
+    ),
+    [],
+  );
+  assert.deepEqual(
+    findCrateBoundaryViolations(
+      metadataFor({
+        "fallow-regress": ["fallow-types", "fallow-graph"],
+        "fallow-types": [],
+        "fallow-graph": [],
+      }),
+    ).map(({ rule, from, to }) => ({ rule, from, to })),
+    [
+      { rule: "regex-must-remain-independent", from: "fallow-regress", to: "fallow-types" },
+      { rule: "regex-must-remain-independent", from: "fallow-regress", to: "fallow-graph" },
+    ],
+  );
+});
+
 test("semantic protocol ownership cannot move into protocol adapters", () => {
   const adapterFiles = [
     ["fallow-cli", "crates/cli/src/semantic_queries.rs"],
