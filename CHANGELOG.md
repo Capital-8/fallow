@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Local subclasses now credit inherited members through namespace imports.**
+  Proven static and instance reads resolve to the declaring class, including
+  renamed re-exports. Shadowed receiver bindings no longer hide unused members
+  on a bare imported base. The parse cache version advances to 341 so warm
+  caches use the corrected receiver provenance and qualified member facts.
+
 - **The agent gate now audits the work tree that a git command names.** A
   session in one worktree can commit in another worktree with `git -C <dir>
   commit`. The gate audited the session tree, so a finding there blocked a

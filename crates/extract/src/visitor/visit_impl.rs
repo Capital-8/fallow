@@ -33,10 +33,9 @@ use super::helpers::{
     extract_class_generic_instance_bindings, extract_class_members,
     extract_class_type_parameter_names, extract_concat_parts, extract_custom_element_tag_reference,
     extract_custom_elements_define, extract_implemented_interface_names,
-    extract_nested_type_bindings, extract_query_list_element_type, extract_super_class_name,
-    extract_super_class_type_args, extract_type_annotation_name, extract_type_reference_name,
-    has_angular_class_decorator, has_angular_plural_query_decorator,
-    infer_array_binding_element_type, is_meta_url_arg, lit_custom_element_decorator,
+    extract_query_list_element_type, extract_super_class_name, extract_super_class_type_args,
+    extract_type_annotation_name, extract_type_reference_name, has_angular_class_decorator,
+    has_angular_plural_query_decorator, is_meta_url_arg, lit_custom_element_decorator,
     lit_custom_element_tag, map_value_type_from_new, map_value_type_from_type,
     regex_pattern_to_suffix, return_type_element_name, ts_import_type_qualifier_root,
 };
@@ -263,14 +262,90 @@ impl ModuleInfoExtractor {
         // is checked unconditionally. Strict (cross-module) eligibility additionally
         // requires a terminal body, so `const ui = createUi()` cannot bind a value
         // the factory only returns on some paths. See issue #1858.
-        if let Some(properties) = function_body_returns_object_shape(body) {
+        let properties = function_body_returns_object_shape(body);
+        if let Some(properties) = &properties {
             let is_strict_eligible = strict_eligible && function_body_is_terminal(body);
             self.factory_return_object_candidates
                 .push(super::FactoryReturnObjectCandidate {
                     fn_name: name.to_string(),
                     is_strict_eligible,
-                    properties,
+                    properties: properties.clone(),
                 });
+        }
+        self.record_factory_binding_producer(name, input, body, properties, returns_promise);
+    }
+
+    fn record_factory_binding_producer(
+        &mut self,
+        name: &str,
+        input: FactoryReturnFunctionInput<'_, '_>,
+        body: BodyRef<'_, '_>,
+        properties: Option<Vec<(String, super::ObjectPropValueRef)>>,
+        returns_promise: bool,
+    ) {
+        if self.capture_subclass_provenance {
+            self.record_binding_declaration(name, input.binding_span);
+            let result = visit_factory_returns::function_body_returns_new_class_target(body)
+                .map(
+                    |(target_name, target_reference_span)| super::BindingClassProof {
+                        target_name,
+                        target_reference_span,
+                        requirements: Vec::new(),
+                    },
+                )
+                .or_else(|| {
+                    input.return_type.and_then(|annotation| {
+                        let (target_name, target_reference_span) = if returns_promise {
+                            let (name, origin) = super::helpers::return_type_element_target(
+                                &annotation.type_annotation,
+                            )?;
+                            (name, origin?)
+                        } else {
+                            (
+                                extract_type_annotation_name(annotation)?,
+                                super::helpers::extract_type_reference_origin(
+                                    &annotation.type_annotation,
+                                )?,
+                            )
+                        };
+                        Some(super::BindingClassProof {
+                            target_name,
+                            target_reference_span,
+                            requirements: Vec::new(),
+                        })
+                    })
+                });
+            let shape = properties
+                .into_iter()
+                .flatten()
+                .filter_map(|(path, value)| {
+                    let super::ObjectPropValueRef::Class(target_name, Some(target_reference_span)) =
+                        value
+                    else {
+                        return None;
+                    };
+                    Some((
+                        path,
+                        super::BindingClassProof {
+                            target_name,
+                            target_reference_span,
+                            requirements: Vec::new(),
+                        },
+                    ))
+                })
+                .collect();
+            self.register_binding_producer(
+                name,
+                super::BindingProducer {
+                    name: name.to_string(),
+                    declaration_span: input.binding_span,
+                    result,
+                    shape,
+                    is_async: input.is_async,
+                    is_generator: input.is_generator,
+                    is_static_method: false,
+                },
+            );
         }
     }
 
@@ -303,6 +378,24 @@ impl ModuleInfoExtractor {
             BindingPattern::BindingIdentifier(id)
                 if self.factory_return_candidates.len() < MAX_FACTORY_RETURN_CANDIDATES =>
             {
+                if self.capture_subclass_provenance {
+                    let call = match unwrap_static_expr(init) {
+                        Expression::AwaitExpression(expression) => {
+                            unwrap_static_expr(&expression.argument)
+                        }
+                        expression => expression,
+                    };
+                    if let Expression::CallExpression(call) = call
+                        && let Expression::Identifier(reference) = &call.callee
+                        && let Some(value) = self.capture_binding_producer_call(
+                            reference.name.as_str(),
+                            reference.span,
+                            awaited,
+                        )
+                    {
+                        self.attach_captured_binding_value(id.name.as_str(), value);
+                    }
+                }
                 self.factory_return_candidates
                     .push(super::FactoryReturnCandidate {
                         local_name: id.name.to_string(),
@@ -322,7 +415,35 @@ impl ModuleInfoExtractor {
                     }
                     return;
                 };
+                let call = match unwrap_static_expr(init) {
+                    Expression::AwaitExpression(expression) => {
+                        unwrap_static_expr(&expression.argument)
+                    }
+                    expression => expression,
+                };
+                let captured = if let Expression::CallExpression(call) = call
+                    && let Expression::Identifier(reference) = &call.callee
+                {
+                    self.capture_binding_producer_call(
+                        reference.name.as_str(),
+                        reference.span,
+                        awaited,
+                    )
+                } else {
+                    None
+                };
                 for key in keys {
+                    if let Some(id) = captured {
+                        self.pending_subclass_member_accesses.push(
+                            super::PendingSubclassMemberAccess {
+                                proof: super::SubclassAccessProof::Value {
+                                    id,
+                                    requirements: Vec::new(),
+                                },
+                                member: key.clone(),
+                            },
+                        );
+                    }
                     self.factory_unnamed_result_accesses
                         .push((callee_name.clone(), key, awaited));
                 }
@@ -452,9 +573,25 @@ impl ModuleInfoExtractor {
             return Some(type_name.to_string());
         };
         match frame.get(type_name) {
-            Some(Some(constraint)) => Some(constraint.clone()),
+            Some(Some(constraint)) => Some(constraint.name.clone()),
             Some(None) => None,
             None => Some(type_name.to_string()),
+        }
+    }
+
+    fn resolve_class_type_param_origin(
+        &self,
+        type_name: &str,
+        origin: Option<Span>,
+    ) -> Option<Span> {
+        match self
+            .class_type_param_constraints
+            .last()
+            .and_then(|frame| frame.get(type_name))
+        {
+            Some(Some(constraint)) => constraint.reference_span,
+            Some(None) => None,
+            None => origin,
         }
     }
 
@@ -536,9 +673,8 @@ impl ModuleInfoExtractor {
         let map_value_type = (method_name == "forEach")
             .then(|| self.map_value_type_for(&receiver_name))
             .flatten();
-        let Some(element_type) = map_value_type
-            .clone()
-            .or_else(|| self.iterable_element_type_for(&receiver_name))
+        let Some(element_type) =
+            map_value_type.or_else(|| self.iterable_element_type_for(&receiver_name))
         else {
             return;
         };
@@ -548,30 +684,40 @@ impl ModuleInfoExtractor {
         let param_name = match first_arg {
             Argument::ArrowFunctionExpression(arrow) => {
                 arrow.params.items.first().and_then(|p| match &p.pattern {
-                    BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                    BindingPattern::BindingIdentifier(id) => Some((id.name.to_string(), id.span)),
                     _ => None,
                 })
             }
             Argument::FunctionExpression(func) => {
                 func.params.items.first().and_then(|p| match &p.pattern {
-                    BindingPattern::BindingIdentifier(id) => Some(id.name.to_string()),
+                    BindingPattern::BindingIdentifier(id) => Some((id.name.to_string(), id.span)),
                     _ => None,
                 })
             }
             _ => None,
         };
-        if let Some(name) = param_name {
-            if map_value_type.is_some() {
-                self.map_callback_value_bindings
-                    .insert(first_arg.span().start, (name, element_type));
-            } else {
-                self.insert_class_binding_target(name, element_type);
+        if let Some((name, declaration_span)) = param_name {
+            {
+                let proof = self.iteration_binding_class_proof(
+                    &receiver_name,
+                    iteration_source_reference(receiver_expr),
+                );
+                self.map_callback_value_bindings.insert(
+                    first_arg.span().start,
+                    (name, declaration_span, element_type, proof),
+                );
             }
         }
     }
 
     fn bind_map_callback_value(&mut self, start: u32) {
-        if let Some((binding, class_name)) = self.map_callback_value_bindings.remove(&start) {
+        if let Some((binding, declaration_span, class_name, proof)) =
+            self.map_callback_value_bindings.remove(&start)
+        {
+            self.record_binding_declaration(&binding, declaration_span);
+            if let Some(proof) = proof {
+                self.record_captured_binding_class_proof(&binding, proof);
+            }
             self.record_scoped_class_binding(&binding, class_name);
         }
     }
@@ -591,10 +737,31 @@ impl ModuleInfoExtractor {
                     .find_map(|scope| scope.get(receiver_name))
             })
             .cloned()
+            .or_else(|| self.binding_iteration_target(receiver_name, false))
             .or_else(|| {
                 let map_name = receiver_name.strip_suffix(".values()")?;
                 self.map_value_type_for(map_name)
             })
+    }
+
+    fn array_type_origin(ty: &TSType<'_>) -> Option<Span> {
+        match ty {
+            TSType::TSArrayType(array) => {
+                super::helpers::extract_type_reference_origin(&array.element_type)
+            }
+            TSType::TSTypeReference(reference) => reference
+                .type_arguments
+                .as_deref()?
+                .params
+                .first()
+                .and_then(super::helpers::extract_type_reference_origin),
+            TSType::TSParenthesizedType(paren) => Self::array_type_origin(&paren.type_annotation),
+            TSType::TSTypeOperatorType(operator) => {
+                Self::array_type_origin(&operator.type_annotation)
+            }
+            TSType::TSUnionType(union) => union.types.iter().find_map(Self::array_type_origin),
+            _ => None,
+        }
     }
 
     fn record_array_binding_element_type(&mut self, binding: String, element: String) {
@@ -638,7 +805,10 @@ impl ModuleInfoExtractor {
                 return None;
             }
         }
-        self.map_binding_value_types.get(receiver_name).cloned()
+        self.map_binding_value_types
+            .get(receiver_name)
+            .cloned()
+            .or_else(|| self.binding_iteration_target(receiver_name, true))
     }
 
     /// The value class `V` of a `map.get(key)` expression when `map` is a
@@ -682,8 +852,47 @@ impl ModuleInfoExtractor {
             None => init.and_then(map_value_type_from_new),
         };
         if let Some(value) = value.and_then(|value| self.resolve_class_type_param(&value)) {
+            if self.capture_subclass_provenance {
+                let origin = type_annotation
+                    .and_then(|annotation| Self::map_type_origin(&annotation.type_annotation))
+                    .or_else(|| match init.map(unwrap_static_expr) {
+                        Some(Expression::NewExpression(expression)) => expression
+                            .type_arguments
+                            .as_deref()
+                            .and_then(|arguments| arguments.params.get(1))
+                            .and_then(super::helpers::extract_type_reference_origin),
+                        _ => None,
+                    });
+                let raw = type_annotation
+                    .and_then(|annotation| map_value_type_from_type(&annotation.type_annotation))
+                    .or_else(|| init.and_then(map_value_type_from_new));
+                let origin = raw
+                    .as_deref()
+                    .and_then(|raw| self.resolve_class_type_param_origin(raw, origin));
+                self.record_binding_iteration_proof(&binding, &value, origin, true);
+            }
             self.record_map_binding_value_type(binding, value);
         }
+    }
+
+    fn map_type_origin(ty: &TSType<'_>) -> Option<Span> {
+        match ty {
+            TSType::TSTypeReference(reference) => reference
+                .type_arguments
+                .as_deref()?
+                .params
+                .get(1)
+                .and_then(super::helpers::extract_type_reference_origin),
+            TSType::TSParenthesizedType(parenthesized) => {
+                Self::map_type_origin(&parenthesized.type_annotation)
+            }
+            TSType::TSUnionType(union) => union.types.iter().find_map(Self::map_type_origin),
+            _ => None,
+        }
+    }
+
+    fn is_vue_array_wrapper_call(call: &CallExpression<'_>) -> bool {
+        matches!(&call.callee, Expression::Identifier(callee) if matches!(callee.name.as_str(), "ref" | "shallowRef" | "computed"))
     }
 
     fn record_vue_ref_value_array_binding_type(
@@ -727,6 +936,12 @@ impl ModuleInfoExtractor {
             let Some(element) = array_element_type_from_type(&property_type.type_annotation) else {
                 continue;
             };
+            self.record_binding_iteration_proof(
+                &format!("{binding}.{property_name}"),
+                &element,
+                Self::array_type_origin(&property_type.type_annotation),
+                false,
+            );
             self.record_array_binding_element_type(format!("{binding}.{property_name}"), element);
         }
     }
@@ -751,6 +966,16 @@ impl ModuleInfoExtractor {
         if let Some(declarator) = decl.declarations.first()
             && let BindingPattern::BindingIdentifier(id) = &declarator.id
         {
+            self.record_binding_declaration(id.name.as_str(), id.span);
+            {
+                self.bind_iteration_class_proof(
+                    receiver_name
+                        .strip_suffix(".values()")
+                        .unwrap_or(&receiver_name),
+                    id.name.as_str(),
+                    iteration_source_reference(&stmt.right),
+                );
+            }
             self.insert_class_binding_target(id.name.to_string(), element_type);
         }
     }
@@ -776,6 +1001,12 @@ impl ModuleInfoExtractor {
             return;
         };
         if let Some(Some(BindingPattern::BindingIdentifier(value))) = pattern.elements.get(1) {
+            self.record_binding_declaration(value.name.as_str(), value.span);
+            self.bind_iteration_class_proof(
+                &self.qualify_this_scope(map_name),
+                value.name.as_str(),
+                iteration_source_reference(&stmt.right),
+            );
             self.record_scoped_class_binding(value.name.as_str(), value_type);
         }
     }
@@ -1205,6 +1436,26 @@ impl ModuleInfoExtractor {
 
     fn record_top_level_class_declaration(&mut self, class: &Class<'_>) {
         if let Some(id) = class.id.as_ref() {
+            let super_reference_span = class.heritage.as_ref().and_then(|base| {
+                match unwrap_static_expr(&base.expression) {
+                    Expression::Identifier(reference) => Some(reference.span),
+                    Expression::StaticMemberExpression(member) => {
+                        if let Expression::Identifier(reference) = &member.object {
+                            Some(reference.span)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            });
+            self.subclass_declarations.insert(
+                id.name.to_string(),
+                super::SubclassDeclaration {
+                    binding_span: id.span,
+                    super_reference_span,
+                },
+            );
             self.record_local_declaration_name(&id.name);
             self.record_sanitizer_binding(id.name.as_str(), None);
             self.record_literal_allowlist_binding(id.name.as_str(), false);
@@ -1214,20 +1465,45 @@ impl ModuleInfoExtractor {
             self.record_local_type_declaration(&id.name, id.span);
             let is_angular = has_angular_class_decorator(class);
             self.record_angular_inputs_outputs(class, is_angular);
-            let instance_bindings = super::helpers::extract_class_instance_bindings(
-                class,
-                |local_name, source, imported_name| {
-                    self.is_named_import_from(local_name, source, imported_name)
-                },
-            );
+            let (instance_bindings, binding_origins) =
+                super::helpers::extract_class_instance_bindings_with_origins(
+                    class,
+                    |local_name, source, imported_name| {
+                        self.is_named_import_from(local_name, source, imported_name)
+                    },
+                );
+            let members = extract_class_members(class, is_angular);
+            if self.capture_subclass_provenance {
+                self.record_binding_declaration(id.name.as_str(), id.span);
+                for member in &members {
+                    if member.is_instance_returning_static
+                        && member.kind == fallow_types::extract::MemberKind::ClassMethod
+                    {
+                        self.register_binding_producer(
+                            &format!("{}.{}", id.name, member.name),
+                            super::BindingProducer {
+                                name: id.name.to_string(),
+                                declaration_span: id.span,
+                                result: None,
+                                shape: Vec::new(),
+                                is_async: false,
+                                is_generator: false,
+                                is_static_method: true,
+                            },
+                        );
+                    }
+                }
+            }
             self.record_local_class_export(
                 id.name.to_string(),
                 super::LocalClassExportInfo {
-                    members: extract_class_members(class, is_angular),
+                    members,
                     super_class: extract_super_class_name(class),
                     implemented_interfaces: extract_implemented_interface_names(class),
                     type_parameters: extract_class_type_parameter_names(class),
                     instance_bindings,
+                    binding_origins,
+                    binding_span: id.span,
                     super_class_type_args: extract_super_class_type_args(class),
                     generic_instance_bindings: extract_class_generic_instance_bindings(class),
                 },
@@ -1285,6 +1561,7 @@ impl ModuleInfoExtractor {
             self.record_factory_return_function(
                 id.name.as_str(),
                 FactoryReturnFunctionInput {
+                    binding_span: id.span,
                     params: &function.params,
                     body: function.body.as_deref().map(BodyRef::Block),
                     is_async: function.r#async,
@@ -1335,7 +1612,10 @@ impl ModuleInfoExtractor {
         self.record_local_signature_refs(&alias.id.name, refs);
         if let TSType::TSTypeLiteral(type_lit) = &alias.type_annotation {
             self.record_required_type_members(&alias.id.name, &type_lit.members);
-            let properties = collect_object_type_property_types(&type_lit.members);
+            let mut properties = collect_object_type_property_types(&type_lit.members);
+            for target in properties.values_mut() {
+                target.owner_span = Some(alias.id.span);
+            }
             if !properties.is_empty() {
                 self.interface_property_types
                     .insert(alias.id.name.to_string(), properties);
@@ -1358,7 +1638,10 @@ impl ModuleInfoExtractor {
         let refs = Self::collect_interface_signature_refs(iface);
         self.record_local_signature_refs(&iface.id.name, refs);
         self.record_required_type_members(&iface.id.name, &iface.body.body);
-        let properties = collect_object_type_property_types(&iface.body.body);
+        let mut properties = collect_object_type_property_types(&iface.body.body);
+        for target in properties.values_mut() {
+            target.owner_span = Some(iface.id.span);
+        }
         if !properties.is_empty() {
             self.interface_property_types
                 .insert(iface.id.name.to_string(), properties);
@@ -1501,7 +1784,128 @@ impl ModuleInfoExtractor {
         self.record_path_relative_binding(id.name.as_str(), None);
     }
 
+    fn capture_subclass_producer_member_access(
+        &mut self,
+        object: &Expression<'_>,
+        member: &str,
+    ) -> bool {
+        if let Expression::CallExpression(call) = object {
+            let source = match &call.callee {
+                Expression::Identifier(reference) => {
+                    Some((reference.name.to_string(), reference.span))
+                }
+                Expression::StaticMemberExpression(callee) => {
+                    static_member_object_name(&callee.object)
+                        .zip(iteration_source_reference(&callee.object))
+                        .map(|(root, span)| (format!("{root}.{}", callee.property.name), span))
+                }
+                _ => None,
+            };
+            if let Some((source, reference)) = source
+                && let Some(id) = self.capture_binding_producer_call(&source, reference, false)
+            {
+                if let Expression::StaticMemberExpression(callee) = &call.callee
+                    && let Expression::Identifier(root) = &callee.object
+                {
+                    self.set_static_binding_call_origin(id, root.name.as_str(), root.span);
+                }
+                self.pending_subclass_member_accesses
+                    .push(super::PendingSubclassMemberAccess {
+                        proof: super::SubclassAccessProof::Value {
+                            id,
+                            requirements: Vec::new(),
+                        },
+                        member: member.to_string(),
+                    });
+                return true;
+            }
+        }
+        false
+    }
+
+    fn record_subclass_member_access(&mut self, object: &Expression<'_>, member: &str) {
+        if !self.capture_subclass_provenance {
+            return;
+        }
+        let object = unwrap_static_expr(object);
+        if let Some(path) = static_member_object_name(object)
+            && !matches!(
+                object,
+                Expression::CallExpression(_) | Expression::NewExpression(_)
+            )
+        {
+            let path = self.qualify_this_scope(&path);
+            if !(path.starts_with("this@") && self.independent_this_depth > 0)
+                && self.capture_subclass_binding_access(
+                    &path,
+                    subclass_receiver_reference(object).map(|(reference, _)| reference.span),
+                    member,
+                )
+            {
+                return;
+            }
+        }
+        if self.capture_subclass_producer_member_access(object, member) {
+            return;
+        }
+        let map_proof = self.map_get_value_type(object).and_then(|_| {
+            let Expression::CallExpression(call) = object else {
+                return None;
+            };
+            let Expression::StaticMemberExpression(member) = &call.callee else {
+                return None;
+            };
+            let source = self.qualify_this_scope(&static_member_object_name(&member.object)?);
+            if source.starts_with("this@") && self.independent_this_depth > 0 {
+                return None;
+            }
+            self.iteration_binding_class_proof(&source, iteration_source_reference(&member.object))
+        });
+        let proof = map_proof.or_else(|| match object {
+            Expression::NewExpression(expression) => {
+                let Expression::Identifier(reference) = &expression.callee else {
+                    return None;
+                };
+                Some(super::BindingClassProof {
+                    target_name: reference.name.to_string(),
+                    target_reference_span: reference.span,
+                    requirements: Vec::new(),
+                })
+            }
+            Expression::Identifier(reference) => self
+                .direct_binding_class_proof(reference.name.as_str(), Some(reference.span))
+                .or_else(|| {
+                    Some(super::BindingClassProof {
+                        target_name: reference.name.to_string(),
+                        target_reference_span: reference.span,
+                        requirements: Vec::new(),
+                    })
+                }),
+            _ => {
+                let path = static_member_object_name(object)?;
+                let path = self.qualify_this_scope(&path);
+                if path.starts_with("this@") && self.independent_this_depth > 0 {
+                    return None;
+                }
+                self.direct_binding_class_proof(
+                    &path,
+                    subclass_receiver_reference(object).map(|(reference, _)| reference.span),
+                )
+            }
+        });
+        if let Some(proof) = proof {
+            self.pending_subclass_member_accesses
+                .push(super::PendingSubclassMemberAccess {
+                    proof: super::SubclassAccessProof::Known(proof),
+                    member: member.to_string(),
+                });
+        }
+    }
+
     fn record_variable_declarator_metadata(&mut self, declarator: &VariableDeclarator<'_>) {
+        for id in declarator.id.get_binding_identifiers() {
+            self.record_binding_declaration(id.name.as_str(), id.span);
+        }
         if self.is_module_scope() {
             let refs = Self::collect_variable_signature_refs(declarator);
             let satisfies_refs = Self::collect_variable_satisfies_refs(declarator);
@@ -2169,11 +2573,7 @@ impl<'a> ModuleInfoExtractor {
         }
     }
 
-    /// Record `binding_target_names` / factory-call candidates from an
-    /// initialized declarator: a `new Class()` RHS, a Svelte `$derived(new ...)`,
-    /// a factory `[svc] = wrap(...)` array destructure, a `useMemo(() => new ...)`
-    /// product binding, and a `Obj.method(...)` factory-call candidate.
-    fn record_declarator_instance_bindings(
+    fn record_declarator_member_destructuring(
         &mut self,
         declarator: &VariableDeclarator<'a>,
         init: &Expression<'a>,
@@ -2200,6 +2600,11 @@ impl<'a> ModuleInfoExtractor {
             }
             for property in &pattern.properties {
                 if let Some(member) = property.key.static_name() {
+                    self.capture_subclass_binding_access(
+                        source.name.as_str(),
+                        Some(source.span),
+                        &member,
+                    );
                     self.member_accesses.push(MemberAccess {
                         object: class_name.clone(),
                         member: member.to_string(),
@@ -2207,16 +2612,27 @@ impl<'a> ModuleInfoExtractor {
                 }
             }
         }
+    }
 
-        // `a ?? new A()`, `f ? new A() : null` and similar inits hold the
-        // class instance in one operand. Bind through that operand.
-        let original_init = init;
-        let init = self.class_carrying_init(init);
-
+    fn record_declarator_receiver_aliases(
+        &mut self,
+        declarator: &VariableDeclarator<'a>,
+        init: &Expression<'a>,
+    ) {
         if let BindingPattern::BindingIdentifier(id) = &declarator.id
+            && !matches!(
+                unwrap_static_expr(init),
+                Expression::NewExpression(_) | Expression::CallExpression(_)
+            )
             && let Some(source) = static_member_object_name(unwrap_static_expr(init))
         {
             let source = self.qualify_this_scope(&source);
+            self.copy_direct_binding_proof(
+                &source,
+                id.name.as_str(),
+                subclass_receiver_reference(unwrap_static_expr(init))
+                    .map(|(reference, _)| reference.span),
+            );
             if let Some(BindingTarget::Class(type_name)) = self.resolve_bound_object_name(&source) {
                 self.insert_class_binding_target(id.name.to_string(), type_name);
             }
@@ -2231,6 +2647,12 @@ impl<'a> ModuleInfoExtractor {
         {
             let source = self.qualify_this_scope(&source);
             for (local, path) in extract_object_pattern_bindings(pattern) {
+                self.copy_direct_binding_proof(
+                    &format!("{source}.{path}"),
+                    &local,
+                    subclass_receiver_reference(unwrap_static_expr(init))
+                        .map(|(reference, _)| reference.span),
+                );
                 if let Some(BindingTarget::Class(type_name)) =
                     self.resolve_bound_object_name(&format!("{source}.{path}"))
                 {
@@ -2238,6 +2660,25 @@ impl<'a> ModuleInfoExtractor {
                 }
             }
         }
+    }
+
+    /// Record `binding_target_names` / factory-call candidates from an
+    /// initialized declarator: a `new Class()` RHS, a Svelte `$derived(new ...)`,
+    /// a factory `[svc] = wrap(...)` array destructure, a `useMemo(() => new ...)`
+    /// product binding, and a `Obj.method(...)` factory-call candidate.
+    fn record_declarator_instance_bindings(
+        &mut self,
+        declarator: &VariableDeclarator<'a>,
+        init: &Expression<'a>,
+    ) {
+        self.record_declarator_member_destructuring(declarator, init);
+
+        // `a ?? new A()`, `f ? new A() : null` and similar inits hold the
+        // class instance in one operand. Bind through that operand.
+        let original_init = init;
+        let init = self.class_carrying_init(init);
+
+        self.record_declarator_receiver_aliases(declarator, init);
 
         // `f ? (value as T) : null` binds `T`. A plain `value as T` init
         // stays out: only an unwrapped nullable operand reads the assertion.
@@ -2245,6 +2686,9 @@ impl<'a> ModuleInfoExtractor {
             && !std::ptr::eq(init, original_init)
             && let Some(type_name) = self.asserted_receiver_type_name(init)
         {
+            let origin = asserted_receiver_type(init)
+                .and_then(super::helpers::extract_type_reference_origin);
+            self.record_binding_class_proof(id.name.as_str(), &type_name, origin);
             self.insert_class_binding_target(id.name.to_string(), type_name);
         }
 
@@ -2252,11 +2696,28 @@ impl<'a> ModuleInfoExtractor {
             && let Some(class_name) = constructed_class_name(init)
         {
             self.insert_class_binding_target(id.name.to_string(), class_name.to_string());
+            if let Expression::NewExpression(expression) = unwrap_static_expr(init)
+                && let Expression::Identifier(reference) = &expression.callee
+            {
+                self.record_binding_class_proof(id.name.as_str(), class_name, Some(reference.span));
+            }
         }
 
         if let BindingPattern::BindingIdentifier(id) = &declarator.id
             && let Some(class_name) = Self::svelte_derived_new_class(init)
         {
+            let origin = match init {
+                Expression::CallExpression(call) => match call.arguments.first() {
+                    Some(Argument::NewExpression(expr)) => match &expr.callee {
+                        Expression::Identifier(id) => Some(id.span),
+                        _ => None,
+                    },
+                    _ => super::helpers::try_extract_factory_new_class_origin(&call.arguments)
+                        .map(|(_, span)| span),
+                },
+                _ => None,
+            };
+            self.record_binding_class_proof(id.name.as_str(), &class_name, origin);
             self.insert_class_binding_target(id.name.to_string(), class_name);
         }
 
@@ -2265,6 +2726,10 @@ impl<'a> ModuleInfoExtractor {
             && let Some(Some(BindingPattern::BindingIdentifier(id))) = arr_pat.elements.first()
             && let Some(class_name) = super::helpers::try_extract_factory_new_class(&call.arguments)
         {
+            self.record_binding_declaration(id.name.as_str(), id.span);
+            let origin = super::helpers::try_extract_factory_new_class_origin(&call.arguments)
+                .map(|(_, span)| span);
+            self.record_binding_class_proof(id.name.as_str(), &class_name, origin);
             self.insert_class_binding_target(id.name.to_string(), class_name);
         }
 
@@ -2278,6 +2743,9 @@ impl<'a> ModuleInfoExtractor {
             && is_value_returning_memo_callee(&call.callee)
             && let Some(class_name) = super::helpers::try_extract_factory_new_class(&call.arguments)
         {
+            let origin = super::helpers::try_extract_factory_new_class_origin(&call.arguments)
+                .map(|(_, span)| span);
+            self.record_binding_class_proof(id.name.as_str(), &class_name, origin);
             self.insert_class_binding_target_if_absent(id.name.to_string(), class_name);
         }
 
@@ -2286,6 +2754,19 @@ impl<'a> ModuleInfoExtractor {
             && let Expression::StaticMemberExpression(member) = &call.callee
             && let Expression::Identifier(callee_object) = &member.object
         {
+            if self.capture_subclass_provenance {
+                let path = format!("{}.{}", callee_object.name, member.property.name);
+                if let Some(value) =
+                    self.capture_binding_producer_call(&path, callee_object.span, false)
+                {
+                    self.set_static_binding_call_origin(
+                        value,
+                        callee_object.name.as_str(),
+                        callee_object.span,
+                    );
+                    self.attach_captured_binding_value(id.name.as_str(), value);
+                }
+            }
             self.factory_call_candidates
                 .push(super::FactoryCallCandidate {
                     local_name: id.name.to_string(),
@@ -2477,31 +2958,7 @@ impl<'a> ModuleInfoExtractor {
                 .push(classify_factory_assigned_value(init));
         }
 
-        // Type array / reactive-array bindings to their element class so
-        // iteration callbacks and `for...of` loops can credit item member
-        // accesses. Module-scope entries remain visible to template scanners;
-        // function/block locals stay scoped to the active visitor stack.
-        if let BindingPattern::BindingIdentifier(id) = &declarator.id
-            && let Some(element) =
-                infer_array_binding_element_type(declarator.type_annotation.as_deref(), Some(init))
-                    .or_else(|| self.promise_all_map_element_type(init))
-        {
-            let binding = id.name.to_string();
-            self.record_vue_ref_value_array_binding_type(&binding, init, &element);
-            self.record_array_binding_element_type(binding, element);
-        }
-
-        if let BindingPattern::BindingIdentifier(id) = &declarator.id {
-            self.record_object_array_member_binding_types(
-                id.name.as_str(),
-                declarator.type_annotation.as_deref(),
-            );
-            if declarator.type_annotation.is_none()
-                && let Some(value) = self.map_get_value_type(init)
-            {
-                self.insert_class_binding_target(id.name.to_string(), value);
-            }
-        }
+        self.record_declarator_collection_bindings(declarator, init);
 
         // FP-1 (unused-load-data-key): `const X = data` passes the whole
         // SvelteKit `data` prop opaquely, so a child could read any key the
@@ -2572,6 +3029,66 @@ impl<'a> ModuleInfoExtractor {
         }
 
         self.record_dynamic_import_declarator(declarator, init);
+    }
+
+    fn record_declarator_collection_bindings(
+        &mut self,
+        declarator: &VariableDeclarator<'a>,
+        init: &Expression<'a>,
+    ) {
+        // Type array / reactive-array bindings to their element class so
+        // iteration callbacks and `for...of` loops can credit item member
+        // accesses. Module-scope entries remain visible to template scanners;
+        // function/block locals stay scoped to the active visitor stack.
+        if let BindingPattern::BindingIdentifier(id) = &declarator.id
+            && let Some((element, origin)) = super::helpers::infer_array_binding_element_target(
+                declarator.type_annotation.as_deref(),
+                Some(init),
+            )
+            .or_else(|| {
+                self.promise_all_map_element_type(init)
+                    .map(|name| (name, None))
+            })
+        {
+            let binding = id.name.to_string();
+            self.record_vue_ref_value_array_binding_type(&binding, init, &element);
+            let origin = self.resolve_class_type_param_origin(&element, origin);
+            self.record_binding_iteration_proof(&binding, &element, origin, false);
+            if let Expression::CallExpression(call) = init
+                && Self::is_vue_array_wrapper_call(call)
+            {
+                self.record_binding_iteration_proof(
+                    &format!("{binding}.value"),
+                    &element,
+                    origin,
+                    false,
+                );
+            }
+            self.record_array_binding_element_type(binding, element);
+        }
+
+        if let BindingPattern::BindingIdentifier(id) = &declarator.id {
+            self.record_object_array_member_binding_types(
+                id.name.as_str(),
+                declarator.type_annotation.as_deref(),
+            );
+            if declarator.type_annotation.is_none()
+                && let Some(value) = self.map_get_value_type(init)
+            {
+                let object = unwrap_static_expr(init);
+                if let Expression::CallExpression(call) = object
+                    && let Expression::StaticMemberExpression(member) = &call.callee
+                    && let Some(source) = static_member_object_name(&member.object)
+                    && let Some(proof) = self.iteration_binding_class_proof(
+                        &self.qualify_this_scope(&source),
+                        iteration_source_reference(&member.object),
+                    )
+                {
+                    self.record_captured_binding_class_proof(id.name.as_str(), proof);
+                }
+                self.insert_class_binding_target(id.name.to_string(), value);
+            }
+        }
     }
 
     /// Record the dynamic-import edges of a declarator init: a
@@ -2889,6 +3406,73 @@ impl<'a> ModuleInfoExtractor {
         }
     }
 
+    fn invalidate_assignment_target_proof(&mut self, target: &AssignmentTarget<'_>) {
+        match target {
+            AssignmentTarget::AssignmentTargetIdentifier(id) => {
+                self.invalidate_direct_binding_path(id.name.as_str(), false);
+            }
+            AssignmentTarget::StaticMemberExpression(member) => {
+                if let Some(path) = static_member_object_name(&member.object) {
+                    self.invalidate_direct_binding_path(
+                        &format!("{path}.{}", member.property.name),
+                        false,
+                    );
+                }
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                if let Some(path) = static_member_object_name(&member.object) {
+                    if let Some(key) = member.static_property_name() {
+                        self.invalidate_direct_binding_path(&format!("{path}.{key}"), false);
+                    } else {
+                        self.invalidate_direct_binding_path(&path, true);
+                    }
+                }
+            }
+            AssignmentTarget::ArrayAssignmentTarget(array) => {
+                for element in array.elements.iter().flatten() {
+                    self.invalidate_assignment_target_default_proof(element);
+                }
+                if let Some(rest) = &array.rest {
+                    self.invalidate_assignment_target_proof(&rest.target);
+                }
+            }
+            AssignmentTarget::ObjectAssignmentTarget(object) => {
+                for property in &object.properties {
+                    match property {
+                        AssignmentTargetProperty::AssignmentTargetPropertyIdentifier(property) => {
+                            self.invalidate_direct_binding_path(
+                                property.binding.name.as_str(),
+                                false,
+                            );
+                        }
+                        AssignmentTargetProperty::AssignmentTargetPropertyProperty(property) => {
+                            self.invalidate_assignment_target_default_proof(&property.binding);
+                        }
+                    }
+                }
+                if let Some(rest) = &object.rest {
+                    self.invalidate_assignment_target_proof(&rest.target);
+                }
+            }
+            _ => {
+                if let Some(name) = assignment_target_identifier_name(target) {
+                    self.invalidate_direct_binding_path(name, false);
+                }
+            }
+        }
+    }
+
+    fn invalidate_assignment_target_default_proof(
+        &mut self,
+        target: &AssignmentTargetMaybeDefault<'_>,
+    ) {
+        if let AssignmentTargetMaybeDefault::AssignmentTargetWithDefault(default) = target {
+            self.invalidate_assignment_target_proof(&default.binding);
+        } else if let Some(target) = target.as_assignment_target() {
+            self.invalidate_assignment_target_proof(target);
+        }
+    }
+
     /// Record sanitizer / allowlist / regex / path bindings cleared by an
     /// assignment to an identifier or member-object target.
     fn record_assignment_target_bindings(&mut self, left: &AssignmentTarget<'a>) {
@@ -3088,6 +3672,11 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.has_global_declarations =
             program_has_global_declarations(program, self.is_module_file);
         self.triple_slash_reference_paths = triple_slash_reference_paths(program);
+        self.capture_subclass_provenance = program.body.iter().any(|statement| match statement {
+            Statement::ClassDeclaration(class) => class.heritage.is_some(),
+            Statement::ExportDeclaration(export) => matches!(&export.declaration, Declaration::ClassDeclaration(class) if class.heritage.is_some()),
+            _ => false,
+        });
         self.record_program_namespace_import_locals(program);
         self.record_program_spy_api_locals(program);
         self.record_program_function_type_aliases(program);
@@ -3105,16 +3694,34 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         if let BindingPattern::BindingIdentifier(id) = &param.pattern
             && let Some(type_annotation) = param.type_annotation.as_deref()
         {
+            self.record_binding_declaration(id.name.as_str(), id.span);
+            if let Some(name) = extract_type_annotation_name(type_annotation)
+                && let Some(target) = self.resolve_class_type_param(&name)
+            {
+                let origin = self.resolve_class_type_param_origin(
+                    &name,
+                    super::helpers::extract_type_reference_origin(&type_annotation.type_annotation),
+                );
+                self.record_binding_class_proof(id.name.as_str(), &target, origin);
+            }
             // The parameter itself is resolved by the scope-owned body collector.
             // Only nested paths remain in the module fallback for consumers such
             // as typed store properties; conflicting scopes become Ambiguous.
             self.record_typed_nested_bindings(id.name.as_str(), type_annotation);
+            if let Some((element, origin)) =
+                super::helpers::array_element_target_from_type(&type_annotation.type_annotation)
+            {
+                self.record_binding_iteration_proof(id.name.as_str(), &element, origin, false);
+            }
             if param.accessibility.is_some() {
                 let key = self.this_member_key(id.name.as_str());
                 self.record_typed_binding(key.as_str(), type_annotation);
             }
         }
 
+        for id in param.pattern.get_binding_identifiers() {
+            self.record_binding_declaration(id.name.as_str(), id.span);
+        }
         if let BindingPattern::ObjectPattern(obj_pat) = &param.pattern
             && let Some(type_annotation) = param.type_annotation.as_deref()
         {
@@ -3124,6 +3731,14 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.record_angular_param_inject(param);
 
         walk::walk_formal_parameter(self, param);
+    }
+
+    fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
+        let previous_span = self.class_method_function_span.replace(method.value.span);
+        let previous_depth = std::mem::replace(&mut self.independent_this_depth, 0);
+        walk::walk_method_definition(self, method);
+        self.independent_this_depth = previous_depth;
+        self.class_method_function_span = previous_span;
     }
 
     fn visit_property_definition(&mut self, prop: &PropertyDefinition<'a>) {
@@ -3166,6 +3781,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                 && !super::helpers::is_builtin_constructor(callee.name.as_str())
             {
                 self.insert_class_binding_target(this_key.clone(), callee.name.to_string());
+                self.record_binding_class_proof(&this_key, callee.name.as_str(), Some(callee.span));
             }
 
             if let Some(Expression::CallExpression(call)) = &prop.value
@@ -3259,7 +3875,11 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.preseed_direct_object_binding_scope_roots(&case.consequent);
             self.preseed_direct_object_binding_targets(&case.consequent);
         }
-        walk::walk_switch_cases(self, cases);
+        for case in cases {
+            let values = self.push_conditional_binding_scope(&[]);
+            self.visit_switch_case(case);
+            self.pop_optional_binding_scope(values);
+        }
         self.pop_direct_object_binding_scope();
     }
 
@@ -3301,6 +3921,10 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_function(&mut self, func: &Function<'a>, flags: ScopeFlags) {
+        let independent_this = self.class_method_function_span != Some(func.span);
+        if independent_this {
+            self.independent_this_depth += 1;
+        }
         self.record_next_function_param_sources(func);
         let type_parameter_scope_pushed = func
             .type_parameters
@@ -3333,6 +3957,8 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             );
         }
         self.push_var_owner_direct_object_binding_scope(direct_roots);
+        self.direct_object_binding_function_scopes
+            .push(self.scoped_direct_object_binding_targets.len() - 1);
         self.push_function_declaration_scope(&func.params);
         self.bind_map_callback_value(func.span.start);
         self.deferred_function_var_binding_roots.push(var_roots);
@@ -3346,7 +3972,11 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.pop_function_type_alias_scope();
         }
         self.pop_function_declaration_scope();
+        self.direct_object_binding_function_scopes.pop();
         self.pop_direct_object_binding_scope();
+        if independent_this {
+            self.independent_this_depth -= 1;
+        }
     }
 
     fn visit_arrow_function_expression(&mut self, expr: &ArrowFunctionExpression<'a>) {
@@ -3376,6 +4006,8 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             .map(|id| id.name.to_string())
             .collect();
         self.push_var_owner_direct_object_binding_scope(direct_roots);
+        self.direct_object_binding_function_scopes
+            .push(self.scoped_direct_object_binding_targets.len() - 1);
         self.push_function_declaration_scope(&expr.params);
         self.bind_map_callback_value(expr.span.start);
         self.deferred_function_var_binding_roots.push(var_roots);
@@ -3389,6 +4021,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.pop_function_type_alias_scope();
         }
         self.pop_function_declaration_scope();
+        self.direct_object_binding_function_scopes.pop();
         self.pop_direct_object_binding_scope();
     }
 
@@ -3971,13 +4604,37 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         if let Some(ForStatementInit::VariableDeclaration(declaration)) = &stmt.init {
             self.preseed_direct_object_binding_declaration(declaration);
         }
-        walk::walk_for_statement(self, stmt);
+        if let Some(init) = &stmt.init {
+            self.visit_for_statement_init(init);
+        }
+        if let Some(test) = &stmt.test {
+            self.visit_expression(test);
+        }
+        let values = self.push_conditional_binding_scope(&[]);
+        if let Some(update) = &stmt.update {
+            let update_values = self.push_conditional_binding_scope(&[]);
+            self.start_loop_update_observations();
+            self.visit_expression(update);
+            let observations = self.finish_loop_update_observations();
+            let update_branch = self.pop_conditional_binding_scope(update_values);
+            self.join_conditional_binding_scopes(
+                &update_branch,
+                &super::DirectObjectBindingBranch::default(),
+            );
+            self.visit_statement(&stmt.body);
+            self.replay_loop_update_observations(observations);
+            self.join_conditional_binding_scopes(
+                &update_branch,
+                &super::DirectObjectBindingBranch::default(),
+            );
+        } else {
+            self.visit_statement(&stmt.body);
+        }
+        self.pop_optional_binding_scope(values);
         self.pop_direct_object_binding_scope();
     }
 
     fn visit_for_of_statement(&mut self, stmt: &ForOfStatement<'a>) {
-        self.bind_for_of_element(stmt);
-
         let static_bindings = self.static_package_loop_bindings(stmt);
         let has_static_bindings = static_bindings.is_some();
         if let Some((strings, objects)) = static_bindings {
@@ -4000,8 +4657,14 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         self.push_direct_object_binding_scope(roots);
         self.visit_for_statement_left(&stmt.left);
         self.visit_expression(&stmt.right);
+        let values = self.push_conditional_binding_scope(&[]);
+        if let Some(target) = stmt.left.as_assignment_target() {
+            self.invalidate_assignment_target_proof(target);
+        }
+        self.bind_for_of_element(stmt);
         self.bind_for_of_map_value(stmt);
         self.visit_statement(&stmt.body);
+        self.pop_optional_binding_scope(values);
         self.pop_direct_object_binding_scope();
 
         if has_static_bindings {
@@ -4207,19 +4870,43 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
                             is_plain_assignment,
                         );
                     } else {
-                        self.record_direct_object_binding_assignment(
-                            &object_name,
-                            &expr.right,
-                            false,
-                        );
+                        self.invalidate_direct_binding_path(&object_name, true);
                     }
                 }
+            }
+            AssignmentTarget::ObjectAssignmentTarget(_)
+            | AssignmentTarget::ArrayAssignmentTarget(_) => {
+                self.invalidate_assignment_target_proof(&expr.left);
             }
             _ => {}
         }
     }
 
     fn visit_update_expression(&mut self, expr: &UpdateExpression<'a>) {
+        match &expr.argument {
+            SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                if let Some(path) = static_member_object_name(&member.object) {
+                    self.invalidate_direct_binding_path(
+                        &format!("{path}.{}", member.property.name),
+                        false,
+                    );
+                }
+            }
+            SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                if let Some(path) = static_member_object_name(&member.object) {
+                    match member.static_property_name() {
+                        Some(key) => {
+                            self.invalidate_direct_binding_path(&format!("{path}.{key}"), false);
+                        }
+                        None => self.invalidate_direct_binding_path(&path, true),
+                    }
+                }
+            }
+            SimpleAssignmentTarget::AssignmentTargetIdentifier(reference) => {
+                self.invalidate_direct_binding_path(reference.name.as_str(), false);
+            }
+            _ => {}
+        }
         let mutates_cjs_exports = match &expr.argument {
             SimpleAssignmentTarget::StaticMemberExpression(member) => {
                 Self::is_static_cjs_assignment_target(member)
@@ -4236,6 +4923,32 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_unary_expression(&mut self, expr: &UnaryExpression<'a>) {
+        if matches!(expr.operator, UnaryOperator::Delete) {
+            match &expr.argument {
+                Expression::StaticMemberExpression(member) => {
+                    if let Some(path) = static_member_object_name(&member.object) {
+                        self.invalidate_direct_binding_path(
+                            &format!("{path}.{}", member.property.name),
+                            false,
+                        );
+                    }
+                }
+                Expression::ComputedMemberExpression(member) => {
+                    if let Some(path) = static_member_object_name(&member.object) {
+                        match member.static_property_name() {
+                            Some(key) => {
+                                self.invalidate_direct_binding_path(
+                                    &format!("{path}.{key}"),
+                                    false,
+                                );
+                            }
+                            None => self.invalidate_direct_binding_path(&path, true),
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         if matches!(expr.operator, UnaryOperator::Delete)
             && Self::is_cjs_mutation_expression(&expr.argument)
         {
@@ -4245,6 +4958,7 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_static_member_expression(&mut self, expr: &StaticMemberExpression<'a>) {
+        self.record_subclass_member_access(&expr.object, expr.property.name.as_str());
         self.record_awaited_dynamic_import_member(&expr.object, expr.property.name.as_str());
         if is_import_meta_env_object(&expr.object) {
             self.member_accesses.push(MemberAccess {
@@ -4299,12 +5013,23 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             );
         }
         if matches!(expr.object, Expression::Super(_))
-            && let Some(Some(super_local)) = self.class_super_stack.last()
+            && let Some(Some((super_local, origin))) = self.class_super_stack.last().cloned()
         {
             self.member_accesses.push(MemberAccess {
                 object: super_local.clone(),
                 member: expr.property.name.to_string(),
             });
+            if let Some(target_reference_span) = origin {
+                self.pending_subclass_member_accesses
+                    .push(super::PendingSubclassMemberAccess {
+                        proof: super::SubclassAccessProof::Known(super::BindingClassProof {
+                            target_name: super_local,
+                            target_reference_span,
+                            requirements: Vec::new(),
+                        }),
+                        member: expr.property.name.to_string(),
+                    });
+            }
         }
         if let Expression::Identifier(object) = &expr.object {
             self.mark_structured_namespace_reference(object);
@@ -4313,6 +5038,9 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
     }
 
     fn visit_computed_member_expression(&mut self, expr: &ComputedMemberExpression<'a>) {
+        if let Some(member) = expr.static_property_name() {
+            self.record_subclass_member_access(&expr.object, member.as_str());
+        }
         if let Some(member) = expr.static_property_name() {
             self.record_awaited_dynamic_import_member(&expr.object, member.as_str());
         }
@@ -4423,8 +5151,38 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             );
         }
         self.push_direct_object_binding_scope(roots);
+        let values = self.push_conditional_binding_scope(&[]);
+        if let Some(target) = stmt.left.as_assignment_target() {
+            self.invalidate_assignment_target_proof(target);
+        }
         self.visit_statement(&stmt.body);
+        self.pop_optional_binding_scope(values);
         self.pop_direct_object_binding_scope();
+    }
+
+    fn visit_while_statement(&mut self, stmt: &WhileStatement<'a>) {
+        self.visit_expression(&stmt.test);
+        let values = self.push_conditional_binding_scope(&[]);
+        self.visit_statement(&stmt.body);
+        self.pop_optional_binding_scope(values);
+    }
+
+    fn visit_logical_expression(&mut self, expr: &LogicalExpression<'a>) {
+        self.visit_expression(&expr.left);
+        let values = self.push_conditional_binding_scope(&[]);
+        self.visit_expression(&expr.right);
+        self.pop_optional_binding_scope(values);
+    }
+
+    fn visit_conditional_expression(&mut self, expr: &ConditionalExpression<'a>) {
+        self.visit_expression(&expr.test);
+        let values = self.push_conditional_binding_scope(&[]);
+        self.visit_expression(&expr.consequent);
+        let consequent = self.pop_conditional_binding_scope(values);
+        let values = self.push_conditional_binding_scope(&[]);
+        self.visit_expression(&expr.alternate);
+        let alternate = self.pop_conditional_binding_scope(values);
+        self.join_conditional_binding_scopes(&consequent, &alternate);
     }
 
     fn visit_if_statement(&mut self, stmt: &IfStatement<'a>) {
@@ -4438,10 +5196,19 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
         // positives.
         let mut narrowings = Vec::new();
         collect_instanceof_narrowings(&stmt.test, &mut narrowings);
-        for (local, class_name) in narrowings {
-            self.insert_class_binding_target_if_absent(local, class_name);
+        for (local, class_name, _, _) in &narrowings {
+            self.insert_class_binding_target_if_absent(local.clone(), class_name.clone());
         }
-        walk::walk_if_statement(self, stmt);
+        self.visit_expression(&stmt.test);
+        let values = self.push_conditional_binding_scope(&narrowings);
+        self.visit_statement(&stmt.consequent);
+        let consequent = self.pop_conditional_binding_scope(values);
+        let values = self.push_conditional_binding_scope(&[]);
+        if let Some(alternate) = &stmt.alternate {
+            self.visit_statement(alternate);
+        }
+        let alternate = self.pop_conditional_binding_scope(values);
+        self.join_conditional_binding_scopes(&consequent, &alternate);
     }
 
     fn visit_spread_element(&mut self, elem: &SpreadElement<'a>) {
@@ -4477,9 +5244,18 @@ impl<'a> Visit<'a> for ModuleInfoExtractor {
             self.record_angular_template_members(&meta);
         }
         self.class_super_stack
-            .push(super::helpers::extract_super_class_name(class));
-        self.class_type_param_constraints
-            .push(super::helpers::collect_class_type_param_constraints(class));
+            .push(super::helpers::extract_super_class_name(class).map(|name| {
+                (
+                    name,
+                    class
+                        .heritage
+                        .as_ref()
+                        .and_then(|base| iteration_source_reference(&base.expression)),
+                )
+            }));
+        self.class_type_param_constraints.push(
+            super::helpers::collect_class_type_param_constraint_origins(class),
+        );
         // Assign this class body a unique scope id so its `this.<field>` binding
         // keys are qualified per-class (issue #1821, Fix B). A nested class
         // pushes its own id, so `this` inside the inner body binds to the inner
@@ -5314,6 +6090,32 @@ fn type_name_member_path(name: &TSTypeName<'_>) -> Option<String> {
     }
 }
 
+fn subclass_receiver_reference<'a, 'b>(
+    expression: &'b Expression<'a>,
+) -> Option<(&'b IdentifierReference<'a>, Vec<String>)> {
+    match unwrap_static_expr(expression) {
+        Expression::Identifier(reference) => Some((reference, Vec::new())),
+        Expression::NewExpression(new) => {
+            let Expression::Identifier(reference) = unwrap_static_expr(&new.callee) else {
+                return None;
+            };
+            Some((reference, Vec::new()))
+        }
+        Expression::StaticMemberExpression(member) => {
+            let (reference, mut path) = subclass_receiver_reference(&member.object)?;
+            path.push(member.property.name.to_string());
+            Some((reference, path))
+        }
+        Expression::ComputedMemberExpression(member) => {
+            let name = member.static_property_name()?;
+            let (reference, mut path) = subclass_receiver_reference(&member.object)?;
+            path.push(name.to_string());
+            Some((reference, path))
+        }
+        _ => None,
+    }
+}
+
 fn static_member_object_name(expr: &Expression<'_>) -> Option<String> {
     match expr {
         Expression::ParenthesizedExpression(wrapper) => {
@@ -5444,13 +6246,21 @@ fn is_html_tagged_template(tag: &Expression<'_>) -> bool {
 /// Recurses through `&&`-chained conditions so `a instanceof A && b instanceof B`
 /// yields both pairs. Only simple identifier left-hand sides (`x instanceof Cls`)
 /// are collected; complex left-hand expressions are skipped conservatively.
-fn collect_instanceof_narrowings<'a>(expr: &'a Expression<'a>, out: &mut Vec<(String, String)>) {
+fn collect_instanceof_narrowings<'a>(
+    expr: &'a Expression<'a>,
+    out: &mut Vec<(String, String, Span, Span)>,
+) {
     match expr {
         Expression::BinaryExpression(bin) if bin.operator == BinaryOperator::Instanceof => {
             if let Expression::Identifier(left) = &bin.left
                 && let Expression::Identifier(right) = &bin.right
             {
-                out.push((left.name.to_string(), right.name.to_string()));
+                out.push((
+                    left.name.to_string(),
+                    right.name.to_string(),
+                    left.span,
+                    right.span,
+                ));
             }
         }
         Expression::LogicalExpression(logical) if logical.operator == LogicalOperator::And => {
@@ -5600,5 +6410,14 @@ impl ModuleInfoExtractor {
             span: oxc_span::Span::default(),
             source_span: oxc_span::Span::default(),
         });
+    }
+}
+
+fn iteration_source_reference(expression: &Expression<'_>) -> Option<Span> {
+    match unwrap_static_expr(expression) {
+        Expression::Identifier(reference) => Some(reference.span),
+        Expression::StaticMemberExpression(member) => iteration_source_reference(&member.object),
+        Expression::CallExpression(call) => iteration_source_reference(&call.callee),
+        _ => None,
     }
 }
