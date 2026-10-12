@@ -2,6 +2,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use fallow_types::extract::is_anonymous_function_name;
 use fallow_types::identity::{IdentifiedFinding, IdentityPaths};
 
 use crate::duplicates::DuplicationReport;
@@ -2763,23 +2764,28 @@ impl HealthBaselineData {
         } else {
             let current_counts = health_finding_counts(findings, root, mode);
             let direct = health_overlap_entry_count(&current_counts, baseline_counts);
-            let remapped = (mode == HealthBaselineMode::Identity)
-                .then(|| {
-                    identity_counts_with_move_tolerance(baseline_counts, &current_counts, root)
-                })
-                .flatten();
-            match remapped {
-                Some(remapped_counts) => {
-                    let matched = health_overlap_entry_count(&current_counts, &remapped_counts);
-                    HealthBaselineOverlap {
-                        matched_entries: matched,
-                        moved_entries: matched.saturating_sub(direct),
-                    }
-                }
-                None => HealthBaselineOverlap {
+            if mode != HealthBaselineMode::Identity {
+                return HealthBaselineOverlap {
                     matched_entries: direct,
                     moved_entries: 0,
-                },
+                };
+            }
+            // `moved_entries` counts only followed file moves, so the overlap
+            // is computed before and after the placeholder transfer.
+            let moved = identity_counts_with_move_tolerance(baseline_counts, &current_counts, root);
+            let moved_matched = moved.as_ref().map_or(direct, |counts| {
+                health_overlap_entry_count(&current_counts, counts)
+            });
+            let matched = identity_counts_with_placeholder_allowance(
+                moved.as_ref().unwrap_or(baseline_counts),
+                &current_counts,
+            )
+            .map_or(moved_matched, |counts| {
+                health_overlap_entry_count(&current_counts, &counts)
+            });
+            HealthBaselineOverlap {
+                matched_entries: matched,
+                moved_entries: moved_matched.saturating_sub(direct),
             }
         }
     }
@@ -2830,11 +2836,6 @@ fn health_bucket_key(
     }
 }
 
-/// Placeholder name for functions without a resolvable name; two anonymous
-/// functions sharing it is not evidence of identity, so move tolerance skips
-/// such buckets entirely.
-const ANONYMOUS_FUNCTION_NAME: &str = "<anonymous>";
-
 fn identity_bucket_parts(key: &str) -> Option<(&str, &str)> {
     key.split_once('\0')
 }
@@ -2867,7 +2868,7 @@ fn moved_identity_bucket_remaps(
             continue;
         }
         if let Some((_, name)) = identity_bucket_parts(key)
-            && name != ANONYMOUS_FUNCTION_NAME
+            && !is_anonymous_function_name(name)
         {
             candidates_by_name.entry(name).or_default().push(key);
         }
@@ -2882,7 +2883,7 @@ fn moved_identity_bucket_remaps(
         let Some((path, name)) = identity_bucket_parts(key) else {
             continue;
         };
-        if name == ANONYMOUS_FUNCTION_NAME || root.join(path).exists() {
+        if is_anonymous_function_name(name) || root.join(path).exists() {
             continue;
         }
         if let Some(candidates) = candidates_by_name.get(name)
@@ -2898,6 +2899,114 @@ fn moved_identity_bucket_remaps(
         .filter(|(_, candidate)| claims.get(candidate) == Some(&1))
         .map(|(old, new)| (old.to_string(), new.to_string()))
         .collect()
+}
+
+/// A current identity bucket with a function name: the key and its counts.
+type NamedBucket<'a> = (&'a String, &'a BTreeMap<String, HealthBaselineCount>);
+
+/// Baseline identity counts where a placeholder bucket (`<anonymous>`,
+/// `<arrow>`) gives its unused allowance to new function names in the same
+/// file.
+///
+/// A function without a declared name can get a context name in a later
+/// version (`Command.make("setup")`, an `Effect.fn` span name). Its findings
+/// then move from the placeholder bucket to a named bucket that has no
+/// allowance for them. This transfer keeps such a baseline valid. The
+/// allowance moves per category, only to named buckets in the same file whose
+/// current count is above their own allowance, and only up to the count that
+/// the placeholder bucket no longer uses. After a re-save, a placeholder bucket has unused allowance only when
+/// an unnamed finding was fixed. Count mode has the same tolerance per file.
+///
+/// Returns `None` when no allowance moves, so callers can keep borrowing the
+/// original map.
+fn identity_counts_with_placeholder_allowance(
+    baseline_counts: &HealthFindingCountMap,
+    current_counts: &HealthFindingCountMap,
+) -> Option<HealthFindingCountMap> {
+    let mut named_by_path: FxHashMap<&str, Vec<NamedBucket<'_>>> = FxHashMap::default();
+    for (key, counts) in current_counts {
+        if let Some((path, name)) = identity_bucket_parts(key)
+            && !is_anonymous_function_name(name)
+        {
+            named_by_path.entry(path).or_default().push((key, counts));
+        }
+    }
+    let mut transferred: HealthFindingCountMap = BTreeMap::new();
+    for (key, placeholder_counts) in baseline_counts {
+        let Some((path, name)) = identity_bucket_parts(key) else {
+            continue;
+        };
+        if !is_anonymous_function_name(name) {
+            continue;
+        }
+        let Some(recipients) = named_by_path.get(path) else {
+            continue;
+        };
+        for (category, placeholder_count) in placeholder_counts {
+            let mut unused = placeholder_count
+                .count
+                .saturating_sub(bucket_category_count(current_counts, key, category));
+            for (recipient_key, recipient_counts) in recipients {
+                if unused == 0 {
+                    break;
+                }
+                let current = recipient_counts
+                    .get(category)
+                    .map_or(0, |entry| entry.count);
+                let own_allowance = bucket_category_count(baseline_counts, recipient_key, category);
+                let given = transferred
+                    .entry((*recipient_key).clone())
+                    .or_default()
+                    .entry(category.clone())
+                    .or_insert(HealthBaselineCount { count: 0 });
+                let take = current
+                    .saturating_sub(own_allowance + given.count)
+                    .min(unused);
+                given.count += take;
+                unused -= take;
+            }
+        }
+    }
+    transferred.retain(|_, counts| {
+        counts.retain(|_, entry| entry.count > 0);
+        !counts.is_empty()
+    });
+    if transferred.is_empty() {
+        return None;
+    }
+    let mut effective = baseline_counts.clone();
+    for (key, counts) in transferred {
+        let bucket = effective.entry(key).or_default();
+        for (category, given) in counts {
+            bucket
+                .entry(category)
+                .and_modify(|entry| entry.count += given.count)
+                .or_insert(given);
+        }
+    }
+    Some(effective)
+}
+
+fn bucket_category_count(counts: &HealthFindingCountMap, key: &str, category: &str) -> usize {
+    counts
+        .get(key)
+        .and_then(|bucket| bucket.get(category))
+        .map_or(0, |entry| entry.count)
+}
+
+/// Baseline identity counts after file-move tolerance and the placeholder
+/// allowance transfer. Returns `None` when neither changes the baseline.
+fn effective_identity_counts(
+    baseline_counts: &HealthFindingCountMap,
+    current_counts: &HealthFindingCountMap,
+    root: &Path,
+) -> Option<HealthFindingCountMap> {
+    let moved = identity_counts_with_move_tolerance(baseline_counts, current_counts, root);
+    identity_counts_with_placeholder_allowance(
+        moved.as_ref().unwrap_or(baseline_counts),
+        current_counts,
+    )
+    .or(moved)
 }
 
 /// Baseline identity counts with retired buckets re-keyed to moved files.
@@ -3118,7 +3227,7 @@ pub(crate) fn filter_new_health_findings(
     if !baseline_counts.is_empty() {
         let current_counts = health_finding_counts(&findings, root, mode);
         let remapped = (mode == HealthBaselineMode::Identity)
-            .then(|| identity_counts_with_move_tolerance(baseline_counts, &current_counts, root))
+            .then(|| effective_identity_counts(baseline_counts, &current_counts, root))
             .flatten();
         let overflow_categories = health_overflow_categories(
             &current_counts,
@@ -4972,6 +5081,118 @@ mod tests {
             HealthBaselineMode::Identity,
         );
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn health_identity_move_is_not_followed_for_arrow_placeholders() {
+        let root = PathBuf::from("/project");
+        let baseline = identity_baseline(&[make_health_finding(&root, "<arrow>", 42)], &root);
+        let filtered = super::filter_new_health_findings(
+            vec![moved_finding(&root, "src/moved.ts", "<arrow>")],
+            &baseline,
+            &root,
+            HealthBaselineMode::Identity,
+        );
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn health_identity_placeholder_allowance_covers_new_context_names() {
+        let root = PathBuf::from("/project");
+        let baseline = identity_baseline(
+            &[
+                make_health_finding(&root, "<anonymous>", 10),
+                make_health_finding(&root, "<arrow>", 20),
+            ],
+            &root,
+        );
+        let current = vec![
+            make_health_finding(&root, "fetchIssue", 10),
+            make_health_finding(&root, "Command.make(\"setup\")", 20),
+        ];
+        let filtered = super::filter_new_health_findings(
+            current.clone(),
+            &baseline,
+            &root,
+            HealthBaselineMode::Identity,
+        );
+        assert!(filtered.is_empty(), "{filtered:?}");
+        let overlap = baseline.overlap_entries(&current, &root, HealthBaselineMode::Identity);
+        assert_eq!(overlap.matched_entries, 2);
+        assert_eq!(overlap.moved_entries, 0);
+    }
+
+    #[test]
+    fn health_identity_placeholder_allowance_gives_only_unused_count() {
+        let root = PathBuf::from("/project");
+        let baseline = identity_baseline(&[make_health_finding(&root, "<anonymous>", 10)], &root);
+        let filtered = super::filter_new_health_findings(
+            vec![
+                make_health_finding(&root, "<anonymous>", 10),
+                make_health_finding(&root, "newHotspot", 30),
+            ],
+            &baseline,
+            &root,
+            HealthBaselineMode::Identity,
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "newHotspot");
+    }
+
+    #[test]
+    fn health_identity_placeholder_allowance_stays_in_its_file() {
+        let root = PathBuf::from("/project");
+        let baseline = identity_baseline(&[make_health_finding(&root, "<anonymous>", 10)], &root);
+        let filtered = super::filter_new_health_findings(
+            vec![moved_finding(&root, "src/other.ts", "fetchIssue")],
+            &baseline,
+            &root,
+            HealthBaselineMode::Identity,
+        );
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn health_identity_placeholder_allowance_tops_up_a_known_name() {
+        let root = PathBuf::from("/project");
+        // The wrapper `load` was a finding, and the generator that it returns
+        // was `<anonymous>`. Both now carry `load`.
+        let baseline = identity_baseline(
+            &[
+                make_health_finding(&root, "<anonymous>", 10),
+                make_health_finding(&root, "load", 30),
+            ],
+            &root,
+        );
+        let current = vec![
+            make_health_finding(&root, "load", 10),
+            make_health_finding(&root, "load", 30),
+        ];
+        let filtered = super::filter_new_health_findings(
+            current.clone(),
+            &baseline,
+            &root,
+            HealthBaselineMode::Identity,
+        );
+        assert!(filtered.is_empty(), "{filtered:?}");
+        let overlap = baseline.overlap_entries(&current, &root, HealthBaselineMode::Identity);
+        assert_eq!(overlap.matched_entries, 2);
+    }
+
+    #[test]
+    fn health_identity_placeholder_allowance_is_not_shared_twice() {
+        let root = PathBuf::from("/project");
+        let baseline = identity_baseline(&[make_health_finding(&root, "<anonymous>", 10)], &root);
+        let filtered = super::filter_new_health_findings(
+            vec![
+                make_health_finding(&root, "alpha", 10),
+                make_health_finding(&root, "beta", 30),
+            ],
+            &baseline,
+            &root,
+            HealthBaselineMode::Identity,
+        );
+        assert_eq!(filtered.len(), 1, "one placeholder covers one finding");
     }
 
     #[test]
