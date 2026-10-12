@@ -10323,3 +10323,134 @@ fn health_performance_reports_the_git_log_bytes_read() {
     let uncached = health_performance_git_log_bytes(root, &["--no-cache"]);
     assert_eq!(uncached, cold, "the same history gives the same byte count");
 }
+
+#[test]
+fn health_css_credits_keyframes_in_animation_shorthand_with_var() {
+    // Issue #3349: `var()` in the shorthand must not hide the literal name.
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    write_file(&root.join("package.json"), r#"{"name":"css-repro-plain"}"#);
+    write_file(
+        &root.join(".fallowrc.json"),
+        r#"{"entry":["src/main.ts"],"rules":{"css-dead-surface":"warn"}}"#,
+    );
+    write_file(&root.join("src/main.ts"), "import \"./style.css\";\n");
+    write_file(
+        &root.join("src/style.css"),
+        ".fixture {\n  --duration: 200ms;\n  animation: pulse var(--duration) ease, glow var(--duration);\n}\n\
+         .other { animation: var(--name) 1s; }\n\
+         @keyframes pulse { from { opacity: 0; } to { opacity: 1; } }\n\
+         @keyframes glow { from { opacity: 0; } }\n\
+         @keyframes dead-anim { from { opacity: 0; } }\n",
+    );
+
+    assert_eq!(
+        css_list_names(root, "unreferenced_keyframes", "name"),
+        vec!["dead-anim".to_string()],
+        "literal names next to var() are credited; a var() name stays unresolved"
+    );
+}
+
+#[test]
+fn health_css_credits_vue_transition_classes_in_scoped_styles() {
+    // Issue #3350: Vue applies `<name>-enter-active` and the other transition
+    // classes at runtime for a literal `name`.
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    write_file(
+        &root.join("package.json"),
+        r#"{"name":"css-repro-transition-literal","dependencies":{"vue":"^3.4.0"}}"#,
+    );
+    write_file(
+        &root.join(".fallowrc.json"),
+        r#"{"entry":["src/main.ts"],"rules":{"css-dead-surface":"warn"}}"#,
+    );
+    write_file(
+        &root.join("src/main.ts"),
+        "import { createApp } from \"vue\";\nimport App from \"./App.vue\";\ncreateApp(App).mount(\"#app\");\n",
+    );
+    write_file(
+        &root.join("src/App.vue"),
+        "<template>\n  <button @click=\"visible = !visible\">Toggle</button>\n  \
+         <Transition name=\"fade\"><div v-if=\"visible\" class=\"panel\">Panel</div></Transition>\n\
+         </template>\n\
+         <script setup lang=\"ts\">\nimport { ref } from \"vue\";\nconst visible = ref(true);\n</script>\n\
+         <style scoped>\n.panel { color: red; }\n.fade-enter-active { transition: opacity 200ms ease; }\n\
+         .fade-move { color: blue; }\n</style>\n",
+    );
+
+    let out = run_fallow_in_root(
+        "health",
+        root,
+        &["--css", "--no-cache", "--format", "json", "--quiet"],
+    );
+    let json = parse_json(&out);
+    let scoped = json["css_analytics"]["scoped_unused"]
+        .as_array()
+        .expect("scoped_unused array");
+    let classes: Vec<&str> = scoped
+        .iter()
+        .flat_map(|entry| entry["classes"].as_array().unwrap().iter())
+        .filter_map(|class| class.as_str())
+        .collect();
+    assert_eq!(
+        classes,
+        vec!["fade-move"],
+        "`fade-enter-active` is credited; `fade-move` needs a TransitionGroup"
+    );
+}
+
+#[test]
+fn health_css_credits_vue_transition_classes_in_global_styles() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    write_file(
+        &root.join("package.json"),
+        r#"{"name":"vue-global-transition","dependencies":{"vue":"^3.4.0"}}"#,
+    );
+    write_file(
+        &root.join("src/main.ts"),
+        "import \"./app.css\";\nimport App from \"./App.vue\";\nexport { App };\n",
+    );
+    write_file(
+        &root.join("src/app.css"),
+        ".panel-shell{}\n.slide-leave-active{}\n.list-move{}\n.v-enter-from{}\n.really-dead-class{}\n",
+    );
+    write_file(
+        &root.join("src/App.vue"),
+        "<template>\n  <Transition name=\"slide\"><div class=\"panel-shell\"/></Transition>\n  \
+         <transition-group name=\"list\" tag=\"ul\"><li/></transition-group>\n  \
+         <Transition :name=\"dynamicName\"><p/></Transition>\n</template>\n",
+    );
+
+    assert_eq!(
+        css_list_names(root, "unreferenced_css_classes", "class"),
+        vec!["really-dead-class".to_string(), "v-enter-from".to_string()],
+        "literal transition names credit their classes; a bound name credits nothing"
+    );
+}
+
+#[test]
+fn health_css_invalid_animation_value_adds_no_undefined_keyframe() {
+    // An invalid `animation` value is kept as raw tokens, like a `var()` value.
+    // Its identifiers must not become undefined keyframe references.
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    write_file(
+        &root.join("package.json"),
+        r#"{"name":"css-invalid-animation"}"#,
+    );
+    write_file(&root.join("src/main.ts"), "import \"./style.css\";\n");
+    write_file(
+        &root.join("src/style.css"),
+        ".a { animation: spin 1s smooth; }\n\
+         .b { animation: x var(--d) replace add accumulate; }\n\
+         @keyframes spin { from { opacity: 0; } }\n\
+         @keyframes x { from { opacity: 0; } }\n",
+    );
+
+    assert!(
+        css_list_names(root, "undefined_keyframes", "name").is_empty(),
+        "invalid values and composition keywords are not keyframe references"
+    );
+}
