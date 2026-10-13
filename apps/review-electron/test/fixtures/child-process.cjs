@@ -31,7 +31,7 @@ switch (mode) {
     setInterval(() => {}, 1_000);
     break;
   case "tree": {
-    const descendant = spawn(process.execPath, [__filename, "descendant", args[1]], {
+    const descendant = spawn(process.execPath, [__filename, "descendant", args[1], args[2]], {
       stdio: "ignore",
     });
     writeFileSync(args[0], String(descendant.pid));
@@ -43,6 +43,7 @@ switch (mode) {
       writeFileSync(args[0], "terminated");
       process.exit(0);
     });
+    writeFileSync(args[1], String(process.pid));
     setInterval(() => {}, 1_000);
     break;
   default:

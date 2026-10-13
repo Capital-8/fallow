@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { setTimeout as wait } from "node:timers/promises";
 import { join, resolve } from "node:path";
 import {
   cancelActiveProcesses,
@@ -12,6 +13,17 @@ import {
 
 const fixture = resolve(process.cwd(), "test", "fixtures", "child-process.cjs");
 const roots: string[] = [];
+const READINESS_TIMEOUT_MS = 5_000;
+const READINESS_POLL_MS = 10;
+const PROCESS_DEADLINE_MS = 200;
+
+const waitForFile = async (path: string): Promise<void> => {
+  const deadline = Date.now() + READINESS_TIMEOUT_MS;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`child did not create ${path}`);
+    await wait(READINESS_POLL_MS);
+  }
+};
 
 const root = (): string => {
   const path = mkdtempSync(join(tmpdir(), "fallow-process-run-"));
@@ -38,6 +50,7 @@ const runFixture = (
 
 afterEach(() => {
   cancelActiveProcesses();
+  vi.useRealTimers();
   for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
@@ -76,10 +89,21 @@ describe("runProcess", () => {
     const dir = root();
     const descendantPid = join(dir, "descendant.pid");
     const descendantTerminated = join(dir, "descendant.terminated");
+    const descendantReady = join(dir, "descendant.ready");
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const outcome = runFixture("tree", [descendantPid, descendantTerminated, descendantReady], {
+      deadlineMs: PROCESS_DEADLINE_MS,
+    }).then(
+      (): null => null,
+      (error: unknown): unknown => error,
+    );
 
-    await expect(
-      runFixture("tree", [descendantPid, descendantTerminated], { deadlineMs: 200 }),
-    ).rejects.toMatchObject({ kind: "timeout" });
+    await waitForFile(descendantReady);
+    await waitForFile(descendantPid);
+    expect(readFileSync(descendantReady, "utf8")).toBe(readFileSync(descendantPid, "utf8"));
+    vi.advanceTimersByTime(PROCESS_DEADLINE_MS);
+    expect(await outcome).toMatchObject({ kind: "timeout" });
+    await waitForFile(descendantTerminated);
 
     expect(Number(readFileSync(descendantPid, "utf8"))).toBeGreaterThan(0);
     expect(readFileSync(descendantTerminated, "utf8")).toBe("terminated");
