@@ -141,6 +141,19 @@ fn build_impact_closure_facts(
     result: &AuditResult,
     diff_index: Option<&fallow_output::DiffIndex>,
 ) -> ImpactClosureFacts {
+    let mut facts = build_graph_impact_closure_facts(result, diff_index);
+    if let Some(check) = result.check.as_ref() {
+        facts.set_co_change_gaps(&check.co_change_gaps);
+    }
+    facts
+}
+
+/// The graph part of the Stage 3 facts: affected set, coordination gaps and
+/// the literal-search gap.
+fn build_graph_impact_closure_facts(
+    result: &AuditResult,
+    diff_index: Option<&fallow_output::DiffIndex>,
+) -> ImpactClosureFacts {
     let Some(closure) = result
         .check
         .as_ref()
@@ -1000,6 +1013,33 @@ fn symbols_taken(sources: &[&CoordinationGapFact]) -> usize {
     sources.iter().map(|g| g.consumed_symbols.len()).sum()
 }
 
+/// Human lines for the co-change gaps: one header, one line per listed gap,
+/// and a note for the gaps that the cap cut.
+fn co_change_gap_lines(closure: &ImpactClosureFacts) -> Vec<String> {
+    let gaps = &closure.co_change_gap;
+    if gaps.is_empty() {
+        return Vec::new();
+    }
+    let total = closure.co_change_gap_count.max(gaps.len());
+    let mut lines = vec![format!(
+        "  co-change gaps ({total}): files that usually change together, no import between them"
+    )];
+    for gap in gaps {
+        lines.push(format!(
+            "    {} -> {} ({} shared commits, {:.0}%)",
+            gap.changed_file,
+            gap.partner_file,
+            gap.shared_revisions,
+            gap.degree * 100.0
+        ));
+    }
+    let hidden = total - gaps.len();
+    if hidden > 0 {
+        lines.push(format!("    {hidden} more not shown"));
+    }
+    lines
+}
+
 /// Print the Stage 3 impact-closure summary on the human brief: the blast
 /// radius and its heaviest directory, then the coordination gaps (the precise
 /// inter-module attention pointer). Caller has already gated on `!quiet`.
@@ -1008,6 +1048,9 @@ fn print_impact_closure_human(closure: &ImpactClosureFacts) {
         eprintln!("{line}");
     }
     for line in coordination_gap_lines(&closure.coordination_gap) {
+        eprintln!("{line}");
+    }
+    for line in co_change_gap_lines(closure) {
         eprintln!("{line}");
     }
     for line in search_gap_lines(closure.search_gap.as_ref()) {
