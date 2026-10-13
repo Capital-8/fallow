@@ -206,6 +206,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under the original export. A namespace import with member access (`ns.a`) stays `found`,
   and a whole-object use (`Object.keys(ns)`, a spread, `ns` as a value) stays
   `missed`.
+
+- **Coverage gaps and the CRAP estimate count only value references from
+  tests.** Before, a test reference that uses a value export only as a type
+  counted as test reach. This covers an `import type`, and also a plain
+  `import` that the test uses only in type positions (for example
+  `typeof fn`). Now `fallow health --coverage-gaps` reports such an export
+  under `untested_exports`. The static CRAP estimate for that function uses
+  40% coverage (test-reachable file), not 85% (directly tested export). The
+  static test signal of runtime coverage changes the same way. File-level
+  reach does not change. A test with only type references to a module still
+  makes that file test-reachable.
+
 - **The MCP `audit` tool and `fallow_api::run_audit` read the `audit` config
   section.** The typed route ignored `audit.gate`, `audit.css` and
   `audit.cssDeep`. A project with `"gate": "all"` got the `new-only` verdict
