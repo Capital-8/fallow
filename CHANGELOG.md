@@ -42,16 +42,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported.
   `diverged-clone-sibling` reports an edit to one copy of duplicated code when
   the other copies did not change. `added-dependency` reports a new
-  `package.json` dependency and is off by default. The other four rules are
-  `warn` by default. Set a rule to `error` to fail the audit, or suppress one
-  finding with `// fallow-ignore-next-line <rule>`. The findings are in the new
-  `diff_risk` JSON section, in SARIF, in CodeClimate, in GitHub annotations,
-  in the GitHub job summary and in the MCP `audit` tool. Compact output adds
-  one record for each finding and markdown output adds a table. The human
-  status line, the issue count of the GitHub Action and the GitLab template,
-  and the VS Code audit status bar count the findings too. `added-dependency`
-  has no suppression comment, because `package.json` cannot hold one: set the
-  rule to `off` for the path in an `overrides` entry.
+  `package.json` dependency. These two rules are off by default. The other
+  three rules are `warn` by default. Set a rule to `error` to fail the audit,
+  or suppress one finding with `// fallow-ignore-next-line <rule>`. The
+  findings are in the new `diff_risk` JSON section, in SARIF, in CodeClimate,
+  in GitHub annotations, in the GitHub job summary and in the MCP `audit`
+  tool. Compact output adds one record for each finding and markdown output
+  adds a table. The human status line, the issue count of the GitHub Action
+  and the GitLab template, and the VS Code audit status bar count the findings
+  too. `added-dependency` has no suppression comment, because `package.json`
+  cannot hold one: set the rule to `off` for the path in an `overrides` entry.
 - **`fallow health` now reports hidden change coupling and change
   dispersion.** A hidden pair is two files that change together in most
   commits while no import or re-export chain connects them. An agent that
@@ -167,6 +167,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--fail-on-issues` is set. The dead-code count gate of the GitHub Action
   counts `warn` findings, because `fail-on-issues` defaults to `true` and the
   gate reads `total_issues`.
+- **The diff-risk rules of `fallow audit` report less noise.** A check over
+  merged pull requests of five public projects found these causes, and the
+  rules now handle them:
+  - `weakened-tests` does not report removed tests or assertions when the
+    lost test lines name code that the same change removed, such as a deleted
+    function, error code or fixture directory. The tests went with that code.
+    A name of a deleted file that a changed file still holds, a name that a
+    deleted file only imports, a directory that still exists, and a reserved
+    word such as `import` do not count.
+  - `weakened-tests` reports an assertion drop only when assertions are at
+    least half of the code lines that the test file lost. A test rewrite that
+    moves setup checks into a shared helper does not report.
+  - `added-suppression` does not report files below a fixture or generated
+    directory, such as a vendored `fixture/generated/schema.ts` with a
+    `// @ts-nocheck` header.
+  - `test-only-branch` does not report a check that only keeps `console`
+    output quiet in tests, or a check that picks a `.env.test` file.
+  - `diverged-clone-sibling` does not report an edit to a story copy
+    (`*.stories.*`, `*.story.*`), the same as a test copy.
+  - `diverged-clone-sibling` is now `off` by default. Most of its findings
+    were copies that differ on purpose, for example an input and an output
+    type, a legacy copy, or one component that gets a new feature. Set the
+    rule to `warn` or `error` to review every diverged copy.
+  (Closes [#3367](https://github.com/fallow-rs/fallow/issues/3367))
 - **A static member read through a namespace is no longer an unused class
   member.** Code such as `Layer.provide(Discord.ApiClient.layer)` did not count
   as a use of `ApiClient.layer`. Now a read of `Ns.Class.member` credits the
