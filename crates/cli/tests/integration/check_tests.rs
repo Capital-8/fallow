@@ -1094,11 +1094,18 @@ fn audit_performance_reports_no_process_clock() {
 /// inherently nondeterministic wall-clock fields are stripped.
 #[test]
 fn combined_parallel_output_is_deterministic() {
+    let project = crate::common::copy_fixture("duplicate-code");
+    let root = project.path().to_str().expect("UTF-8 root");
     let mut canonicalized: Vec<String> = std::iter::repeat_with(|| {
-        let output = run_fallow_combined(
-            "duplicate-code",
-            &["--only", "dead-code,dupes", "--format", "json", "--quiet"],
-        );
+        let output = run_fallow_raw(&[
+            "--root",
+            root,
+            "--only",
+            "dead-code,dupes",
+            "--format",
+            "json",
+            "--quiet",
+        ]);
         assert!(
             output.code == 0 || output.code == 1,
             "combined run should not crash: stdout={}\nstderr={}",

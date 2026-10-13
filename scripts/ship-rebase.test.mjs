@@ -757,6 +757,7 @@ test("the run does not touch an unrelated branch with uncommitted changes", (t) 
 
 test("--push runs the pre-push hook of a relative core.hooksPath", (t) => {
   const repo = changelogConflictRepo(t);
+  delete repo.env.CARGO_TARGET_DIR;
   const log = join(repo.root, "pre-push.log");
   mkdirSync(join(repo.work, "hooks"));
   mkdirSync(join(repo.work, "target"));
