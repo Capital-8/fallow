@@ -318,6 +318,23 @@ Contract rules:
   the tool runs the CLI. The
   drift case `i5_audit_config_section_agrees_across_surfaces` holds both
   routes to the CLI result.
+- The typed routes run type-aware analysis only when the caller sets
+  `AnalysisOptions.type_aware`. The CLI also turns it on from
+  `FALLOW_TYPE_AWARE`, `audit.typeAware` (audit only) and
+  `typeAware.enabled`, with that precedence. `fallow_api` therefore refuses a
+  run that these layers make type-aware with
+  `FALLOW_TYPE_AWARE_CONFIG_UNSUPPORTED`: `run_dead_code`,
+  `run_circular_dependencies`, `run_boundary_violations`, `run_audit`,
+  `run_combined` when its dead-code or health section runs, and `run_health`
+  when no section and no `css` is selected (the CLI adds type coupling only
+  then). `api_runtime::typed_error_needs_cli` reads the code, and `analyze`,
+  `check_changed`, `check_health`, `audit` and the Code Mode `combined` and
+  `checkChanged` routes run the CLI instead. The `type_aware: false`
+  parameter does not turn off type-aware analysis that the config turns on:
+  the typed route refuses, and the CLI fallback passes no `--no-type-aware`.
+  The drift case
+  `type_aware_config_agrees_across_surfaces` holds the MCP envelope to the
+  `_meta.type_aware` of the CLI.
 - `trace_symbol` and `symbol_impact` expose exact TypeScript evidence for
   Fallow-owned project questions. They do not expose compiler diagnostics or
   typed lint findings.
