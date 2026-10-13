@@ -436,6 +436,28 @@ pub struct RulesConfig {
     /// "error-runtime" severity tier, shared with `route-collision`).
     #[serde(default, alias = "dynamic-segment-name-conflicts")]
     pub dynamic_segment_name_conflict: Severity,
+    /// An audit diff that weakens tests: a new skip or focus marker, removed
+    /// test cases, fewer assertions, or a lowered coverage threshold.
+    /// `fallow audit` only. Defaults to `warn`.
+    #[serde(default = "Severity::default_warn")]
+    pub weakened_tests: Severity,
+    /// An audit diff that adds a lint, type-check, coverage or Fallow
+    /// suppression comment. `fallow audit` only. Defaults to `warn`.
+    #[serde(default = "Severity::default_warn", alias = "added-suppressions")]
+    pub added_suppression: Severity,
+    /// An audit diff that adds a test-environment branch to a non-test source
+    /// file. `fallow audit` only. Defaults to `warn`.
+    #[serde(default = "Severity::default_warn", alias = "test-only-branches")]
+    pub test_only_branch: Severity,
+    /// An audit diff that edits one copy of a base clone group so that it no
+    /// longer matches its siblings, while no sibling changed. `fallow audit`
+    /// only. Defaults to `warn`.
+    #[serde(default = "Severity::default_warn", alias = "diverged-clone-siblings")]
+    pub diverged_clone_sibling: Severity,
+    /// An audit diff that adds a dependency to a `package.json`. `fallow
+    /// audit` only. Opt-in; defaults to `off`.
+    #[serde(default = "Severity::default_off", alias = "added-dependencies")]
+    pub added_dependency: Severity,
 }
 
 impl Default for RulesConfig {
@@ -504,6 +526,11 @@ impl Default for RulesConfig {
             misplaced_directive: Severity::Warn,
             route_collision: Severity::Error,
             dynamic_segment_name_conflict: Severity::Error,
+            weakened_tests: Severity::Warn,
+            added_suppression: Severity::Warn,
+            test_only_branch: Severity::Warn,
+            diverged_clone_sibling: Severity::Warn,
+            added_dependency: Severity::Off,
         }
     }
 }
@@ -590,6 +617,11 @@ impl RulesConfig {
             IssueKind::CssSelectorComplexity => self.css_selector_complexity,
             IssueKind::CssDeadSurface => self.css_dead_surface,
             IssueKind::CssBrokenReference => self.css_broken_reference,
+            IssueKind::WeakenedTests => self.weakened_tests,
+            IssueKind::AddedSuppression => self.added_suppression,
+            IssueKind::TestOnlyBranch => self.test_only_branch,
+            IssueKind::DivergedCloneSibling => self.diverged_clone_sibling,
+            IssueKind::AddedDependency => self.added_dependency,
             IssueKind::Complexity | IssueKind::CodeDuplication => Severity::Error,
         }
     }
@@ -709,6 +741,11 @@ impl RulesConfig {
                 misplaced_directive,
                 route_collision,
                 dynamic_segment_name_conflict,
+                weakened_tests,
+                added_suppression,
+                test_only_branch,
+                diverged_clone_sibling,
+                added_dependency,
             ]
         );
     }
@@ -1157,6 +1194,37 @@ pub struct PartialRulesConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub dynamic_segment_name_conflict: Option<Severity>,
+    /// Optional override for [`RulesConfig::weakened_tests`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weakened_tests: Option<Severity>,
+    /// Optional override for [`RulesConfig::added_suppression`].
+    #[serde(
+        default,
+        alias = "added-suppressions",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub added_suppression: Option<Severity>,
+    /// Optional override for [`RulesConfig::test_only_branch`].
+    #[serde(
+        default,
+        alias = "test-only-branches",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub test_only_branch: Option<Severity>,
+    /// Optional override for [`RulesConfig::diverged_clone_sibling`].
+    #[serde(
+        default,
+        alias = "diverged-clone-siblings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub diverged_clone_sibling: Option<Severity>,
+    /// Optional override for [`RulesConfig::added_dependency`].
+    #[serde(
+        default,
+        alias = "added-dependencies",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub added_dependency: Option<Severity>,
 }
 
 /// Every rule name accepted by `RulesConfig` deserialization, in kebab-case.
@@ -1287,6 +1355,15 @@ pub const KNOWN_RULE_NAMES: &[&str] = &[
     "misplaced-directives",
     "route-collisions",
     "dynamic-segment-name-conflicts",
+    "weakened-tests",
+    "added-suppression",
+    "added-suppressions",
+    "test-only-branch",
+    "test-only-branches",
+    "diverged-clone-sibling",
+    "diverged-clone-siblings",
+    "added-dependency",
+    "added-dependencies",
 ];
 
 /// Find the closest known rule name to `input` when it is plausibly a typo.
@@ -1781,6 +1858,11 @@ mod tests {
             route_collision: Some(Severity::Off),
             dynamic_segment_name_conflict: Some(Severity::Off),
             deprecated_exports_in_use: Some(Severity::Off),
+            weakened_tests: Some(Severity::Off),
+            added_suppression: Some(Severity::Off),
+            test_only_branch: Some(Severity::Off),
+            diverged_clone_sibling: Some(Severity::Off),
+            added_dependency: Some(Severity::Off),
         };
         rules.apply_partial(&partial);
         assert_eq!(rules.unused_files, Severity::Off);
@@ -1806,6 +1888,32 @@ mod tests {
         assert_eq!(rules.unused_svelte_events, Severity::Off);
         assert_eq!(rules.route_collision, Severity::Off);
         assert_eq!(rules.dynamic_segment_name_conflict, Severity::Off);
+    }
+
+    #[test]
+    fn diff_risk_rules_default_and_parse_from_kebab_keys() {
+        let rules = RulesConfig::default();
+        assert_eq!(rules.weakened_tests, Severity::Warn);
+        assert_eq!(rules.added_suppression, Severity::Warn);
+        assert_eq!(rules.test_only_branch, Severity::Warn);
+        assert_eq!(rules.diverged_clone_sibling, Severity::Warn);
+        assert_eq!(rules.added_dependency, Severity::Off);
+
+        let json = r#"{"weakened-tests": "error", "added-dependency": "warn"}"#;
+        let partial: PartialRulesConfig = serde_json::from_str(json).expect("partial rules");
+        let mut merged = RulesConfig::default();
+        merged.apply_partial(&partial);
+        assert_eq!(merged.weakened_tests, Severity::Error);
+        assert_eq!(merged.added_dependency, Severity::Warn);
+        assert_eq!(merged.added_suppression, Severity::Warn);
+        assert_eq!(
+            merged.severity_for_kind(IssueKind::WeakenedTests),
+            Severity::Error
+        );
+        assert_eq!(
+            merged.severity_for_kind(IssueKind::AddedDependency),
+            Severity::Warn
+        );
     }
 
     #[test]
@@ -1847,7 +1955,7 @@ mod tests {
     /// more. See the note on [`KNOWN_RULE_NAMES`].
     #[test]
     fn known_rule_names_list_length_is_pinned() {
-        assert_eq!(KNOWN_RULE_NAMES.len(), 113);
+        assert_eq!(KNOWN_RULE_NAMES.len(), 122);
     }
 
     /// The reverse of `known_rule_names_covers_every_struct_field`. That one
@@ -1916,8 +2024,8 @@ mod tests {
 
         assert_eq!(
             aliases_found.len(),
-            118,
-            "expected 118 source-level alias attrs (59 per struct); got {}: {:?}",
+            126,
+            "expected 126 source-level alias attrs (63 per struct); got {}: {:?}",
             aliases_found.len(),
             aliases_found
         );

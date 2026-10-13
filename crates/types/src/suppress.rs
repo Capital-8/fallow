@@ -218,6 +218,23 @@ pub enum IssueKind {
     /// A `catchTag("X")` / `catchTags({ X })` handler whose project tag `X` no
     /// code produces, when no `unused-tagged-error` finding already covers it.
     UnproducedCatchTag,
+    /// An audit diff that weakens tests: a new skip or focus marker, removed
+    /// test cases, fewer assertions, or a lowered coverage threshold.
+    /// Audit-only, computed from the base and head text of changed files.
+    WeakenedTests,
+    /// An audit diff that adds a lint, type-check, coverage or Fallow
+    /// suppression comment. Audit-only.
+    AddedSuppression,
+    /// An audit diff that adds a test-environment branch, such as
+    /// `process.env.NODE_ENV === 'test'`, to a non-test source file.
+    /// Audit-only.
+    TestOnlyBranch,
+    /// An audit diff that edits one instance of a base clone group so that it
+    /// no longer matches its siblings, while no sibling changed. Audit-only.
+    DivergedCloneSibling,
+    /// An audit diff that adds a dependency to a `package.json`. Audit-only
+    /// and off by default.
+    AddedDependency,
 }
 
 impl IssueKind {
@@ -282,6 +299,11 @@ impl IssueKind {
         Self::UnusedEffectLayer,
         Self::UnusedTaggedError,
         Self::UnproducedCatchTag,
+        Self::WeakenedTests,
+        Self::AddedSuppression,
+        Self::TestOnlyBranch,
+        Self::DivergedCloneSibling,
+        Self::AddedDependency,
     ];
 
     /// Parse an issue kind from the string tokens used in CLI output and suppression comments.
@@ -353,6 +375,11 @@ impl IssueKind {
             Self::UnusedEffectLayer => 57,
             Self::UnusedTaggedError => 58,
             Self::UnproducedCatchTag => 59,
+            Self::WeakenedTests => 60,
+            Self::AddedSuppression => 61,
+            Self::TestOnlyBranch => 62,
+            Self::DivergedCloneSibling => 63,
+            Self::AddedDependency => 64,
         }
     }
 
@@ -419,6 +446,11 @@ impl IssueKind {
             57 => Some(Self::UnusedEffectLayer),
             58 => Some(Self::UnusedTaggedError),
             59 => Some(Self::UnproducedCatchTag),
+            60 => Some(Self::WeakenedTests),
+            61 => Some(Self::AddedSuppression),
+            62 => Some(Self::TestOnlyBranch),
+            63 => Some(Self::DivergedCloneSibling),
+            64 => Some(Self::AddedDependency),
             _ => None,
         }
     }
@@ -755,6 +787,21 @@ mod tests {
     }
 
     #[test]
+    fn issue_kind_parse_accepts_diff_risk_tokens() {
+        let cases = [
+            ("weakened-tests", IssueKind::WeakenedTests),
+            ("added-suppression", IssueKind::AddedSuppression),
+            ("test-only-branch", IssueKind::TestOnlyBranch),
+            ("diverged-clone-sibling", IssueKind::DivergedCloneSibling),
+            ("added-dependency", IssueKind::AddedDependency),
+        ];
+        for (token, kind) in cases {
+            assert_eq!(IssueKind::parse(token), Some(kind), "{token}");
+            assert_eq!(issue_kind_to_kebab(kind), token);
+        }
+    }
+
+    #[test]
     fn issue_kind_from_str_unknown() {
         assert_eq!(IssueKind::parse("foo"), None);
         assert_eq!(IssueKind::parse(""), None);
@@ -834,6 +881,11 @@ mod tests {
             (57, IssueKind::UnusedEffectLayer),
             (58, IssueKind::UnusedTaggedError),
             (59, IssueKind::UnproducedCatchTag),
+            (60, IssueKind::WeakenedTests),
+            (61, IssueKind::AddedSuppression),
+            (62, IssueKind::TestOnlyBranch),
+            (63, IssueKind::DivergedCloneSibling),
+            (64, IssueKind::AddedDependency),
         ];
         for &(discriminant, kind) in cases {
             assert_eq!(kind.to_discriminant(), discriminant, "{kind:?} drifted");

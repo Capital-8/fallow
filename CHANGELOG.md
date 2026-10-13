@@ -32,6 +32,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default, and editor diagnostics stay hints. Thanks
   [@miky-mfw](https://github.com/miky-mfw) for the request.
   (Closes [#3327](https://github.com/fallow-rs/fallow/issues/3327))
+- **`fallow audit` reports risky changes as rules.** Five new rules compare the
+  base and head text of each changed file. `weakened-tests` reports a new skip
+  or focus marker, removed test cases, fewer assertions, or a less strict
+  coverage threshold. `added-suppression` reports a new lint, type-check,
+  coverage or Fallow suppression comment. `test-only-branch` reports a new
+  `process.env.NODE_ENV === 'test'` style check in source code. A Vitest
+  in-source test block (`if (import.meta.vitest)`) is test code and is not
+  reported.
+  `diverged-clone-sibling` reports an edit to one copy of duplicated code when
+  the other copies did not change. `added-dependency` reports a new
+  `package.json` dependency and is off by default. The other four rules are
+  `warn` by default. Set a rule to `error` to fail the audit, or suppress one
+  finding with `// fallow-ignore-next-line <rule>`. The findings are in the new
+  `diff_risk` JSON section, in SARIF, in CodeClimate, in GitHub annotations,
+  in the GitHub job summary and in the MCP `audit` tool. Compact output adds
+  one record for each finding and markdown output adds a table. The human
+  status line, the issue count of the GitHub Action and the GitLab template,
+  and the VS Code audit status bar count the findings too. `added-dependency`
+  has no suppression comment, because `package.json` cannot hold one: set the
+  rule to `off` for the path in an `overrides` entry.
 - **`fallow health` now reports hidden change coupling and change
   dispersion.** A hidden pair is two files that change together in most
   commits while no import or re-export chain connects them. An agent that
