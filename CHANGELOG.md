@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`fallow mutation` measures how well the tests detect code changes.** The
+  command makes small changes (mutants) in the changed code and runs the
+  Vitest tests of the project against each one. A mutant that no test fails
+  on survives. The report gives the mutation score over the tested mutants,
+  the survivors by file with their covering tests, and the share of mutants
+  that a test reaches.
+  - `--plan` selects and ranks the mutants and runs no code.
+    `fallow mutation inspect <mutant_id>` shows one mutant against the current
+    file and runs no code. It reads the report that the last run saved in the
+    Fallow cache, or the file that `--report` names. From a subdirectory, it
+    finds the report of a run at the project root. A changed file gives a
+    `stale` status.
+  - The default scope is the changed code against the base ref, as for
+    `audit`. `--all` and file paths widen or narrow it.
+  - A run refuses a dirty git worktree unless `--allow-dirty` is set. Mutants
+    near file system, process, network or database calls are pruned unless
+    `--allow-side-effects` is set. Fallow does not write to project files, and
+    the report lists any path that the tests changed. `-o <file>` writes the
+    report after the run, and the worktree check leaves that file out.
+  - The exit code is 0 by default. `--min-score` or `mutation.minScore` makes a
+    lower score exit with 1. `--verdicts <file>` marks equivalent mutants,
+    which leave the score.
+  - The coverage counts the mutants that the run did not execute because of
+    `--max-mutants`. The dry run decides their coverage: a pending mutant that
+    no test reaches in the dry run is `no_coverage`. A capped run therefore
+    reports the coverage of the full run.
+  - A covering test that fails in the dry run of a restarted companion is a
+    baseline failure. The mutant runs with its other covering tests and is a
+    runtime error only when no covering test is left.
+  - The new `mutation` config section sets the runner, the operators, the
+    minimum score and the concurrency.
+
 - **`fallow audit` can skip sub-analyses.** `fallow audit` now takes
   `--only` and `--skip` with the values and rules of bare `fallow --only` /
   `--skip`: `dead-code`, `architecture`, `dupes` and `health`. The new config

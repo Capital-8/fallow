@@ -1,0 +1,30 @@
+---
+source: crates/cli/src/mutation_cli_tests.rs
+expression: text
+---
+Mutation testing (ran the project tests)
+Scope: changed code against origin/main
+Score 25.0%  killed 1  survived 3  timeout 0  partial (time-budget)
+Coverage 80.0%  no coverage 1
+[X] Minimum score 50%: missed
+
+● Survived (3)
+  src/b.ts
+    #2 3:10  add  arithmetic-operator  return a + b; -> return a - b;
+      id m4
+      covered by 2 tests, first: test/a.test.ts::adds
+    #4 5:10  add  arithmetic-operator
+      id m2
+      covered by 2 tests, first: test/a.test.ts::adds
+  src/a.ts
+    #3 4:10  add  arithmetic-operator
+      id m3
+      covered by 2 tests, first: test/a.test.ts::adds
+
+● No coverage (1): no test reaches these mutants
+  src/c.ts  1 mutant
+
+Pruned: 1 side-effect-sink
+
+Next
+  Inspect a survivor (runs no code): fallow mutation inspect m4

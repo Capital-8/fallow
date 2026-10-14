@@ -1103,6 +1103,7 @@ dependencies = [
  "dunce",
  "fallow-config",
  "fallow-engine",
+ "fallow-mutation",
  "fallow-output",
  "fallow-process",
  "fallow-types",
@@ -1152,6 +1153,7 @@ dependencies = [
  "fallow-cov-protocol",
  "fallow-engine",
  "fallow-license",
+ "fallow-mutation",
  "fallow-output",
  "fallow-process",
  "fallow-security",
@@ -1281,6 +1283,7 @@ dependencies = [
  "fallow-core",
  "fallow-extract",
  "fallow-graph",
+ "fallow-mutation",
  "fallow-output",
  "fallow-security",
  "fallow-types",
@@ -1394,6 +1397,7 @@ name = "fallow-mcp"
 version = "3.33.1"
 dependencies = [
  "fallow-api",
+ "fallow-output",
  "fallow-process",
  "fallow-types",
  "mimalloc",
@@ -1419,6 +1423,22 @@ dependencies = [
  "fallow-lsp",
  "fallow-mcp",
  "mimalloc",
+]
+
+[[package]]
+name = "fallow-mutation"
+version = "3.33.1"
+dependencies = [
+ "insta",
+ "oxc_allocator 0.152.0",
+ "oxc_ast 0.152.0",
+ "oxc_ast_visit 0.152.0",
+ "oxc_parser 0.152.0",
+ "oxc_semantic 0.152.0",
+ "oxc_span 0.152.0",
+ "oxc_syntax 0.152.0",
+ "serde",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -1464,6 +1484,7 @@ version = "3.33.1"
 dependencies = [
  "fallow-config",
  "fallow-types",
+ "oxc_span 0.152.0",
  "rustc-hash",
  "serde",
  "tempfile",

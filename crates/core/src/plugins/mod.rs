@@ -2008,6 +2008,7 @@ mod rstest;
 mod serverless_framework;
 mod textlint;
 mod tooling;
+mod used_export_names;
 
 pub(crate) use module_federation::runtime_remotes;
 pub use registry::{
@@ -2017,6 +2018,7 @@ pub use tooling::types_package_target;
 pub(crate) use tooling::{
     cli_tooling_config_patterns, is_ambient_types_package, is_known_tooling_dependency,
 };
+pub use used_export_names::UsedExportNames;
 
 fn add_import_referenced_dependencies(result: &mut PluginResult, source: &str, config_path: &Path) {
     let imports = config_parser::extract_imports(source, config_path);

@@ -1329,3 +1329,145 @@ async fn typed_analyze_keeps_cycle_findings_for_each_cycle_issue_type() {
         "issue_types [circular-deps, package-cycles] must return the package cycle"
     );
 }
+
+fn write_mutation_project(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("src")).expect("src directory");
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "mutation-inspect", "private": true, "devDependencies": { "vitest": "4.1.11" } }"#,
+    )
+    .expect("package.json");
+    std::fs::write(
+        root.join("src/math.ts"),
+        "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+    )
+    .expect("math.ts");
+    std::fs::write(
+        root.join("src/math.test.ts"),
+        "import { expect, it } from \"vitest\";\nimport { add } from \"./math\";\n\nit(\"adds\", () => {\n  expect(add(1, 2)).toBe(3);\n});\n",
+    )
+    .expect("math.test.ts");
+}
+
+async fn mutation_inspect_result(params: serde_json::Value) -> (bool, serde_json::Value) {
+    let params: crate::params::MutationInspectParams =
+        serde_json::from_value(params).expect("inspect params");
+    let result = crate::tools::run_mutation_inspect(&fallow_binary(), params)
+        .await
+        .expect("inspect runs");
+    let text = extract_text(&result);
+    (
+        result.is_error == Some(true),
+        serde_json::from_str(text).unwrap_or_else(|_| panic!("inspect JSON: {text}")),
+    )
+}
+
+async fn mutation_inspect_json(root: &std::path::Path, mutant_id: &str) -> serde_json::Value {
+    let (is_error, packet) = mutation_inspect_result(serde_json::json!({
+        "mutant_id": mutant_id,
+        "report": root.join("plan.json").to_string_lossy(),
+        "root": root.to_string_lossy(),
+    }))
+    .await;
+    assert!(!is_error, "{packet}");
+    packet
+}
+
+async fn plan_text_for_math(root: &std::path::Path) -> String {
+    let params: crate::params::MutationPlanParams = serde_json::from_value(serde_json::json!({
+        "root": root.to_string_lossy(),
+        "paths": ["src/math.ts"],
+        "operators": ["arithmetic-operator"],
+        "no_cache": true,
+    }))
+    .expect("plan params");
+    let plan = crate::tools::run_mutation_plan(&fallow_binary(), params)
+        .await
+        .expect("plan runs");
+    let plan_text = extract_text(&plan).to_owned();
+    assert_ne!(plan.is_error, Some(true), "{plan_text}");
+    plan_text
+}
+
+/// Without `report`, inspect reads the report that the last run saved in
+/// the cache directory of the project, as the CLI
+/// does. Before any run, the call gives the no-report error.
+#[tokio::test]
+async fn e2e_mutation_inspect_without_a_report_reads_the_last_run_report() {
+    let dir = tempfile::tempdir().expect("temporary project");
+    let root = dir.path();
+    write_mutation_project(root);
+
+    let (is_error, body) = mutation_inspect_result(serde_json::json!({
+        "mutant_id": "m_0000000000000000",
+        "root": root.to_string_lossy(),
+    }))
+    .await;
+    assert!(is_error, "{body}");
+    assert_eq!(body["code"], "FALLOW_MUTATION_NO_REPORT", "{body}");
+
+    let plan_text = plan_text_for_math(root).await;
+    let last_report =
+        fallow_api::mutation::last_mutation_report_path(&fallow_api::AnalysisOptions {
+            root: Some(root.to_path_buf()),
+            ..fallow_api::AnalysisOptions::default()
+        })
+        .expect("last report path");
+    std::fs::create_dir_all(last_report.parent().expect("cache dir")).expect("cache dir");
+    std::fs::write(&last_report, &plan_text).expect("last report");
+    let plan: serde_json::Value = serde_json::from_str(&plan_text).expect("plan JSON");
+    let mutant_id = plan["mutants"][0]["mutant_id"]
+        .as_str()
+        .expect("the plan has a mutant");
+
+    let (is_error, packet) = mutation_inspect_result(serde_json::json!({
+        "mutant_id": mutant_id,
+        "root": root.to_string_lossy(),
+    }))
+    .await;
+    assert!(!is_error, "{packet}");
+    assert_eq!(packet["kind"], "mutation-inspect", "{packet}");
+    assert_eq!(packet["status"], "fresh", "{packet}");
+    assert_eq!(packet["mutant_id"], mutant_id, "{packet}");
+}
+
+/// The plan tool output is a valid `--report` input of the inspect tool, and
+/// inspect checks the saved digest against the current file: the unchanged
+/// file reproduces the mutant code, and an edited file gives a stale packet
+/// with no code.
+#[tokio::test]
+async fn e2e_mutation_inspect_is_fresh_for_the_planned_file_and_stale_after_an_edit() {
+    let dir = tempfile::tempdir().expect("temporary project");
+    let root = dir.path();
+    write_mutation_project(root);
+
+    let plan_text = plan_text_for_math(root).await;
+    std::fs::write(root.join("plan.json"), &plan_text).expect("plan.json");
+    let plan: serde_json::Value = serde_json::from_str(&plan_text).expect("plan JSON");
+    let mutant_id = plan["mutants"][0]["mutant_id"]
+        .as_str()
+        .expect("the plan has a mutant")
+        .to_owned();
+
+    let fresh = mutation_inspect_json(root, &mutant_id).await;
+    assert_eq!(fresh["kind"], "mutation-inspect", "{fresh}");
+    assert_eq!(fresh["status"], "fresh", "{fresh}");
+    assert_eq!(fresh["mutant_id"], mutant_id.as_str());
+    assert_eq!(fresh["code"]["original"], "+", "{fresh}");
+    assert_eq!(fresh["code"]["replacement"], "-", "{fresh}");
+    assert_eq!(fresh["report_sha256"], fresh["current_sha256"], "{fresh}");
+
+    std::fs::write(
+        root.join("src/math.ts"),
+        "export function add(a: number, b: number): number {\n  return b + a;\n}\n",
+    )
+    .expect("edit math.ts");
+    let stale = mutation_inspect_json(root, &mutant_id).await;
+    assert_eq!(stale["status"], "stale", "{stale}");
+    assert_eq!(stale["stale_reason"], "source-changed", "{stale}");
+    assert!(
+        stale["code"].is_null(),
+        "a stale packet carries no code: {stale}"
+    );
+    assert_ne!(stale["report_sha256"], stale["current_sha256"], "{stale}");
+}

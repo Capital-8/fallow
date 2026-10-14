@@ -218,6 +218,30 @@ pub const MCP_TOOLS: &[McpToolInfo] = &[
         code_mode_alias: None,
     },
     McpToolInfo {
+        name: "mutation_plan",
+        kind: "analysis",
+        description: "Static mutation plan for changed code: mutant ids, operators, dispositions, and static test files; runs no tests",
+        cli_command: Some("fallow mutation --plan --format json --quiet"),
+        key_params: &["changed_since", "all", "paths", "max_mutants", "operators"],
+        license: McpToolLicense::Free,
+        license_note: None,
+        read_only: true,
+        code_mode_alias: None,
+    },
+    McpToolInfo {
+        name: "mutation_inspect",
+        kind: "trace",
+        description: "Inspect one mutant of a saved mutation report (default: the last run report), with a stale status when its source changed; runs no tests",
+        cli_command: Some(
+            "fallow mutation inspect <mutant-id> [--report <report.json>] --format json --quiet",
+        ),
+        key_params: &["mutant_id", "report"],
+        license: McpToolLicense::Free,
+        license_note: None,
+        read_only: true,
+        code_mode_alias: None,
+    },
+    McpToolInfo {
         name: "inspect_target",
         kind: "analysis",
         description: "One evidence bundle for a file or exported symbol: trace, dead-code actions, duplication, complexity, and security candidates",
@@ -1081,6 +1105,33 @@ pub const CAPABILITY_PARITY: &[CapabilityParityRow] = &[
             "Rust api variant for hosts that supply an explicit cache directory. The value wins over FALLOW_CACHE_DIR and cache.dir, and run_doctor already honors FALLOW_CACHE_DIR. No napi export or dedicated MCP tool.",
         ),
     },
+    CapabilityParityRow {
+        capability: "mutation testing",
+        api_runner: Some("run_mutation"),
+        napi_export: None,
+        mcp_tool: None,
+        omission_note: Some(
+            "Mutation testing runs the project's own tests, so it is available through the CLI (`fallow mutation`) and the Rust api only. A test run is a host permission decision: no napi export, and no MCP run tool in version 1. The read-only plan and inspect halves are the mutation_plan and mutation_inspect MCP tools.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "mutation plan",
+        api_runner: None,
+        napi_export: None,
+        mcp_tool: Some("mutation_plan"),
+        omission_note: Some(
+            "Static mutation plan that runs no tests. MCP calls fallow_api::plan_mutation in process; plan_mutation is not a run_* runner, and the napi addon has no mutation surface in version 1.",
+        ),
+    },
+    CapabilityParityRow {
+        capability: "mutation inspection",
+        api_runner: None,
+        napi_export: None,
+        mcp_tool: Some("mutation_inspect"),
+        omission_note: Some(
+            "One mutant of a saved mutation report, with a stale status when the source changed. MCP shells out to `fallow mutation inspect`; no run_* API runner and no napi export.",
+        ),
+    },
     // -- MCP-only tools that shell out to the CLI: no api runner, no napi
     //    export. --
     CapabilityParityRow {
@@ -1466,17 +1517,19 @@ mod tests {
     }
 
     /// Code Mode's exclusions are routing decisions, not omissions: the
-    /// sandbox is read-only and capped at 30 seconds, so fix tools and
-    /// similar-code must stay off the allowlist, and the meta-tool cannot
-    /// call itself.
+    /// sandbox is read-only and capped at 30 seconds, so fix tools,
+    /// similar-code and mutation must stay off the allowlist, and the
+    /// meta-tool cannot call itself.
     #[test]
-    fn code_mode_excludes_fix_similar_code_and_the_meta_tool() {
+    fn code_mode_excludes_fix_similar_code_mutation_and_the_meta_tool() {
         for name in [
             "code_execute",
             "fix_preview",
             "fix_apply",
             "find_similar_code",
             "inspect_similar_code",
+            "mutation_plan",
+            "mutation_inspect",
         ] {
             let tool = MCP_TOOLS
                 .iter()
@@ -1499,6 +1552,24 @@ mod tests {
             );
             assert!(!alias.is_empty(), "{tool} has an empty Code Mode alias");
         }
+    }
+
+    #[test]
+    fn mutation_inspect_marks_the_report_as_optional() {
+        let tool = MCP_TOOLS
+            .iter()
+            .find(|t| t.name == "mutation_inspect")
+            .expect("mutation_inspect row");
+        let cli_command = tool.cli_command.expect("mutation_inspect CLI analogue");
+        assert!(
+            cli_command.contains("[--report <report.json>]"),
+            "without --report the CLI reads the last run report, so the row must show it as optional: {cli_command}"
+        );
+        assert!(
+            tool.description.contains("last run report"),
+            "the description must name the last run default: {}",
+            tool.description
+        );
     }
 
     #[test]

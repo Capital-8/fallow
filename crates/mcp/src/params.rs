@@ -528,6 +528,71 @@ pub struct InspectSimilarCodeParams {
     pub max_output_bytes: Option<usize>,
 }
 
+/// Parameters for the static mutation plan. The plan runs no project code.
+#[derive(Default, Deserialize, JsonSchema)]
+pub struct MutationPlanParams {
+    /// Project root; defaults to the working directory.
+    pub root: Option<String>,
+
+    /// Path to a fallow config file.
+    pub config: Option<String>,
+
+    /// Allow trusted HTTPS config `extends` for this request. Defaults to false
+    /// and never grants process-global trust.
+    pub allow_remote_extends: Option<bool>,
+
+    /// Base ref for the default changed-code scope. Omitted: the base is
+    /// detected as for `audit`.
+    pub changed_since: Option<String>,
+
+    /// Plan every source file instead of the changed code.
+    pub all: Option<bool>,
+
+    /// Plan only these files or directories, relative to the root.
+    pub paths: Option<Vec<String>>,
+
+    /// Maximum number of mutants to plan; the others become `pending`.
+    pub max_mutants: Option<usize>,
+
+    /// Kebab-case operator names, for example `relational-operator`.
+    /// Omitted: the `mutation.operators` config key, else every operator.
+    pub operators: Option<Vec<String>>,
+
+    /// Disable the incremental parse cache.
+    pub no_cache: Option<bool>,
+
+    /// Parser thread count; defaults to CPU cores.
+    pub threads: Option<usize>,
+}
+
+/// Parameters for one mutant of a saved mutation report.
+#[derive(Deserialize, JsonSchema)]
+pub struct MutationInspectParams {
+    /// The `mutant_id` from a mutation plan or report.
+    #[schemars(length(min = 1))]
+    pub mutant_id: String,
+
+    /// Path to a saved `fallow mutation` report or `mutation_plan` output.
+    /// A relative path resolves against `root`. Without `root`, it resolves
+    /// against the working directory of the MCP server. Omitted: the report
+    /// that the last `fallow mutation` run saved in the Fallow cache of the
+    /// project.
+    #[schemars(length(min = 1))]
+    pub report: Option<String>,
+
+    /// Project root; defaults to the working directory.
+    pub root: Option<String>,
+
+    /// Path to a fallow config file. Used only without `report`, to find the
+    /// cache directory that holds the report of the last run.
+    pub config: Option<String>,
+
+    /// Allow trusted HTTPS config `extends` for this request. Used only
+    /// without `report`, as for `config`. Defaults to false and never grants
+    /// process-global trust.
+    pub allow_remote_extends: Option<bool>,
+}
+
 #[derive(Default, Deserialize, JsonSchema)]
 pub struct FindDupesParams {
     /// Project root; defaults to the working directory.
