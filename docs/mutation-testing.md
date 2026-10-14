@@ -23,6 +23,7 @@ read-only next steps. It never writes a test and never proposes a code change.
   because the plan cannot narrow to a workspace yet. Pass the workspace
   directory as a path.
 - The run flags are `--max-mutants`, `--time-budget` (`90s`, `10m`, `1h`),
+  `--setup-timeout` (default `2m`),
   `--concurrency`, `--runtime`, `--allow-dirty`, `--allow-side-effects`,
   `--min-score`, `--operators` and `--verdicts`.
 - Only `--format human` and `--format json` are valid. Version 1 has no SARIF,
@@ -107,9 +108,16 @@ tests detect the mutant.
   the retry, and a real infinite loop still times out.
 - A `killed` result gets no retry. In repeated runs under host load, no
   kill became a survivor, and a retry of each kill doubles the run time.
-- The retries stay inside the time budget. A mutant that gets no retry
-  before the deadline keeps its first status, and the completion is
-  `partial` (`time-budget`).
+- A retry starts only before the `--time-budget` deadline. A mutant that
+  gets no retry keeps its first status, and the completion is `partial`
+  (`time-budget`).
+- A run that started before the deadline continues until its watchdog
+  fires, so the command can end after the deadline. For a mutant run, the
+  overrun is at most `timeout_ms` plus the setup time plus 2 seconds. For
+  a timeout retry, it is at most twice `timeout_ms` and the setup time,
+  plus 2 seconds.
+- `retried: true` on a mutant result marks a status from a first run and
+  a retry. A `survived` or `timeout` mutant without the field got no retry.
 - A retry of a real infinite loop costs two more timeout windows.
 - A `runtime_error` retry takes the mutant out of the score, also after a
   first `timeout`. The completion is then `partial` (`runtime-error`).
@@ -146,6 +154,19 @@ it names each test entry point that loads a file, with the mask of that test,
 and the runner selects the tests from that list. `export_test_reach` reads
 the shared profiles of the reachability index. It names only the test files
 that reference the export, so it cannot give that list.
+
+## Setup timeout
+
+`--setup-timeout` limits the start, the dry run and each reload of a runner
+process. The default is 2 minutes, and units from `ms` to `h` are valid. A
+slow or busy host can need more, because the dry run executes each test file.
+
+- For the first runner process, the run stops with exit code 2 and
+  `FALLOW_MUTATION_RUNNER_FAILED`, and the help names the flag.
+- For a restarted runner process, the mutant is `runtime_error`, and its error
+  names the flag. The run continues.
+- A reload that passes the limit restarts the runner process.
+- The config has no key for this limit.
 
 ## Baseline failures
 
