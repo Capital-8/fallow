@@ -27,7 +27,7 @@ const publishStep = (name) => {
   return workflow.slice(start, next === -1 ? undefined : next);
 };
 
-const execute = (t, provider, mode, identity = true, pat = true) => {
+const execute = (t, provider, mode, identity = true, pat = true, extraEnv = {}) => {
   const cwd = mkdtempSync(join(tmpdir(), "fallow-publisher-auth-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   mkdirSync(join(cwd, "bin"));
@@ -65,6 +65,7 @@ const execute = (t, provider, mode, identity = true, pat = true) => {
         ? "https://token.actions.githubusercontent.com/synthetic"
         : "",
       ACTIONS_ID_TOKEN_REQUEST_TOKEN: identity ? "synthetic-oidc-request" : "",
+      ...extraEnv,
     },
   });
   let calls = [];
@@ -117,3 +118,23 @@ for (const provider of providers) {
     });
   }
 }
+
+test("Marketplace publishes prepared targets through Azure identity without legacy PAT", (t) => {
+  const provider = providers[0];
+  const { result, calls, files } = execute(t, provider, "azure", true, true, {
+    AZURE_CLIENT_ID: "11111111-2222-3333-4444-555555555555",
+    AZURE_TENANT_ID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    MARKETPLACE_AZURE_AUTHENTICATED: "true",
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(
+    calls.map(({ args }) => args.find((arg) => arg.endsWith(".vsix"))),
+    files.map((file) => `vscode-targets/${file}`),
+  );
+  assert.ok(
+    calls.every(
+      ({ args, patPresent }) =>
+        args.includes("--azure-credential") && !args.includes("--oidc") && !patPresent,
+    ),
+  );
+});
