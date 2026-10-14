@@ -11,9 +11,10 @@ creates, moves, or publishes Git tags or GitHub Releases.
 |---|---|---|
 | `release-context` | Bind the dispatch to `main`, the release version, and an absent tag | Read only |
 | `pgo-profile` | Build an instrumented binary, train the PGO profile on pinned public fixtures, and upload only the profile | Read only |
-| `build` | Build and sign release artifacts | Artifact signing only |
+| `build` | Build unsigned binaries, archives, and NAPI addons | Read only |
+| `sign` | Sign downloaded raw binaries and stage npm binary payloads on fresh runners | Artifact signing only |
 | `validate` | Reusable release validation | Read only |
-| `release-verified` | Join build, validation, and `similar-code-conformance` | None |
+| `release-verified` | Join build, signing, validation, and `similar-code-conformance` | None |
 | `release-assets` | Flatten and store the complete GitHub asset bundle, including all VSIX targets | Read only |
 | `release-ready` | Join publication jobs and prove the tag is still absent | Read only |
 | `publish-crates` | Publish prevalidated crates in dependency order | crates.io OIDC |
@@ -22,19 +23,56 @@ creates, moves, or publishes Git tags or GitHub Releases.
 | `npm-root-approved` | Wait until the maintainer-approved `fallow` root is public with the staged bytes | Read only |
 | `vscode-prep` | Build seven VSIX targets plus their inventory and checksums | Read only |
 | `vscode-host-smoke` | Run the exact prepared x64 target VSIX on Linux, Windows, and macOS with matching release binaries | Read only |
-| `vscode-publish-marketplace` | Publish the closed VSIX set to Visual Studio Marketplace | VSCE token only |
-| `vscode-publish-open-vsx` | Publish the closed VSIX set to Open VSX | OVSX token only |
+| `vscode-publish-marketplace` | Publish the closed VSIX set to Visual Studio Marketplace | VSCE PAT or Marketplace OIDC |
+| `vscode-publish-open-vsx` | Publish the closed VSIX set to Open VSX | OVSX PAT or Open VSX OIDC |
 | `vscode-public-verify` | Verify exact public target payloads from both registries | Read only |
 
 Preparation jobs may execute dependency code because they have no publication
 credentials. Publication jobs must remain small. They must not install
 repository dependencies, run package lifecycle scripts, or execute
-repository-controlled build steps. They may install pinned publisher CLIs
-globally with `--ignore-scripts`.
+repository-controlled build steps. VSIX publishers install only the dedicated
+reviewed tool graph under `.github/publishers/` with `npm ci --ignore-scripts`.
+Its manifests and integrity-pinned lockfiles come from a sparse checkout of the
+validated dispatch SHA. Tools never come from build artifacts or caches, and
+publication tokens appear only on the final publication step.
+The Open VSX graph overrides its VSCE packaging dependency to the same reviewed
+version used for Marketplace, avoiding its older vulnerable secret-scanning
+graph. Publication uses prepared VSIX files, with no packaging step.
+
+## VSIX publisher authorization
+
+The `release` environment variables `VSCE_AUTH_MODE` and `OVSX_AUTH_MODE`
+independently select `pat` or `oidc`; an unset variable preserves `pat`.
+Unknown modes, a missing selected PAT, or unavailable GitHub OIDC identity
+fail before upload. In `oidc` mode the workflow excludes the legacy PAT from
+the step environment and explicitly requests trusted publishing. Registry
+authorization failures never switch back to PAT authentication.
+
+Before selecting `oidc`, the publisher or namespace owner must register and
+verify the provider policy for `fallow-rs/fallow`, `release.yml`, the existing
+publisher `fallow-rs`, and the protected `release` environment. Require that
+environment in the provider binding; a repository/workflow-only policy does
+not stop an edited workflow on another ref. Do not activate the mode until
+the provider's binding fields and rights are confirmed. The extension is
+`fallow-rs.fallow-vscode`.
+
+CLI support does not establish that a registry exposes policy configuration
+for this account. If Marketplace has no available trusted-publisher policy
+control, leave `VSCE_AUTH_MODE` at `pat`; a prepared `--oidc` route is not an
+activated publisher identity. Open VSX namespace policy configuration is a
+separate owner action.
+
+The frozen `@vscode/vsce@4.0.0` supports `--oidc`, requesting audience
+`marketplace.visualstudio.com`. The frozen `ovsx@1.2.0` supports
+`--trusted-publishing`, requesting the registry URL audience
+`https://open-vsx.org`. Both exchange the identity for short-lived publication
+authority. Their graphs and binary signing keys are independent of this mode
+selection. Account policies, mode activation, legacy-token revocation and
+real publication require separate owner actions.
 
 ## Invariants
 
-- Run every credential-bearing job in the `release` environment: `build`
+- Run every credential-bearing job in the `release` environment: `sign`
   (binary signing key), `publish-crates`, `npm-publish`, and both VSIX
   publisher jobs. Its deployment branch policy admits `main` only. The ref
   check in `release-context` is part of the workflow file, so it stops a
@@ -59,11 +97,24 @@ globally with `--ignore-scripts`.
   artifact name must not start with `fallow-`, because `release-assets`
   downloads that pattern as release assets. The `build` job fails when a
   release binary contains the LLVM profiler runtime.
+- Keep `build` outside the `release` environment, with no signing credential.
+  Upload raw binary data only as `unsigned-binaries-<platform>`, separately from
+  the existing release archives and NAPI addons. Each `sign` matrix runner is
+  fresh, downloads its exact unsigned artifact, and rejects unexpected,
+  missing, empty, or nonregular entries before the signing key is exposed.
+  Signing uses only Node builtins and the committed signing scripts. Never
+  install dependencies, restore build caches, or execute downloaded binaries
+  in `sign`. The key is set only on the signing step. Preserve the signed
+  release artifact names and npm multicall payload names. Every consumer of
+  signed binaries must wait for `sign`, including npm preparation and
+  similar-code conformance.
 - Keep every checkout at `persist-credentials: false`.
 - Keep repository dependency installation out of `npm-publish`, both VSIX
   publisher jobs, and `publish-crates`.
 - Keep `--ignore-scripts` on every privileged `npm publish`.
-- Keep global publication tools pinned to reviewed versions.
+- Keep publication tools and their transitive dependency graph pinned in the
+  dedicated lockfiles. Invoke them with `npx --no-install --prefix` so execution
+  cannot fetch a missing CLI. Review lockfile changes before release.
 - Stage the `fallow` npm root, never publish it from the workflow. `fallow` pins
   its platform packages and `fallow-type-aware` to the exact release version,
   so those reach users only through a new root. The `fallow` trusted publisher
@@ -75,8 +126,9 @@ globally with `--ignore-scripts`.
 - Make exactly one `npm stage publish` call per staged name per run and never
   probe with a direct publish. Every attempt, including a refused one, signs
   and logs a provenance statement before the registry answers.
-- Clear `NODE_AUTH_TOKEN` for the stage call so a bootstrap token never reaches
-  a staged name.
+- Keep `NODE_AUTH_TOKEN` empty throughout `npm-publish`. Every package must
+  have environment-scoped trusted publishing configured. Never restore a
+  repository token fallback: a token bypasses the OIDC environment binding.
 - Treat npm error code `E409` from the stage call as already staged. The job
   has no npm login, so it cannot read stages, and the `npm view` precheck does
   not see a staged version. The maintainer digest comparison is what proves
