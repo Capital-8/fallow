@@ -8116,7 +8116,7 @@
     ]
   },
   "plugins": {
-    "count": 136,
+    "count": 145,
     "note": "Built-in framework plugins, auto-activated when their enabler dependency is present; run fallow list --plugins for the set active in a specific project",
     "names": [
       "nextjs",
@@ -8193,6 +8193,8 @@
       "karma",
       "cucumber",
       "webdriverio",
+      "jasmine",
+      "rstest",
       "eslint",
       "biome",
       "stylelint",
@@ -8214,6 +8216,8 @@
       "knex",
       "typeorm",
       "kysely",
+      "textlint",
+      "typescript-content-mapper",
       "turborepo",
       "nx",
       "changesets",
@@ -8254,7 +8258,12 @@
       "varlock",
       "pnpm",
       "bun",
-      "deno"
+      "deno",
+      "mise",
+      "railway",
+      "serverless-framework",
+      "osls",
+      "flue"
     ]
   },
   "task_matrix": [
