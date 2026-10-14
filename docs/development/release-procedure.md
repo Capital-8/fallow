@@ -54,6 +54,21 @@ invariants in this file.
      esac
    done
    ```
+   Marketplace's optional `azure` mode requires the protected release variables
+   `VSCE_AZURE_CLIENT_ID` and `VSCE_AZURE_TENANT_ID`, the exact app federation and
+   publisher Contributor membership described in `release-security.md`. Leave
+   `VSCE_AUTH_MODE` unset or at `pat` until owner verification is complete.
+   After approved integration and app/federation setup, separately approve the
+   manual `verify-marketplace-identity.yml` run on `main` to obtain its validated
+   global profile ID. This read-only path requests no signing/PAT secret and
+   performs no publication. The publisher owner adds that ID as a Contributor
+   and verifies the member before authorizing Azure-mode activation. When
+   `azure` or direct `oidc` has been approved, omit `VSCE_PAT` from the secret
+   presence loop above; neither route reads it. Repository-copy retirement and
+   provider token revocation require separate approval. No subscription purchase,
+   organization directory reconnection or end-user login change is a release
+   prerequisite for the prepared Entra workflow.
+
 4. Derive the semantic-version bump from every commit since the prior release
    unless the user supplied an explicit bump. Confirm a major bump before
    mutating versions unless the user explicitly requested it.

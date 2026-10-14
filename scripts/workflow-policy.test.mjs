@@ -2268,9 +2268,11 @@ test("VSIX publishers use reviewed frozen graphs from the validated source commi
     assert.equal(job.match(/secrets\./gu)?.length, 1);
     const authMode = cli === "ovsx" ? "OVSX_AUTH_MODE" : "VSCE_AUTH_MODE";
     assert.ok(job.includes(`${authMode}: \${{ vars.${authMode} || 'pat' }}`));
-    assert.ok(
-      job.includes(`${token}: \${{ vars.${authMode} != 'oidc' && secrets.${token} || '' }}`),
-    );
+    const tokenCondition =
+      cli === "ovsx"
+        ? "vars.OVSX_AUTH_MODE != 'oidc'"
+        : "(vars.VSCE_AUTH_MODE == '' || vars.VSCE_AUTH_MODE == 'pat')";
+    assert.ok(job.includes(`${token}: \${{ ${tokenCondition} && secrets.${token} || '' }}`));
     assert.match(job, /id-token: write/u);
 
     const manifest = JSON.parse(readFileSync(`${prefix}/package.json`, "utf8"));
@@ -2298,4 +2300,66 @@ test("VSIX publishers use reviewed frozen graphs from the validated source commi
       assert.equal(dependency.link, undefined, path);
     }
   }
+});
+
+test("Marketplace Entra login is conditional, subscription-free and follows frozen tool installation", () => {
+  const workflow = readWorkflow(".github/workflows/release.yml");
+  const job = indentedBlock(workflow, "vscode-publish-marketplace", 2);
+  const install = job.indexOf("- name: Install VS Code Marketplace publisher");
+  const config = job.indexOf("- name: Validate Marketplace Azure identity configuration");
+  const login = job.indexOf("- name: Authenticate Marketplace with Microsoft Entra");
+  const publish = job.indexOf("- name: Publish every target to VS Code Marketplace");
+  assert.ok(install >= 0 && install < config && config < login && login < publish);
+  const configStep = job.slice(config, login);
+  const loginStep = job.slice(login, publish);
+  for (const step of [configStep, loginStep]) {
+    assert.match(step, /if: vars\.VSCE_AUTH_MODE == 'azure'/u);
+    assert.doesNotMatch(step, /secrets\./u);
+  }
+  assert.match(loginStep, /uses: azure\/login@[0-9a-f]{40}/u);
+  assert.match(loginStep, /client-id: \$\{\{ vars\.VSCE_AZURE_CLIENT_ID \}\}/u);
+  assert.match(loginStep, /tenant-id: \$\{\{ vars\.VSCE_AZURE_TENANT_ID \}\}/u);
+  assert.match(loginStep, /allow-no-subscriptions: true/u);
+  assert.match(loginStep, /audience: api:\/\/AzureADTokenExchange/u);
+  assert.doesNotMatch(loginStep, /subscription-id:|creds:|continue-on-error:/u);
+  assert.match(
+    job.slice(publish),
+    /MARKETPLACE_AZURE_AUTHENTICATED: \$\{\{ steps\.marketplace_azure_login\.outcome == 'success' \}\}/u,
+  );
+  assert.match(job, /environment: release/u);
+  assert.match(job, /id-token: write/u);
+});
+
+test("Marketplace identity verification is a protected manual read with no publication credentials", () => {
+  const workflow = readWorkflow(".github/workflows/verify-marketplace-identity.yml");
+  const job = indentedBlock(workflow, "profile", 2);
+  assert.match(workflow, /on:\n\s+workflow_dispatch:/u);
+  assert.doesNotMatch(
+    workflow,
+    /^\s+(?:push|pull_request|pull_request_target|schedule|workflow_call):/mu,
+  );
+  assert.match(
+    job,
+    /if: github\.event_name == 'workflow_dispatch' && github\.ref == 'refs\/heads\/main'/u,
+  );
+  assert.match(job, /environment: release/u);
+  assert.match(job, /permissions:\n\s+contents: read\n\s+id-token: write/u);
+  assert.match(job, /ref: \$\{\{ github\.sha \}\}/u);
+  assert.match(job, /persist-credentials: false/u);
+  assert.match(job, /sparse-checkout: \.github\/scripts\/marketplace-profile\.mjs/u);
+  assert.match(job, /sparse-checkout-cone-mode: false/u);
+  assert.match(job, /package-manager-cache: false/u);
+  assert.match(job, /uses: azure\/login@[0-9a-f]{40}/u);
+  assert.match(job, /client-id: \$\{\{ vars\.VSCE_AZURE_CLIENT_ID \}\}/u);
+  assert.match(job, /tenant-id: \$\{\{ vars\.VSCE_AZURE_TENANT_ID \}\}/u);
+  assert.match(job, /allow-no-subscriptions: true/u);
+  assert.match(job, /audience: api:\/\/AzureADTokenExchange/u);
+  assert.doesNotMatch(
+    job,
+    /secrets\.|VSCE_PAT|SIGNING|subscription-id:|creds:|continue-on-error:|npm|npx|publish|upload-artifact|contents: write/u,
+  );
+  const config = job.indexOf("--validate-config");
+  const login = job.indexOf("uses: azure/login@");
+  const profile = job.indexOf("- name: Read validated Marketplace profile ID");
+  assert.ok(config >= 0 && config < login && login < profile);
 });

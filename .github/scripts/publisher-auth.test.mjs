@@ -41,7 +41,7 @@ const execute = (t, provider, mode, identity = true, pat = true, extraEnv = {}) 
     writeFileSync(join(cwd, "vscode-targets", file), "prepared fixture bytes");
   writeFileSync(
     join(cwd, "bin/npx"),
-    `#!${process.execPath}\nimport { appendFileSync } from "node:fs";\nappendFileSync("calls.jsonl", JSON.stringify({ args: process.argv.slice(2), patPresent: Boolean(process.env[${JSON.stringify(provider.secret)}]) }) + "\\n");\n`,
+    `#!${process.execPath}\nimport { appendFileSync } from "node:fs";\nappendFileSync("calls.jsonl", JSON.stringify({ args: process.argv.slice(2), patPresent: Boolean(process.env[${JSON.stringify(provider.secret)}]), azureSecretPresent: ['AZURE_CLIENT_SECRET', 'AZURE_CLIENT_CERTIFICATE_PATH', 'AZURE_CLIENT_CERTIFICATE_PASSWORD'].some((name) => Boolean(process.env[name])) }) + "\\n");\n`,
     { mode: 0o755 },
   );
   const step = publishStep(provider.name);
@@ -96,11 +96,13 @@ for (const provider of providers) {
     assert.equal(result.status, 0, result.stderr);
     assert.equal(calls.length, files.length);
     assert.ok(calls.every(({ args, patPresent }) => args.includes(provider.flag) && !patPresent));
-    assert.match(
-      publishStep(provider.name),
-      new RegExp(
-        `${provider.secret}: \\$\\{\\{ vars\\.${provider.mode} != 'oidc' && secrets\\.${provider.secret} \\|\\| '' \\}\\}`,
-        "u",
+    const condition =
+      provider.secret === "VSCE_PAT"
+        ? "(vars.VSCE_AUTH_MODE == '' || vars.VSCE_AUTH_MODE == 'pat')"
+        : "vars.OVSX_AUTH_MODE != 'oidc'";
+    assert.ok(
+      publishStep(provider.name).includes(
+        `${provider.secret}: \${{ ${condition} && secrets.${provider.secret} || '' }}`,
       ),
     );
   });
@@ -125,6 +127,9 @@ test("Marketplace publishes prepared targets through Azure identity without lega
     AZURE_CLIENT_ID: "11111111-2222-3333-4444-555555555555",
     AZURE_TENANT_ID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     MARKETPLACE_AZURE_AUTHENTICATED: "true",
+    AZURE_CLIENT_SECRET: "synthetic-unwanted-secret",
+    AZURE_CLIENT_CERTIFICATE_PATH: "synthetic-unwanted-certificate",
+    AZURE_CLIENT_CERTIFICATE_PASSWORD: "synthetic-unwanted-password",
   });
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.deepEqual(
@@ -133,8 +138,87 @@ test("Marketplace publishes prepared targets through Azure identity without lega
   );
   assert.ok(
     calls.every(
-      ({ args, patPresent }) =>
-        args.includes("--azure-credential") && !args.includes("--oidc") && !patPresent,
+      ({ args, patPresent, azureSecretPresent }) =>
+        args.includes("--azure-credential") &&
+        !args.includes("--oidc") &&
+        !patPresent &&
+        !azureSecretPresent,
     ),
   );
+});
+
+test("Marketplace Azure uploads require a complete successful configured identity", (t) => {
+  const provider = providers[0];
+  const ready = {
+    AZURE_CLIENT_ID: "11111111-2222-3333-4444-555555555555",
+    AZURE_TENANT_ID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    MARKETPLACE_AZURE_AUTHENTICATED: "true",
+  };
+  const good = execute(t, provider, "azure", true, true, ready);
+  assert.equal(good.result.status, 0, good.result.stdout + good.result.stderr);
+  assert.deepEqual(
+    good.calls.map(({ args }) => args.at(-3)),
+    good.files.map((file) => `vscode-targets/${file}`),
+  );
+  for (const override of [
+    { MARKETPLACE_AZURE_AUTHENTICATED: "false" },
+    { AZURE_CLIENT_ID: "" },
+    { AZURE_TENANT_ID: "" },
+    { AZURE_CLIENT_ID: "not-a-client-id" },
+    { AZURE_TENANT_ID: "not-a-tenant-id" },
+    { ACTIONS_ID_TOKEN_REQUEST_TOKEN: "" },
+  ]) {
+    const denied = execute(t, provider, "azure", true, true, { ...ready, ...override });
+    assert.notEqual(
+      denied.result.status,
+      0,
+      `Accepted incomplete Azure identity: ${JSON.stringify(override)}`,
+    );
+    assert.match(denied.result.stdout, /::error::/u);
+    assert.deepEqual(denied.calls, []);
+  }
+});
+
+const azureConfigStep = () => {
+  const start = workflow.indexOf(
+    "      - name: Validate Marketplace Azure identity configuration\n",
+  );
+  assert.notEqual(start, -1, "Azure configuration must be validated before login");
+  const end = workflow.indexOf("\n      - name:", start + 1);
+  return workflow.slice(start, end);
+};
+
+test("Marketplace validates Azure configuration before requesting login", () => {
+  const step = azureConfigStep();
+  const block = step.match(/        run: \|\n([\s\S]+)/u);
+  assert.ok(block);
+  const script = block[1]
+    .split("\n")
+    .map((line) => line.slice(10))
+    .join("\n");
+  const ready = {
+    PATH: "/usr/bin:/bin",
+    GITHUB_ACTIONS: "true",
+    AZURE_CLIENT_ID: "11111111-2222-3333-4444-555555555555",
+    AZURE_TENANT_ID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    ACTIONS_ID_TOKEN_REQUEST_URL: "http://127.0.0.1/synthetic",
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic",
+  };
+  const invoke = (overrides = {}) =>
+    spawnSync("bash", ["-euo", "pipefail", "-c", script], {
+      encoding: "utf8",
+      env: { ...ready, ...overrides },
+    });
+  const good = invoke();
+  assert.equal(good.status, 0, good.stdout + good.stderr);
+  for (const overrides of [
+    { AZURE_CLIENT_ID: "" },
+    { AZURE_TENANT_ID: "invalid" },
+    { GITHUB_ACTIONS: "false" },
+    { ACTIONS_ID_TOKEN_REQUEST_URL: "" },
+  ]) {
+    const denied = invoke(overrides);
+    assert.notEqual(denied.status, 0);
+    assert.match(denied.stdout, /::error::/u);
+  }
 });

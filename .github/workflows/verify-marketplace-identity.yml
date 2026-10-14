@@ -1,0 +1,48 @@
+name: Verify Marketplace identity
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  profile:
+    name: Read Marketplace app profile
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: ${{ vars.VSCE_AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ vars.VSCE_AZURE_TENANT_ID }}
+    steps:
+      - name: Checkout reviewed profile lookup
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/marketplace-profile.mjs
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Validate configured app identity
+        run: node .github/scripts/marketplace-profile.mjs --validate-config
+
+      - name: Authenticate configured app with Microsoft Entra
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+        with:
+          client-id: ${{ vars.VSCE_AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.VSCE_AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+          audience: api://AzureADTokenExchange
+
+      - name: Read validated Marketplace profile ID
+        id: profile
+        run: node .github/scripts/marketplace-profile.mjs
