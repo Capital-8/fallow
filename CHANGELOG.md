@@ -123,6 +123,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     of a test file that does not load now starts with the error line, for
     example `SyntaxError [ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX]: ...`, not
     with a stack line. (#3487)
+  - A `borp` script is a `node:test` run. The files of its `-p` /
+    `--pattern` glob, or of its positional arguments, are test entry
+    points. Without a file and a pattern, the default `borp` glob
+    `**/*.test.{js,mjs,cjs,ts,mts,cts}` applies. `auto` selects `node-test`
+    for a project with a `borp` script. Before, the plan of such a project
+    had no test file, and each mutant was `no_coverage`. Fallow does not
+    read `.borp.yaml`, so a bare `borp` command gets the default glob. (#3482)
 
 - **`fallow audit` can skip sub-analyses.** `fallow audit` now takes
   `--only` and `--skip` with the values and rules of bare `fallow --only` /
