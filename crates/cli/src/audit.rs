@@ -1580,6 +1580,100 @@ pub fn create_audit_review_benchmark_corpus(
     })
 }
 
+/// Finding counts that the audit analyses benchmark checks after each run.
+/// This is not a supported API.
+#[doc(hidden)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct AuditAnalysesBenchmarkResult {
+    pub introduced_count: usize,
+    pub inherited_count: usize,
+    pub clone_group_count: usize,
+    pub health_finding_count: usize,
+}
+
+/// Run the HEAD analyses and the focused base analyses of one audit in
+/// parallel, as the production audit does, then attribute the dead-code
+/// findings. The base side reads a prepared tree instead of a git worktree,
+/// so no git process runs. This is not a supported API.
+#[doc(hidden)]
+pub fn benchmark_audit_analyses(
+    head_root: &Path,
+    base_root: &Path,
+    changed_files: &[PathBuf],
+    threads: usize,
+) -> Result<AuditAnalysesBenchmarkResult, ExitCode> {
+    let config_path = None;
+    let cache_dir = head_root.join(".fallow-cache-benchmark");
+    let mut opts = audit_review_benchmark_options(head_root, &config_path, &cache_dir, threads);
+    // The review brief has its own benchmark and reads git history.
+    opts.brief = false;
+    let changed_files = changed_files.iter().cloned().collect::<FxHashSet<_>>();
+    let focus = fallow_api::audit_run::base_focus_files(&changed_files, &[]);
+    // Production canonicalizes the base root, because a session
+    // canonicalizes its root and a focus set under a symbolic link would
+    // match no finding.
+    let base_root = dunce::canonicalize(base_root).unwrap_or_else(|_| base_root.to_path_buf());
+    let base_root = base_root.as_path();
+    let base_focus = fallow_api::audit_run::remap_focus_files(&focus, head_root, base_root);
+    let (head, base) = rayon::join(
+        || {
+            run_audit_head_analyses(
+                &opts,
+                AuditTypeAwareOptions::default(),
+                None,
+                &changed_files,
+            )
+        },
+        || {
+            run_audit_base_analyses(
+                &opts,
+                AuditTypeAwareOptions::default(),
+                base_root,
+                base_focus.as_ref(),
+            )
+        },
+    );
+    let mut head = head?;
+    let mut base = base?;
+    scope_benchmark_dependency_findings(&mut head, &changed_files);
+    if let Some(focus) = base_focus.as_ref() {
+        scope_benchmark_dependency_findings(&mut base, focus);
+    }
+    let base_snapshot = AuditKeySnapshot::from_view(&base.view());
+    let run = attribute_preloaded_run(&opts, head, base_snapshot, changed_files);
+    let clone_group_count = run
+        .analyses
+        .dupes
+        .as_ref()
+        .map_or(0, |dupes| dupes.report.clone_groups.len());
+    let health_finding_count = run
+        .analyses
+        .health
+        .as_ref()
+        .map_or(0, |health| health.report.findings.len());
+    Ok(AuditAnalysesBenchmarkResult {
+        introduced_count: run.outcome.attribution.dead_code_introduced,
+        inherited_count: run.outcome.attribution.dead_code_inherited,
+        clone_group_count,
+        health_finding_count,
+    })
+}
+
+/// Scope the dependency findings of one side to `files`, under the root that
+/// the dead-code analysis reports, as the production audit does.
+fn scope_benchmark_dependency_findings(analyses: &mut HeadAnalyses, files: &FxHashSet<PathBuf>) {
+    let Some(root) = analyses
+        .view()
+        .dead_code
+        .map(|dead_code| dead_code.root.to_path_buf())
+    else {
+        return;
+    };
+    if let Some(results) = analyses.dead_code_results_mut() {
+        fallow_api::audit_run::scope_dependency_findings(results, &root, files);
+    }
+}
+
 /// Attribute preloaded head analyses against a preloaded base snapshot, with
 /// no renames, through the production attribution.
 fn attribute_preloaded_run(

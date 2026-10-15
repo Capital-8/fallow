@@ -561,11 +561,11 @@ fn namespace_re_export_propagation(c: &mut Criterion) {
         bencher.iter_batched_ref(
             create_namespace_re_export_input,
             |input| {
-                fallow_core::graph::ModuleGraph::build(
+                std::hint::black_box(fallow_core::graph::ModuleGraph::build(
                     &input.resolved_modules,
                     &input.entry_points,
                     &input.files,
-                );
+                ))
             },
             BatchSize::LargeInput,
         );
@@ -872,11 +872,11 @@ fn namespace_object_alias_propagation(c: &mut Criterion) {
         bencher.iter_batched_ref(
             create_namespace_object_alias_input,
             |input| {
-                fallow_core::graph::ModuleGraph::build(
+                std::hint::black_box(fallow_core::graph::ModuleGraph::build(
                     &input.resolved_modules,
                     &input.entry_points,
                     &input.files,
-                );
+                ))
             },
             BatchSize::LargeInput,
         );
@@ -1124,11 +1124,11 @@ fn resolve_re_export_chains(c: &mut Criterion) {
         bencher.iter_batched_ref(
             create_re_export_input,
             |input| {
-                fallow_core::graph::ModuleGraph::build(
+                std::hint::black_box(fallow_core::graph::ModuleGraph::build(
                     &input.resolved_modules,
                     &input.entry_points,
                     &input.files,
-                );
+                ))
             },
             BatchSize::LargeInput,
         );
@@ -1240,6 +1240,103 @@ fn reverse_re_export_chain(c: &mut Criterion) {
                             &input.files,
                         ));
                     },
+                    BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+const STAR_MONOREPO_MODULES_PER_PACKAGE: u32 = 8;
+const STAR_MONOREPO_EXPORTS_PER_MODULE: u32 = 8;
+
+/// A monorepo where each package barrel `export *`s its modules, a root
+/// barrel `export *`s every package barrel, and one entry imports a name
+/// from each package through the root barrel. The work must grow linearly
+/// with the package count; a superlinear ratio between sizes is the
+/// barrel-heavy regression this guards.
+fn create_star_barrel_monorepo_input(packages: u32) -> ReExportInput {
+    use fallow_core::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
+    use fallow_core::extract::{ImportInfo, ImportedName};
+    use fallow_core::resolve::{ResolveResult, ResolvedImport};
+
+    let mut files = Vec::new();
+    let mut resolved_modules = Vec::new();
+    let mut push_module = |path: String| {
+        let id = FileId(u32::try_from(files.len()).expect("fixture file count fits in u32"));
+        let path = PathBuf::from(path);
+        files.push(DiscoveredFile {
+            id,
+            path: path.clone(),
+            size_bytes: 100,
+        });
+        resolved_modules.push(empty_resolved_module(id, path));
+        id
+    };
+
+    let entry = push_module("/project/src/main.ts".to_string());
+    let root_barrel = push_module("/project/packages/index.ts".to_string());
+    let mut package_barrels = Vec::new();
+    let mut package_modules = Vec::new();
+    for package in 0..packages {
+        let barrel = push_module(format!("/project/packages/p{package}/src/index.ts"));
+        package_barrels.push(barrel);
+        for module in 0..STAR_MONOREPO_MODULES_PER_PACKAGE {
+            let id = push_module(format!("/project/packages/p{package}/src/m{module}.ts"));
+            package_modules.push((package, module, barrel, id));
+        }
+    }
+
+    for &(package, module, barrel, id) in &package_modules {
+        resolved_modules[id.0 as usize].exports = (0..STAR_MONOREPO_EXPORTS_PER_MODULE)
+            .map(|slot| effective_export_info(&format!("p{package}m{module}e{slot}"), slot))
+            .collect();
+        resolved_modules[barrel.0 as usize]
+            .re_exports
+            .push(star_re_export(id));
+    }
+    for &barrel in &package_barrels {
+        resolved_modules[root_barrel.0 as usize]
+            .re_exports
+            .push(star_re_export(barrel));
+    }
+    resolved_modules[entry.0 as usize].resolved_imports = (0..packages)
+        .map(|package| ResolvedImport {
+            info: ImportInfo {
+                source: "@project/packages".to_string(),
+                imported_name: ImportedName::Named(format!("p{package}m0e0")),
+                local_name: format!("p{package}m0e0"),
+                is_type_only: false,
+                is_type_only_star: false,
+                from_style: false,
+                span: oxc_span::Span::default(),
+                source_span: oxc_span::Span::default(),
+            },
+            target: ResolveResult::InternalModule(root_barrel),
+        })
+        .collect();
+
+    ReExportInput {
+        entry_points: vec![EntryPoint {
+            path: files[entry.0 as usize].path.clone(),
+            source: EntryPointSource::PackageJsonMain,
+        }],
+        files,
+        resolved_modules,
+    }
+}
+
+fn star_barrel_monorepo(c: &mut Criterion) {
+    let mut group = c.benchmark_group("star_barrel_monorepo");
+    for packages in [8_u32, 32, 128] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(packages),
+            &packages,
+            |b, &packages| {
+                b.iter_batched_ref(
+                    || create_star_barrel_monorepo_input(packages),
+                    |input| std::hint::black_box(build_effective_export_graph(input)),
                     BatchSize::LargeInput,
                 );
             },
@@ -1523,7 +1620,7 @@ fn cache_round_trip(c: &mut Criterion) {
             create_cache_round_trip_input,
             |module| {
                 let cached = module_to_cached(module, SourceFingerprint::new(0, 0), false);
-                let _ = cached_to_module(&cached, FileId(0));
+                std::hint::black_box(cached_to_module(&cached, FileId(0)))
             },
             BatchSize::LargeInput,
         );
@@ -1532,6 +1629,7 @@ fn cache_round_trip(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    star_barrel_monorepo,
     parse_single_file,
     full_pipeline_10_files,
     full_pipeline_100_files,

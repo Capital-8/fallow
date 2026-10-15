@@ -21,8 +21,8 @@ use super::{Edge, ModuleGraph};
 
 use propagate::{
     EffectiveDeclarationRouteCache, ImportBindingUsageIndex, NamedPropagationScratch,
-    NamedReExportPropagation, StarReExportPropagation, propagate_named_re_export,
-    propagate_star_re_export,
+    NamedReExportPropagation, NamedStarRefCache, StarReExportPropagation,
+    propagate_named_re_export, propagate_star_re_export,
 };
 
 #[cfg(test)]
@@ -109,6 +109,7 @@ struct ReExportContext<'a> {
     declaration_routes: &'a mut EffectiveDeclarationRouteCache,
     scratch: &'a mut NamedPropagationScratch,
     reference_paths: &'a mut ReferencePathInterner,
+    named_star_refs: &'a mut NamedStarRefCache,
 }
 
 /// How much of a closure member the consumers that cannot be enumerated see.
@@ -881,6 +882,7 @@ impl ModuleGraph {
         let binding_usage = ImportBindingUsageIndex::build(module_by_id);
         let mut declaration_routes = EffectiveDeclarationRouteCache::default();
         let mut scratch = NamedPropagationScratch::default();
+        let mut named_star_refs = NamedStarRefCache::default();
 
         while let Some(entry_idx) = plan.pop_front() {
             if processed >= safety_cap {
@@ -906,6 +908,7 @@ impl ModuleGraph {
                 declaration_routes: &mut declaration_routes,
                 scratch: &mut scratch,
                 reference_paths,
+                named_star_refs: &mut named_star_refs,
             };
 
             let entry = &re_export_info[entry_idx];
@@ -919,15 +922,19 @@ impl ModuleGraph {
 
         #[cfg(test)]
         if let Some(legacy_modules) = legacy_modules.as_mut() {
-            Self::run_re_export_full_scan(LegacyReExportFullScan {
-                modules: legacy_modules,
-                edges: &self.edges,
-                re_export_info,
-                entry_star_targets,
-                edges_by_target,
-                module_by_id,
-                effective_exports: &self.effective_exports,
-                reference_paths,
+            // The oracle checks every name against every star source, so it
+            // also proves that the source-name filter drops nothing.
+            propagate::without_star_source_filter(|| {
+                Self::run_re_export_full_scan(LegacyReExportFullScan {
+                    modules: legacy_modules,
+                    edges: &self.edges,
+                    re_export_info,
+                    entry_star_targets,
+                    edges_by_target,
+                    module_by_id,
+                    effective_exports: &self.effective_exports,
+                    reference_paths,
+                });
             });
             assert_eq!(
                 serde_json::to_value(legacy_modules)
@@ -1014,6 +1021,7 @@ impl ModuleGraph {
                 triggering_is_type_only: entry.is_type_only,
                 synthetic_stubs: context.synthetic_stubs,
                 reference_paths: context.reference_paths,
+                named_star_refs: context.named_star_refs,
             })
         } else {
             propagate_named_re_export(NamedReExportPropagation {
@@ -1066,6 +1074,9 @@ impl ModuleGraph {
                     declaration_routes: &mut declaration_routes,
                     scratch: &mut scratch,
                     reference_paths,
+                    // A fresh cache per entry keeps the reference scan
+                    // independent of the per-barrel cache it checks.
+                    named_star_refs: &mut NamedStarRefCache::default(),
                 };
                 changed |= Self::propagate_re_export_entry(modules, edges, entry, &mut context);
             }
