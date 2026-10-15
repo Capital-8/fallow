@@ -441,7 +441,11 @@ are not checked, so the cost grows with the number of survivors only.
 - A survivor that the checker cannot check stays `survived`. The reasons are
   `no-project` (no `tsconfig.json` includes the file), `not-type-checked`
   (`// @ts-nocheck`, or a JavaScript file without `checkJs`),
-  `source-changed` and `file-missing`. `typecheck.skipped` counts them.
+  `source-changed`, `file-missing` and `unsupported-file` (a Vue, Svelte or
+  Astro component). `typecheck.skipped` counts them.
+- The run does not send a component survivor to the companion. The
+  TypeScript checker cannot read a component file, so the run gives it the
+  reason `unsupported-file` directly.
 - The run looks for the companion before the tests start. When no trusted
   companion exists, the run exits with code 2 and
   `FALLOW_MUTATION_TYPECHECK_UNAVAILABLE`. Discovery is the same as for
@@ -450,6 +454,8 @@ are not checked, so the cost grows with the number of survivors only.
 - When the companion fails after the tests, the survivors keep the status
   `survived`. The report has `typecheck.completed: false`, an error with the
   code `typecheck-failed`, and the completion reason `typecheck-failed`.
+  `typecheck.skipped` still counts the component survivors, because they
+  never go to the companion.
 - `typecheck` is absent from the report when the option is off. A run
   without the option never sets `compile_error`.
 - `--plan --typecheck` exits with code 2, because a plan has no survivors.
