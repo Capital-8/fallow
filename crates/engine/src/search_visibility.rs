@@ -52,8 +52,16 @@ impl<'g> SourceCache<'g> {
     }
 
     /// Whether `file_id` only exports its import binding `local` again and
-    /// has no other use of it. The file is parsed once.
+    /// has no other use of it. The file is parsed once, and only when its text
+    /// can list `local` in an `export { .. }`.
     fn only_forwards(&mut self, file_id: FileId, local: &str) -> bool {
+        if !self.forwarded.contains_key(&file_id)
+            && !self
+                .get(file_id)
+                .is_some_and(|source| may_export_binding(&source.text, local))
+        {
+            return false;
+        }
         if !self.forwarded.contains_key(&file_id) {
             let path = self
                 .graph
@@ -341,6 +349,67 @@ enum Binding<'g> {
     },
     /// The consumer forwards the export and has no import of it.
     ReExport,
+}
+
+/// Whether `source` can list `local` in an `export { .. }` statement.
+///
+/// [`forwarded_import_bindings`] marks a binding as exported only for a
+/// specifier of an `export { .. }` list. A `false` here proves that no such
+/// list names `local`, so the parse cannot return it. The scan answers `true`
+/// for any text that it cannot read with certainty: an escaped identifier, a
+/// comment after `export`, or a comment, string or non-ASCII character inside
+/// the braces.
+fn may_export_binding(source: &str, local: &str) -> bool {
+    if source.contains("\\u") {
+        return true;
+    }
+    let bytes = source.as_bytes();
+    for (start, keyword) in source.match_indices("export") {
+        let end = start + keyword.len();
+        // Only an ASCII identifier byte can join `export` to a longer name.
+        // JavaScript whitespace such as a no-break space is not ASCII.
+        if start
+            .checked_sub(1)
+            .is_some_and(|index| is_ascii_identifier_byte(bytes[index]))
+            || bytes
+                .get(end)
+                .copied()
+                .is_some_and(is_ascii_identifier_byte)
+        {
+            continue;
+        }
+        let mut rest = trim_script_whitespace(&source[end..]);
+        if let Some(after_type) = strip_keyword(rest, "type") {
+            rest = trim_script_whitespace(after_type);
+        }
+        if rest.starts_with('/') {
+            return true;
+        }
+        let Some(list) = rest.strip_prefix('{') else {
+            continue;
+        };
+        let Some(close) = list.find('}') else {
+            return true;
+        };
+        let list = &list[..close];
+        if !list.is_ascii()
+            || list.contains(['/', '"', '\'', '`'])
+            || contains_whole_word(list, local)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+const fn is_ascii_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+}
+
+/// Strip leading whitespace as a script reads it: Unicode white space, line
+/// terminators and the byte order mark.
+fn trim_script_whitespace(text: &str) -> &str {
+    text.trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\u{feff}')
 }
 
 /// The import bindings of a source file that the file only exports again
@@ -815,6 +884,43 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn export_scan_admits_every_list_that_can_name_the_binding() {
+        for source in [
+            "import { a } from './x';\nexport { a };\n",
+            "import { a } from './x';\nexport {\n  b,\n  a as c,\n};\n",
+            "import type { a } from './x';\nexport type { a };\n",
+            "import { a } from './x';\nexport /* note */ { a };\n",
+            "import { a } from './x';\nexport { /* } */ a };\n",
+            "import { a } from './x';\nexport { b as \"}\", a };\n",
+            "import { \\u0061 } from './x';\nexport { \\u0061 };\n",
+            "import { a } from './x';\nexport { a",
+            "import { a } from './x';\n\u{a0}export { a };\n",
+            "import { a } from './x';\nexport\u{a0}{ a };\n",
+            "import { a } from './x';\u{2028}export { a };\n",
+            "import { a } from './x';\nexport\u{2028}{ a };\n",
+            "import { a } from './x';\nexport\u{feff}{ a };\n",
+            "\u{feff}export { a };\nimport { a } from './x';\n",
+            "import { a } from './x';\nexport type\u{a0}{ a };\n",
+            "import { a } from './x';\nexport {\u{a0}a\u{a0}};\n",
+        ] {
+            assert!(may_export_binding(source, "a"), "{source}");
+        }
+    }
+
+    #[test]
+    fn export_scan_rejects_text_without_a_list_naming_the_binding() {
+        for source in [
+            "import { a } from './x';\nexport const b = a;\n",
+            "import { a } from './x';\nexport { b };\nconsole.log(a);\n",
+            "import { a } from './x';\nexports.a = a;\nreexport { a };\n",
+            "import { a } from './x';\nexport default a;\n",
+            "import { ab } from './x';\nexport { ab };\n",
+        ] {
+            assert!(!may_export_binding(source, "a"), "{source}");
+        }
     }
 
     #[test]
