@@ -585,8 +585,13 @@ fn next_extglob_group(pattern: &str) -> Option<(usize, char)> {
 mod tests {
     use super::*;
 
+    fn project_root() -> PathBuf {
+        std::env::temp_dir().join("fallow-rstest-project")
+    }
+
     fn resolve(path: &str, source: &str) -> PluginResult {
-        RstestPlugin.resolve_config(Path::new(path), source, Path::new("/project"))
+        let root = project_root();
+        RstestPlugin.resolve_config(&root.join(path), source, &root)
     }
 
     fn entry_patterns(result: &PluginResult) -> Vec<String> {
@@ -628,7 +633,7 @@ mod tests {
     #[test]
     fn default_config_keeps_default_include_and_credits_environment() {
         let result = resolve(
-            "/project/rstest.config.ts",
+            "rstest.config.ts",
             "import { defineConfig } from '@rstest/core';\n\
              export default defineConfig({ testEnvironment: 'happy-dom' });",
         );
@@ -644,7 +649,7 @@ mod tests {
     #[test]
     fn include_exclude_and_root_resolve_against_the_project_root() {
         let result = resolve(
-            "/project/rstest.config.ts",
+            "rstest.config.ts",
             "export default defineConfig(({ envMode }) => ({\n\
                root: 'src',\n\
                include: ['**/*.check.ts', '!**/ignored.check.ts'],\n\
@@ -674,12 +679,12 @@ mod tests {
         assert!(
             result
                 .setup_files
-                .contains(&PathBuf::from("/project/src/setup/per-file.ts"))
+                .contains(&project_root().join("src/setup/per-file.ts"))
         );
         assert!(
             result
                 .setup_files
-                .contains(&PathBuf::from("/project/src/setup/global.ts"))
+                .contains(&project_root().join("src/setup/global.ts"))
         );
         let deps = deps(&result);
         assert!(deps.contains(&"some-pkg".to_owned()));
@@ -689,7 +694,7 @@ mod tests {
     #[test]
     fn inline_projects_replace_the_root_project() {
         let result = resolve(
-            "/project/rstest.config.ts",
+            "rstest.config.ts",
             "export default defineConfig({\n\
                coverage: { provider: 'v8' },\n\
                browser: { enabled: true },\n\
@@ -717,7 +722,7 @@ mod tests {
     #[test]
     fn resolve_alias_feeds_path_aliases() {
         let result = resolve(
-            "/project/rstest.config.ts",
+            "rstest.config.ts",
             "export default defineConfig({\n\
                resolve: { alias: { '@app': './src', 'fruit$': './src/fruit.ts', 'gone': false } },\n\
              });",
