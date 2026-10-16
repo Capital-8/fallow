@@ -34,7 +34,8 @@ read-only next steps. It never writes a test and never proposes a code change.
   `<cache dir>/mutation/last-report.json` (by default `.fallow/mutation/`).
   The cache directory has a `.gitignore` with `*`, so the saved report does
   not make the worktree dirty.
-- `-o <path>` (`--output-file`) writes the report only after the run. The
+- `-o <path>` (`--output-file`) writes the report only after the run, also
+  for a run that exits `2` because of baseline failures. The
   worktree check leaves that path out, so a report from an earlier run does
   not make the worktree dirty. A shell redirect such as `> mutation.json`
   creates the file before Fallow starts, so the dirty-worktree check refuses
@@ -179,11 +180,37 @@ or relational mutant, so it adds little test-strength signal for its run time.
 |---|---|
 | `0` | The plan, the run or inspect finished. Survivors do not fail a run. |
 | `1` | `--min-score` or `mutation.minScore` is set, and the score is lower. |
-| `2` | Invalid input or an execution error: a dirty worktree without `--allow-dirty`, a cache directory that hides project files, a missing runtime or runner, a companion file with a wrong digest, an invalid verdict document, `--typecheck` without a type-aware companion. |
+| `2` | Invalid input or an execution error: a dirty worktree without `--allow-dirty`, a cache directory that hides project files, a missing runtime or runner, a companion file with a wrong digest, an invalid verdict document, `--typecheck` without a type-aware companion, a run in which baseline failures leave each mutant without a test result. |
 
 The flag wins over the config key. The minimum applies to the score, in
-percent. A run with no executed mutant has no score and exits `0`, also when
-each mutant is `no_coverage`.
+percent. A run in which no mutant has a test result has no score. It exits
+`0` when it has no baseline failure, also when each mutant is `no_coverage`.
+
+A run in which baseline failures leave each mutant without a test result
+exits `2` with `FALLOW_MUTATION_BASELINE_FAILED`, the same code as a dry run
+that fails outside each test file. The failed tests cannot detect a mutant,
+so the run measured nothing.
+
+- A mutant has a test result when it is `killed`, `timeout`, `survived` or
+  `flaky`. A run with only `runtime_error`, `compile_error` and
+  `no_coverage` mutants and a baseline failure exits `2`.
+- A `pending` mutant keeps the exit code at `0`. The time budget or
+  `--max-mutants` stopped that run, so the baseline failure is not the
+  cause. The completion is `partial`.
+- The error names the first baseline failure and the first line of its
+  message.
+- The run always saves the full report to
+  `<cache dir>/mutation/last-report.json`, and to the `-o` file when `-o`
+  is given. The `help` field of the error gives these paths.
+- With `--format json`, stdout gets the error envelope. When the run cannot
+  save `last-report.json` and has no `-o`, stdout gets the report, so the
+  data stays available, and the error goes to stderr.
+- The human output prints the report and then the error on stderr.
+- This check uses the statuses before `--verdicts`. An `equivalent`
+  verdict for a survivor does not change the exit code to `2`. The
+  `--min-score` check uses the statuses after the verdicts.
+- `fallow_api::mutation::baseline_blocked_run_error` gives the same error
+  to a caller of the programmatic API. MCP does not run mutants.
 
 ## Mutant limit
 
@@ -245,11 +272,16 @@ tests detect the mutant.
 | First result | Retry result | Final status |
 |---|---|---|
 | `survived` | `survived` | `survived` |
+| `survived` | `timeout` | `survived` |
 | `timeout` | `timeout` | `timeout` |
 | `timeout` | `killed` | `killed` |
 | any | `runtime_error` | `runtime_error` |
 | any | other result | `flaky` |
 
+- A `survived` result with a `timeout` retry stays `survived`. The first
+  run finished all tests with the mutant active. Host load alone can make
+  the retry time out, so the timeout is no proof that the tests detect the
+  mutant. A `killed` retry of a survivor gives `flaky`.
 - The retry of a `timeout` waits twice as long. Host load often lasts into
   the retry, and a real infinite loop still times out.
 - A `killed` result gets no retry. In repeated runs under host load, no
@@ -358,6 +390,8 @@ mutant. Their results decide no mutant status.
   `runtime_error`. The time budget does not stop a dry run in progress, so a
   companion that hangs in its dry run can extend the run past the budget.
 - A baseline failure makes the completion `partial` (`baseline-failure`).
+- A run in which baseline failures leave each mutant without a test
+  result exits `2` (see Exit codes).
 
 ## Runners
 
@@ -783,7 +817,9 @@ reads files only. It runs no test.
   `[OK]` when the score meets the minimum, `[X]` when it misses the minimum,
   and `[-]` when no score is measured.
 - One line for the baseline failures. It names the failing test when there
-  is one, and the count and the first test when there are more.
+  is one, and the count and the first test when there are more. A `Message`
+  line under it shows the first line of the message of the first failure, at
+  most 120 characters, for example `Invalid environment variables`.
 - Each `Error` line names its mutant when the error belongs to one mutant.
 - A separate no-coverage section with one line for each file and its count.
   The line adds the counts by test reach class, for example

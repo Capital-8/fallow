@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
-use fallow_api::mutation::{MAX_VERDICT_INPUT_BYTES, Operator};
+use fallow_api::mutation::{MAX_VERDICT_INPUT_BYTES, Operator, baseline_blocked_run_error};
 use fallow_api::{
     AnalysisOptions, MutationRunOptions, MutationRunScope, ProgrammaticError,
     apply_mutation_verdicts, plan_mutation, run_mutation, validate_mutation_verdicts,
@@ -299,9 +299,11 @@ fn absolute_output_path(path: &Path) -> PathBuf {
     std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
 }
 
-/// The exit code of a finished run: 1 only when a minimum score is set and
-/// the measured score is lower. Survivors alone never fail a run. A run with no counted mutant
-/// has no score and passes.
+/// The exit code of the score of a finished run: 1 only when a minimum
+/// score is set and the measured score is lower. Survivors alone never fail
+/// a run. A run with no counted mutant has no score and passes here; a run
+/// in which baseline failures leave each mutant without a test result exits 2
+/// through [`baseline_blocked_run_error`] instead.
 #[must_use]
 pub fn run_exit_code(report: &MutationReport, min_score: Option<f64>) -> u8 {
     match (min_score, report.summary.score) {
@@ -486,6 +488,9 @@ fn run_inner(input: &MutationCliInput<'_>) -> Result<ExitCode, ProgrammaticError
     }
     let mut report = run_mutation(&options)?;
     complete_file_digests(&mut report, input.root);
+    // Before the verdicts: an equivalent verdict for a survivor does not make
+    // the run one in which no mutant has a test result.
+    let blocked = baseline_blocked_run_error(&report);
     if let Some(verdicts) = verdicts {
         apply_mutation_verdicts(&mut report, &verdicts)?;
     }
@@ -497,44 +502,103 @@ fn run_inner(input: &MutationCliInput<'_>) -> Result<ExitCode, ProgrammaticError
             2,
         )
     })?;
-    let saved = match fallow_api::mutation::save_last_mutation_report(&options.analysis, &value) {
-        Ok(_) => true,
+    let saved_path = save_report(&options.analysis, &value);
+    let saved = saved_path.is_some();
+    let json = matches!(input.output, OutputFormat::Json);
+    // The JSON contract of exit code 2 is the error envelope on stdout. The
+    // envelope replaces the report on stdout only when the report is in a
+    // file: the saved report or the `--output-file`.
+    let envelope_only = blocked.is_some() && json && input.output_file.is_none() && saved;
+    let blocked = blocked
+        .map(|error| with_report_locations(error, saved_path.as_deref(), input.output_file, json));
+    if !envelope_only {
+        if let Some(path) = input.output_file
+            && let Err(code) = crate::redirect_report_to_file(path, input.output)
+        {
+            return Ok(code);
+        }
+        if json {
+            emit_json(&value, input.json_style)?;
+        } else {
+            let code = code_lookup(&report, input.root);
+            let flags = inspect_flags(input);
+            let text = render_run(
+                &report,
+                &RunReportOptions {
+                    min_score,
+                    code: Some(&code),
+                    inspect_flags: saved.then_some(flags.as_str()),
+                },
+            );
+            for line in text.lines() {
+                crate::report::sink::outln!("{line}");
+            }
+        }
+        if let Some(path) = input.output_file
+            && let Err(code) = crate::finalize_report_file(path, input.quiet, input.output)
+        {
+            return Ok(code);
+        }
+    }
+    if let Some(error) = &blocked {
+        // A JSON report on stdout keeps stdout one document, so the error
+        // goes to stderr in that case.
+        let report_on_stdout = json && input.output_file.is_none() && !envelope_only;
+        let format = if report_on_stdout {
+            OutputFormat::Human
+        } else {
+            input.output
+        };
+        return Ok(crate::error::emit_programmatic_error(
+            error,
+            format,
+            input.json_style,
+        ));
+    }
+    Ok(ExitCode::from(exit))
+}
+
+/// Saves the report for `fallow mutation inspect` and gives its path. A
+/// failed save is a warning, not a run error.
+fn save_report(analysis: &AnalysisOptions, value: &serde_json::Value) -> Option<PathBuf> {
+    match fallow_api::mutation::save_last_mutation_report(analysis, value) {
+        Ok(path) => Some(path),
         Err(error) => {
             eprintln!(
                 "fallow: warning: the mutation report was not saved for `fallow mutation inspect`: {}",
                 error.message
             );
-            false
+            None
         }
-    };
-    if let Some(path) = input.output_file
-        && let Err(code) = crate::redirect_report_to_file(path, input.output)
-    {
-        return Ok(code);
     }
-    if matches!(input.output, OutputFormat::Json) {
-        emit_json(&value, input.json_style)?;
+}
+
+/// Adds the locations of the report to the help of a run error, so that a
+/// JSON caller that gets the error envelope knows where to read the report.
+fn with_report_locations(
+    error: ProgrammaticError,
+    saved: Option<&Path>,
+    output_file: Option<&Path>,
+    json: bool,
+) -> ProgrammaticError {
+    let locations: Vec<String> = saved
+        .into_iter()
+        .chain(output_file)
+        .map(|path| path.display().to_string())
+        .collect();
+    let location = if locations.is_empty() {
+        if !json {
+            return error;
+        }
+        "the report of this run is on stdout".to_owned()
     } else {
-        let code = code_lookup(&report, input.root);
-        let flags = inspect_flags(input);
-        let text = render_run(
-            &report,
-            &RunReportOptions {
-                min_score,
-                code: Some(&code),
-                inspect_flags: saved.then_some(flags.as_str()),
-            },
-        );
-        for line in text.lines() {
-            crate::report::sink::outln!("{line}");
-        }
-    }
-    if let Some(path) = input.output_file
-        && let Err(code) = crate::finalize_report_file(path, input.quiet, input.output)
-    {
-        return Ok(code);
-    }
-    Ok(ExitCode::from(exit))
+        format!("the report of this run is in {}", locations.join(" and "))
+    };
+    let help = match &error.help {
+        Some(help) => format!("{help}; {location}"),
+        None => location,
+    };
+    error.with_help(help)
 }
 
 fn emit_json(value: &serde_json::Value, style: JsonStyle) -> Result<(), ProgrammaticError> {
