@@ -167,14 +167,18 @@ and [federated app credentials](https://learn.microsoft.com/en-us/entra/workload
   check in `release-context` is part of the workflow file, so it stops a
   mistaken dispatch but not an edited copy of the workflow on another ref; the
   environment is enforced by GitHub outside the file.
-- Move `VSCE_PAT`, `OVSX_PAT`, and `ED25519_BINARY_SIGNING_PRIVATE_KEY` into the
-  `release` environment as each one is rotated, and delete the repository copy
-  in the same pass. GitHub never returns a secret value, so a move needs the
-  value entered again. A secret that is still at repository level is readable
-  by any workflow on any ref: the environment does not protect it. The
-  maintainer preflight verifies the branch policy, names every secret that is
-  still unprotected, and fails on a secret that exists at both levels, because
-  the workflow token cannot read environment settings.
+- Keep required publication secrets in the protected `release` environment.
+  Rotation can move `VSCE_PAT`, `OVSX_PAT`, or
+  `ED25519_BINARY_SIGNING_PRIVATE_KEY` when its value is entered again.
+  The existing signing key can also move through a reviewed, one-time
+  ciphertext-only transfer without changing the key or its consumers.
+  Independently verify a signature made with the protected environment copy
+  before retiring the repository copy. GitHub's API does not return secret
+  values. A repository copy remains readable by a workflow on any ref and is
+  not protected by the environment. The maintainer preflight verifies the
+  branch policy, names unprotected copies, and rejects duplicates; complete
+  transfer verification and retirement before running that preflight.
+  The workflow token cannot read environment settings.
 - Pin the crates.io trusted publishing configs to the `release` environment.
   crates.io accepts an environment claim when a config sets none, and rejects a
   token without the matching claim once it does, so the pin is what stops an
