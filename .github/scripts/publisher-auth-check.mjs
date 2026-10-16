@@ -10,7 +10,8 @@ const requestJson = async (url, options, send, expectedStatus = 200) => {
     redirect: "error",
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
-  if (response.status !== expectedStatus) throw new Error("Identity request was refused");
+  if (response.status !== expectedStatus)
+    throw Object.assign(new Error("Identity request was refused"), { httpStatus: response.status });
   const value = await response.json();
   if (!value || typeof value !== "object" || value.error) {
     throw new Error("Identity response was invalid");
@@ -169,8 +170,9 @@ export const verifyOtherRegistryIdentities = async (
   }
 };
 
-/** Check the fixed extension's trusted identity and namespace rights without uploading packages. */
+/** Check the fixed extension's trusted identity and target rights without uploading packages. */
 export const verifyOpenVsxIdentity = async (env = process.env, send = fetch) => {
+  let stage = "GitHub identity";
   try {
     const identityUrl = getIdentityUrl(env, REGISTRY);
     const identity = await requestJson(
@@ -185,6 +187,7 @@ export const verifyOpenVsxIdentity = async (env = process.env, send = fetch) => 
       send,
     );
     if (!validToken(identity.value)) throw new Error("Missing identity");
+    stage = "trusted exchange";
     const authority = await requestJson(
       `${REGISTRY}/api/-/trusted-publishing/token`,
       {
@@ -197,21 +200,24 @@ export const verifyOpenVsxIdentity = async (env = process.env, send = fetch) => 
         }),
       },
       send,
+      201,
     );
     if (!validToken(authority.value)) throw new Error("Missing authority");
+    stage = "extension permission";
     const permission = await requestJson(
-      `${REGISTRY}/api/fallow-rs/verify-pat`,
+      `${REGISTRY}/api/-/size-limit?namespace=fallow-rs&extension=fallow-vscode`,
       {
         method: "GET",
         headers: { Authorization: `Bearer ${authority.value}`, Accept: "application/json" },
       },
       send,
     );
-    if (typeof permission.success !== "string" || !permission.success)
+    if (!Number.isSafeInteger(permission.maxSize) || permission.maxSize <= 0)
       throw new Error("Missing permission");
     return { ok: true };
-  } catch {
-    return { ok: false, error: "Open VSX trusted identity or namespace permission check failed" };
+  } catch (error) {
+    const status = Number.isInteger(error?.httpStatus) ? ` (HTTP ${error.httpStatus})` : "";
+    return { ok: false, error: `Open VSX ${stage} check failed${status}` };
   }
 };
 
@@ -221,7 +227,9 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       ? await verifyOpenVsxIdentity()
       : { ok: false, error: "Unsupported identity check arguments" };
   console.log(
-    result.ok ? "Open VSX trusted identity has namespace publishing permission" : result.error,
+    result.ok
+      ? "Open VSX trusted identity has fixed extension publishing permission"
+      : result.error,
   );
   const registries = result.ok ? await verifyOtherRegistryIdentities() : result;
   if (result.ok) {
