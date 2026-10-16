@@ -166,7 +166,7 @@ globalThis.fetch = async (url, options) => {
     return Response.json({value:'e30.'+Buffer.from(JSON.stringify(claims)).toString('base64url')+'.synthetic'});
   }
   if (endpoint.href === 'https://open-vsx.org/api/-/trusted-publishing/token' && options.method === 'POST') return process.env.TEST_REFUSE_OPENVSX === 'true' ? new Response('private provider authority', {status:403}) : Response.json({value:'synthetic-authority'},{status:201});
-  if (endpoint.hostname === 'registry.npmjs.org' && options.method === 'POST' && endpoint.pathname.startsWith('/-/npm/v1/oidc/token/exchange/package/')) return process.env.TEST_REFUSE_NPM === 'true' ? new Response('private provider authority',{status:401}) : Response.json({token_type:'oidc',token:'synthetic-npm-authority',created:new Date().toISOString(),expires:new Date(Date.now()+3600000).toISOString()},{status:201});
+  if (endpoint.hostname === 'registry.npmjs.org' && options.method === 'POST' && endpoint.pathname.startsWith('/-/npm/v1/oidc/token/exchange/package/')) return process.env.TEST_REFUSE_NPM === 'true' ? new Response('private provider authority',{status:401}) : Response.json({token_type:'oidc',token:'synthetic-npm-authority'},{status:201});
   if (endpoint.href === 'https://crates.io/api/v1/trusted_publishing/tokens' && options.method === 'POST') return process.env.TEST_REFUSE_CRATES === 'true' ? new Response('private provider authority',{status:403}) : Response.json({token:'cio_tp_'+'a'.repeat(32)});
   throw new Error('Unexpected provider route');
 };`,
@@ -240,15 +240,13 @@ globalThis.fetch = async (url, options) => {
   assert.equal(readFileSync(trace, "utf8"), "");
 });
 
-test("npm and crates exchanges validate authority expiration and retain independent outcomes", async () => {
+test("npm and crates exchanges validate identity expiry and opaque authority without timestamp metadata", async () => {
   const now = Date.parse("2026-10-16T12:00:00Z");
   const identity = (audience, expires = now + 600_000) =>
     `e30.${Buffer.from(JSON.stringify({ aud: audience, exp: Math.floor(expires / 1000) })).toString("base64url")}.synthetic`;
   const token = {
     token_type: "oidc",
     token: "synthetic-npm-token",
-    created: new Date(now).toISOString(),
-    expires: new Date(now + 3_600_000).toISOString(),
   };
   const run = async (override = null, identityOverride = null, refuseCrates = false) => {
     const calls = [];
@@ -289,11 +287,6 @@ test("npm and crates exchanges validate authority expiration and retain independ
     }
   }
   for (const [invalid, stage] of [
-    [{ ...token, expires: new Date(now - 1).toISOString() }, "authority lifetime"],
-    [{ ...token, expires: "invalid" }, "authority timestamp shape"],
-    [{ ...token, created: "invalid" }, "authority timestamp shape"],
-    [{ ...token, created: new Date(now + 600_000).toISOString() }, "authority lifetime"],
-    [{ ...token, expires: new Date(now + 86_400_000).toISOString() }, "authority lifetime"],
     [{ ...token, token_type: "persistent" }, "authority token type"],
     [{ ...token, token: "" }, "authority token shape"],
     [{ ...token, token: "secret\r\n::error::private" }, "authority token shape"],
