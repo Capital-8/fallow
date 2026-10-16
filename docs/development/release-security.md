@@ -96,14 +96,36 @@ connection, Azure resource role or subscription ID is part of this workflow.
 The manual-only `verify-marketplace-identity.yml` workflow provides the profile
 lookup prerequisite after owner-approved source integration. It runs only on
 `main` in the protected `release` environment, uses the configured app's Entra
-identity, and makes only the fixed global profile GET with API version 7.1.
+identity, and makes the fixed global profile GET with API version 7.1.
 It requires Azure CLI's active account to be the configured service principal
 and tenant before obtaining a token. It emits a validated profile ID, never a
 token or upstream response body, and refuses redirects. It has no signing, PAT, dependency installation or publication
 step. Running it still requires separate owner approval, app registration and
 federation setup; the prepared workflow is not provider verification. Use the
 returned ID for owner-controlled publisher membership and read it back there.
+After the owner grants the profile a publishing role, dispatch that workflow
+with `verify_publisher=true`. It also reads the fixed publisher role-assignment
+endpoint and requires this profile to hold Contributor, Owner or Creator with
+no denied permissions. Reader access does not pass. The frozen VSCE
+`verify-pat` command alone accepts Reader, so its success is not sufficient.
 The real publisher job must never be dispatched as an identity capability probe.
+
+Open VSX binds identity to `release.yml`. Its owner-approved check therefore
+uses that workflow with `auth_check=true`, `tag=auth-check` and `pgo=false`.
+The deliberately invalid version tag provides a second barrier if the release
+context guard regresses. The check runs only on `main` in the protected
+`release` environment. `release-context` and all release build, signing and
+publication jobs skip. The separate check job installs no dependencies and
+reads no package, PAT or signing secret. It requests GitHub identity for
+`https://open-vsx.org`, exchanges it for the fixed `fallow-rs.fallow-vscode`
+extension, and calls the namespace permission GET with Bearer authority.
+No registry URL or namespace is supplied by an input. Redirects and refusal
+fail closed, with no PAT fallback and no provider response or token in logs.
+
+The exchange issues short-lived authority at the provider. The permission
+request does not consume that authority or upload a package. A successful
+check proves the binding and namespace publishing permission at that time;
+it does not prove an extension upload or change either active auth mode.
 
 App registration, federation, publisher membership, mode activation and legacy
 PAT retirement are separate owner actions. A prepared source route does not

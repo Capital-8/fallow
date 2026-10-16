@@ -787,6 +787,7 @@ test("release credential jobs run in the main-only release environment", () => {
   const credentialJobs = [
     "npm-publish",
     "publish-crates",
+    "publisher-auth-check",
     "sign",
     "vscode-publish-marketplace",
     "vscode-publish-open-vsx",
@@ -2356,7 +2357,7 @@ test("Marketplace identity verification is a protected manual read with no publi
   assert.match(job, /audience: api:\/\/AzureADTokenExchange/u);
   assert.doesNotMatch(
     job,
-    /secrets\.|VSCE_PAT|SIGNING|subscription-id:|creds:|continue-on-error:|npm|npx|publish|upload-artifact|contents: write/u,
+    /secrets\.|VSCE_PAT|SIGNING|subscription-id:|creds:|continue-on-error:|npm|npx|\bpublish\b|upload-artifact|contents: write/u,
   );
   const config = job.indexOf("--validate-config");
   const login = job.indexOf("uses: azure/login@");
@@ -2420,4 +2421,47 @@ ${block}`;
   assert.notEqual(duplicate.status, 0);
   assert.match(duplicate.stderr, /VSCE_PAT exists at both levels/u);
   assert.notEqual(run("azure", "oidc", [], []).status, 0);
+});
+
+test("release auth check cannot start any release build or publication job", () => {
+  const workflow = readWorkflow(".github/workflows/release.yml");
+  assert.match(
+    workflow,
+    /auth_check:\n\s+description:[^\n]*\n\s+required: false\n\s+default: false\n\s+type: boolean/u,
+  );
+  const context = indentedBlock(workflow, "release-context", 2);
+  assert.match(context, /^    if: \$\{\{ !inputs.auth_check \}\}$/mu);
+  const names = Array.from(
+    indentedBlock(workflow, "jobs", 0).matchAll(/^ {2}([a-z][a-z0-9-]*):$/gmu),
+    (match) => match[1],
+  );
+  const reachable = new Set(["release-context"]);
+  for (let pass = 0; pass < names.length; pass++) {
+    for (const name of names) {
+      if (name === "publisher-auth-check") continue;
+      const job = indentedBlock(workflow, name, 2);
+      assert.doesNotMatch(job, /always\(\)|!cancelled\(\)/u);
+      const needs =
+        job
+          .match(/^    needs: (.+)$/mu)?.[1]
+          .replaceAll("[", "")
+          .replaceAll("]", "")
+          .split(/,\s*/u) ?? [];
+      if (needs.length && needs.every((dependency) => reachable.has(dependency)))
+        reachable.add(name);
+    }
+  }
+  assert.deepEqual(
+    [...reachable].toSorted(),
+    names.filter((name) => name !== "publisher-auth-check").toSorted(),
+  );
+  const auth = indentedBlock(workflow, "publisher-auth-check", 2);
+  assert.match(auth, /if: inputs.auth_check && github.ref == 'refs\/heads\/main'/u);
+  assert.match(auth, /environment: release/u);
+  assert.match(auth, /id-token: write/u);
+  assert.doesNotMatch(
+    auth,
+    /needs:|secrets\.|npm|npx|cargo|upload-artifact|download-artifact|packagePath/u,
+  );
+  assert.match(auth, /node .github\/scripts\/publisher-auth-check.mjs/u);
 });

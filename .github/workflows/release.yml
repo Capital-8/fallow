@@ -7,6 +7,11 @@ on:
         description: Version tag to publish, for example v3.11.0
         required: true
         type: string
+      auth_check:
+        description: Check Open VSX identity without a release
+        required: false
+        default: false
+        type: boolean
       pgo:
         description: Build the Rust release binaries with profile-guided optimization (PGO)
         required: false
@@ -28,6 +33,7 @@ env:
 jobs:
   release-context:
     name: Verify tag-last release context
+    if: ${{ !inputs.auth_check }}
     runs-on: ubuntu-26.04
     # The CI gate below waits up to 150 min for runs on the release commit.
     # The free plan queue can hold push runs for a long time.
@@ -2333,3 +2339,28 @@ jobs:
             exit 1
           fi
           echo "Release workflow completed with ${TAG_NAME} still absent"
+
+
+  publisher-auth-check:
+    name: Check Open VSX publishing identity
+    if: inputs.auth_check && github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout reviewed identity check
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/publisher-auth-check.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Check Open VSX trusted publishing permission
+        run: node .github/scripts/publisher-auth-check.mjs

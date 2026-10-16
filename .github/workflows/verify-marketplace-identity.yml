@@ -2,6 +2,12 @@ name: Verify Marketplace identity
 
 on:
   workflow_dispatch:
+    inputs:
+      verify_publisher:
+        description: Require the app to hold a publishing role after the owner grants access
+        required: false
+        default: false
+        type: boolean
 
 permissions: {}
 
@@ -46,3 +52,7 @@ jobs:
       - name: Read validated Marketplace profile ID
         id: profile
         run: node .github/scripts/marketplace-profile.mjs
+
+      - name: Check app publishing role
+        if: inputs.verify_publisher
+        run: node .github/scripts/marketplace-profile.mjs --verify-publisher

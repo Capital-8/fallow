@@ -167,3 +167,46 @@ test("Marketplace rejects a personal account or different app before any profile
     assert.equal(requests, 1);
   }
 });
+
+test("Marketplace publisher check rejects Reader access and requires the app's publishing role", async () => {
+  const config = {
+    clientId: "11111111-2222-3333-4444-555555555555",
+    tenantId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    verifyPublisher: true,
+  };
+  const runAzure = (command, args) =>
+    JSON.stringify(
+      args[1] === "show"
+        ? { tenantId: config.tenantId, user: { type: "servicePrincipal", name: config.clientId } }
+        : { tenant: config.tenantId, accessToken: token },
+    );
+  for (const [name, identity, denied, expected] of [
+    ["Reader", profileId, 0, false],
+    ["Contributor", profileId, 0, true],
+    ["Owner", profileId, 0, true],
+    ["Contributor", "aaaaaaaa-1234-1234-1234-123456789abc", 0, false],
+    ["Contributor", profileId, 1, false],
+  ]) {
+    const requests = [];
+    const send = async (url, options) => {
+      requests.push({ url, ...options });
+      return Response.json(
+        requests.length === 1
+          ? { id: profileId }
+          : {
+              value: [{ identity: { id: identity }, role: { name, denyPermissions: denied } }],
+            },
+      );
+    };
+    const result = await resolveMarketplaceProfile(config, runAzure, send);
+    assert.equal(result.ok, expected, name);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].method, "GET");
+    assert.equal(
+      requests[1].url,
+      "https://marketplace.visualstudio.com/_apis/securityroles/scopes/gallery.publisher/roleassignments/resources/fallow-rs?api-version=3.2-preview.1",
+    );
+    assert.equal(requests[1].headers.Authorization, `Bearer ${token}`);
+    assert.equal(requests[1].redirect, "error");
+  }
+});
