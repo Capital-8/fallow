@@ -1,0 +1,11 @@
+{
+  "repository": "fallow-rs/fallow",
+  "environment": "release",
+  "key_id": "3380204578043523366",
+  "key": "v+9n6iao9HgdoJMP+E8wgxjVB5Gp+HA7mSjwPblSiB0=",
+  "toolchain": {
+    "path": "/usr/lib/x86_64-linux-gnu/libsodium.so.23.3.0",
+    "version": "1.0.18",
+    "sha256": "fe00408090ea084504d7cb0130af56a22554fe299034b864551b65a64ca8a7b5"
+  }
+}

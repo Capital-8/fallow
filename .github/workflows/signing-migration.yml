@@ -1,0 +1,96 @@
+name: Temporary signing secret migration
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/signing-migration.yml
+      - scripts/signing_migration.py
+      - scripts/signing_migration_test.py
+      - scripts/signing-migration.json
+      - scripts/signing-migration.test.mjs
+      - scripts/signing-migration-receipt.mjs
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Preflight contains no signing credential. Export and verify require owner review.
+        type: choice
+        required: true
+        default: preflight
+        options:
+          - preflight
+          - export
+          - verify
+
+permissions: {}
+
+concurrency:
+  group: signing-migration-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+      - name: Inspect system crypto library without credentials
+        run: python3 -I -S scripts/signing_migration.py preflight
+      - name: Exercise synthetic byte preservation and negative controls
+        run: python3 -I -S scripts/signing_migration_test.py
+
+  transfer:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'fallow-rs/fallow' && inputs.operation == 'export'
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/signing_migration.py
+            scripts/signing-migration.json
+          sparse-checkout-cone-mode: false
+      - name: Seal the existing signing secret for the reviewed environment key
+        env:
+          ED25519_BINARY_SIGNING_PRIVATE_KEY: ${{ secrets.ED25519_BINARY_SIGNING_PRIVATE_KEY }}
+        run: python3 -I -S scripts/signing_migration.py export
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: signing-migration-${{ github.run_id }}-${{ github.run_attempt }}
+          path: signing-migration-output/receipt.json
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-environment:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'fallow-rs/fallow' && inputs.operation == 'verify'
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/signing_migration.py
+            scripts/signing-migration.json
+          sparse-checkout-cone-mode: false
+      - name: Prove the effective environment seed matches the unchanged public key
+        env:
+          ED25519_BINARY_SIGNING_PRIVATE_KEY: ${{ secrets.ED25519_BINARY_SIGNING_PRIVATE_KEY }}
+        run: python3 -I -S scripts/signing_migration.py verify
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: signing-environment-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: signing-migration-output/receipt.json
+          if-no-files-found: error
+          retention-days: 1
