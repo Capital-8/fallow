@@ -137,6 +137,42 @@ export const resolveMarketplaceProfile = async (
   return { ok: false, error: "Marketplace app has no verified publishing role for fallow-rs" };
 };
 
+/** Verify the frozen VSCE Azure credential chain without publishing or exposing CLI output. */
+export const verifyMarketplaceAzureCredential = (runNative = execFileSync, env = process.env) => {
+  const safeEnv = { ...env };
+  for (const name of [
+    "VSCE_PAT",
+    "AZURE_CLIENT_SECRET",
+    "AZURE_CLIENT_CERTIFICATE_PATH",
+    "AZURE_CLIENT_CERTIFICATE_PASSWORD",
+  ]) {
+    delete safeEnv[name];
+  }
+  try {
+    runNative(
+      process.execPath,
+      [
+        fileURLToPath(
+          new URL("../publishers/marketplace/node_modules/@vscode/vsce/vsce", import.meta.url),
+        ),
+        "verify-pat",
+        "fallow-rs",
+        "--azure-credential",
+      ],
+      {
+        env: safeEnv,
+        encoding: "utf8",
+        timeout: TOKEN_TIMEOUT_MS,
+        maxBuffer: TOKEN_OUTPUT_LIMIT,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    return { ok: true };
+  } catch {
+    return { ok: false, error: "Marketplace native Azure credential verification failed" };
+  }
+};
+
 const main = async () => {
   const config = {
     clientId: process.env.AZURE_CLIENT_ID,
@@ -153,6 +189,13 @@ const main = async () => {
     return 1;
   }
   if (process.argv.length === 3 && process.argv[2] === "--validate-config") return 0;
+  if (process.argv.length === 3 && process.argv[2] === "--verify-vsce") {
+    const native = verifyMarketplaceAzureCredential();
+    console.log(
+      native.ok ? "Marketplace native Azure credential verification passed" : native.error,
+    );
+    return native.ok ? 0 : 1;
+  }
   if (process.argv.length !== 2 && !(process.argv.length === 3 && config.verifyPublisher)) {
     console.error("Unsupported Marketplace identity verification arguments");
     return 1;

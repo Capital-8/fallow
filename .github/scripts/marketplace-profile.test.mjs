@@ -5,6 +5,7 @@ import {
   lookupMarketplaceProfile,
   resolveMarketplaceProfile,
   validateIdentityConfig,
+  verifyMarketplaceAzureCredential,
 } from "./marketplace-profile.mjs";
 
 const profileId = "12345678-1234-1234-1234-123456789abc";
@@ -209,4 +210,33 @@ test("Marketplace publisher check rejects Reader access and requires the app's p
     assert.equal(requests[1].headers.Authorization, `Bearer ${token}`);
     assert.equal(requests[1].redirect, "error");
   }
+});
+
+test("native Marketplace verification uses only the frozen Azure CLI path and hides output", () => {
+  const env = {
+    VSCE_PAT: "private PAT",
+    AZURE_CLIENT_SECRET: "private secret",
+    AZURE_CLIENT_CERTIFICATE_PATH: "private certificate",
+    AZURE_CLIENT_CERTIFICATE_PASSWORD: "private password",
+    AZURE_CLIENT_ID: "configured-app",
+  };
+  const execute = (command, args, options) => {
+    assert.equal(command, process.execPath);
+    assert.match(
+      args[0],
+      /\/.github\/publishers\/marketplace\/node_modules\/@vscode\/vsce\/vsce$/u,
+    );
+    assert.deepEqual(args.slice(1), ["verify-pat", "fallow-rs", "--azure-credential"]);
+    assert.deepEqual(options.env, { AZURE_CLIENT_ID: "configured-app" });
+    assert.deepEqual(options.stdio, ["ignore", "pipe", "pipe"]);
+    return "private upstream output";
+  };
+  assert.deepEqual(verifyMarketplaceAzureCredential(execute, env), { ok: true });
+  assert.deepEqual(
+    verifyMarketplaceAzureCredential(() => {
+      throw new Error("private token and provider output");
+    }, env),
+    { ok: false, error: "Marketplace native Azure credential verification failed" },
+  );
+  assert.equal(env.VSCE_PAT, "private PAT");
 });

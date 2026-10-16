@@ -2347,7 +2347,7 @@ test("Marketplace identity verification is a protected manual read with no publi
   assert.match(job, /permissions:\n\s+contents: read\n\s+id-token: write/u);
   assert.match(job, /ref: \$\{\{ github\.sha \}\}/u);
   assert.match(job, /persist-credentials: false/u);
-  assert.match(job, /sparse-checkout: \.github\/scripts\/marketplace-profile\.mjs/u);
+  assert.match(job, /sparse-checkout: \|\n\s+\.github\/scripts\/marketplace-profile\.mjs/u);
   assert.match(job, /sparse-checkout-cone-mode: false/u);
   assert.match(job, /package-manager-cache: false/u);
   assert.match(job, /uses: azure\/login@[0-9a-f]{40}/u);
@@ -2357,7 +2357,7 @@ test("Marketplace identity verification is a protected manual read with no publi
   assert.match(job, /audience: api:\/\/AzureADTokenExchange/u);
   assert.doesNotMatch(
     job,
-    /secrets\.|VSCE_PAT|SIGNING|subscription-id:|creds:|continue-on-error:|npm|npx|\bpublish\b|upload-artifact|contents: write/u,
+    /secrets\.|VSCE_PAT|SIGNING|subscription-id:|creds:|continue-on-error:|npx|\bpublish\b|upload-artifact|contents: write/u,
   );
   const config = job.indexOf("--validate-config");
   const login = job.indexOf("uses: azure/login@");
@@ -2476,4 +2476,30 @@ test("auth-only npm exchanges use the exact release publication inventory", asyn
   const expected = [...inventory.matchAll(/"([^"\n]+)"/gu)].map((match) => match[1]);
   assert.deepEqual(NPM_PACKAGES, expected);
   assert.equal(new Set(NPM_PACKAGES).size, NPM_PACKAGES.length);
+});
+
+test("optional Marketplace publisher proof installs only the frozen CLI before Azure login", () => {
+  const workflow = readWorkflow(".github/workflows/verify-marketplace-identity.yml");
+  const job = indentedBlock(workflow, "profile", 2);
+  const install = job.match(
+    /- name: Install frozen Marketplace verifier\n([\s\S]*?)(?=\n      -|$)/u,
+  )?.[1];
+  assert.ok(install, "publisher verification needs the frozen native CLI");
+  assert.match(install, /if: inputs.verify_publisher/u);
+  assert.match(
+    install,
+    /run: npm ci --prefix .github\/publishers\/marketplace --ignore-scripts --no-audit --no-fund/u,
+  );
+  assert.ok(job.indexOf("Install frozen Marketplace verifier") < job.indexOf("uses: azure/login@"));
+  const native = job.match(
+    /- name: Verify native Marketplace Azure credential chain\n([\s\S]*?)(?=\n      -|$)/u,
+  )?.[1];
+  assert.ok(native);
+  assert.match(native, /if: inputs.verify_publisher/u);
+  assert.match(native, /run: node .github\/scripts\/marketplace-profile.mjs --verify-vsce/u);
+  assert.ok(job.indexOf("--verify-publisher") < job.indexOf("--verify-vsce"));
+  assert.match(
+    job,
+    /sparse-checkout: \|\n\s+.github\/scripts\/marketplace-profile.mjs\n\s+.github\/publishers\/marketplace/u,
+  );
 });

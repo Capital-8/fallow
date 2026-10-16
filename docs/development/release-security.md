@@ -99,15 +99,20 @@ lookup prerequisite after owner-approved source integration. It runs only on
 identity, and makes the fixed global profile GET with API version 7.1.
 It requires Azure CLI's active account to be the configured service principal
 and tenant before obtaining a token. It emits a validated profile ID, never a
-token or upstream response body, and refuses redirects. It has no signing, PAT, dependency installation or publication
-step. Running it still requires separate owner approval, app registration and
+token or upstream response body, and refuses redirects. The default lookup
+installs no dependencies. Neither mode reads signing or PAT secrets or publishes
+an extension. Running it still requires separate owner approval, app registration and
 federation setup; the prepared workflow is not provider verification. Use the
 returned ID for owner-controlled publisher membership and read it back there.
 After the owner grants the profile a publishing role, dispatch that workflow
 with `verify_publisher=true`. It also reads the fixed publisher role-assignment
 endpoint and requires this profile to hold Contributor, Owner or Creator with
-no denied permissions. Reader access does not pass. The frozen VSCE
-`verify-pat` command alone accepts Reader, so its success is not sufficient.
+no denied permissions. Reader access does not pass. This optional path installs
+only the frozen Marketplace CLI with lifecycle scripts disabled, before Azure
+login. It also runs `verify-pat fallow-rs --azure-credential` to check the native
+credential chain used by publication. CLI output stays captured, and only a
+fixed pass or fail message reaches the log. The native command alone accepts
+Reader, so the strict app-profile role check remains required.
 The real publisher job must never be dispatched as an identity capability probe.
 
 Open VSX binds identity to `release.yml`. Its owner-approved check therefore
