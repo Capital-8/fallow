@@ -15,16 +15,16 @@ const env = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic-request",
 };
 
-test("Open VSX checks fixed identity exchange and namespace permission without packages or PAT", async () => {
+test("Open VSX accepts the server 201 exchange and checks the fixed extension without packages or PAT", async () => {
   const calls = [];
   const send = async (url, options) => {
     calls.push({ url: String(url), ...options });
     const payloads = [
       { value: "synthetic-identity" },
       { value: "synthetic-authority" },
-      { success: "Valid token" },
+      { maxSize: 536870912 },
     ];
-    return Response.json(payloads[calls.length - 1]);
+    return Response.json(payloads[calls.length - 1], { status: calls.length === 2 ? 201 : 200 });
   };
   assert.deepEqual(await verifyOpenVsxIdentity({ ...env, OVSX_PAT: "must-not-be-used" }, send), {
     ok: true,
@@ -39,7 +39,10 @@ test("Open VSX checks fixed identity exchange and namespace permission without p
     extension: "fallow-vscode",
     token: "synthetic-identity",
   });
-  assert.equal(calls[2].url, "https://open-vsx.org/api/fallow-rs/verify-pat");
+  assert.equal(
+    calls[2].url,
+    "https://open-vsx.org/api/-/size-limit?namespace=fallow-rs&extension=fallow-vscode",
+  );
   assert.equal(calls[2].method, "GET");
   assert.equal(calls[2].headers.Authorization, "Bearer synthetic-authority");
   for (const call of calls) assert.equal(call.redirect, "error");
@@ -51,7 +54,7 @@ test("Open VSX refuses identity and permission failures without token fallback o
     const send = async () => {
       const index = calls++;
       if (index === failedRequest) return new Response("private provider details", { status: 403 });
-      return Response.json({ value: "synthetic-token" });
+      return Response.json({ value: "synthetic-token" }, { status: index === 1 ? 201 : 200 });
     };
     const result = await verifyOpenVsxIdentity({ ...env, OVSX_PAT: "must-not-be-used" }, send);
     assert.equal(result.ok, false);
@@ -78,10 +81,70 @@ test("Open VSX refuses identity and permission failures without token fallback o
   assert.equal(calls, 0);
   assert.deepEqual(
     await verifyOpenVsxIdentity(env, async () =>
-      Response.json({ value: "token", success: "Valid token" }),
+      Response.json({ value: "token", maxSize: 1024 }, { status: calls++ === 1 ? 201 : 200 }),
     ),
     { ok: true },
   );
+});
+
+test("Open VSX rejects incorrect HTTP statuses and malformed target permission responses", async () => {
+  for (const [statuses, permission, expected] of [
+    [[200, 200, 200], { maxSize: 1024 }, "Open VSX trusted exchange check failed (HTTP 200)"],
+    [[200, 201, 201], { maxSize: 1024 }, "Open VSX extension permission check failed (HTTP 201)"],
+    [[200, 201, 200], { success: "Valid token" }, "Open VSX extension permission check failed"],
+    [[200, 201, 200], { maxSize: "1024" }, "Open VSX extension permission check failed"],
+    [[200, 201, 200], { maxSize: 0 }, "Open VSX extension permission check failed"],
+    [[200, 201, 200], { maxSize: -1 }, "Open VSX extension permission check failed"],
+    [[200, 201, 200], { maxSize: 1.5 }, "Open VSX extension permission check failed"],
+    [
+      [200, 201, 200],
+      { error: "private provider token", maxSize: 1024 },
+      "Open VSX extension permission check failed",
+    ],
+  ]) {
+    let calls = 0;
+    const send = async () => {
+      const index = calls++;
+      return Response.json(index === 2 ? permission : { value: "synthetic-token" }, {
+        status: statuses[index],
+      });
+    };
+    assert.deepEqual(await verifyOpenVsxIdentity(env, send), { ok: false, error: expected });
+    assert.equal(calls, statuses[1] === 200 ? 2 : 3);
+  }
+});
+
+test("extension permission read rejects a token scoped to another extension", async () => {
+  for (const scope of ["fallow-vscode", "other-extension"]) {
+    let calls = 0;
+    const send = async (url, options) => {
+      calls++;
+      if (calls === 1) return Response.json({ value: "synthetic-identity" });
+      if (calls === 2) {
+        assert.deepEqual(JSON.parse(options.body), {
+          namespace: "fallow-rs",
+          extension: "fallow-vscode",
+          token: "synthetic-identity",
+        });
+        return Response.json({ value: "synthetic-extension-token" }, { status: 201 });
+      }
+      const target = new URL(url);
+      assert.equal(target.pathname, "/api/-/size-limit");
+      assert.equal(target.searchParams.get("namespace"), "fallow-rs");
+      assert.equal(target.searchParams.get("extension"), "fallow-vscode");
+      assert.equal(options.headers.Authorization, "Bearer synthetic-extension-token");
+      return scope === target.searchParams.get("extension")
+        ? Response.json({ maxSize: 1024 })
+        : Response.json({ error: "private scope refusal" }, { status: 403 });
+    };
+    assert.deepEqual(
+      await verifyOpenVsxIdentity(env, send),
+      scope === "fallow-vscode"
+        ? { ok: true }
+        : { ok: false, error: "Open VSX extension permission check failed (HTTP 403)" },
+    );
+    assert.equal(calls, 3);
+  }
 });
 
 test("Open VSX check exercises HTTP exchange and permission reads on loopback", async (t) => {
@@ -104,13 +167,14 @@ test("Open VSX check exercises HTTP exchange and permission reads on loopback", 
         extension: "fallow-vscode",
         token: "synthetic-identity",
       });
+      response.statusCode = 201;
       response.end(JSON.stringify({ value: "synthetic-authority" }));
       return;
     }
-    assert.equal(request.url, "/api/fallow-rs/verify-pat");
+    assert.equal(request.url, "/api/-/size-limit?namespace=fallow-rs&extension=fallow-vscode");
     assert.equal(request.method, "GET");
     assert.equal(request.headers.authorization, "Bearer synthetic-authority");
-    response.end(JSON.stringify({ success: "Valid token" }));
+    response.end(JSON.stringify({ maxSize: 536870912 }));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(async () => {
@@ -148,7 +212,7 @@ globalThis.fetch = async (url, options) => {
     const claims={aud:endpoint.searchParams.get('audience'),exp:Math.floor(Date.now()/1000)+600};
     return Response.json({value:'e30.'+Buffer.from(JSON.stringify(claims)).toString('base64url')+'.synthetic'});
   }
-  if (endpoint.hostname === 'open-vsx.org') return Response.json(endpoint.pathname.endsWith('verify-pat')?{success:'Valid token'}:{value:'synthetic-authority'});
+  if (endpoint.hostname === 'open-vsx.org') return Response.json(endpoint.pathname === '/api/-/size-limit'?{maxSize:536870912}:{value:'synthetic-authority'},{status:options.method==='POST'?201:200});
   if (endpoint.hostname === 'registry.npmjs.org' && options.method === 'POST' && endpoint.pathname.startsWith('/-/npm/v1/oidc/token/exchange/package/')) return Response.json({token_type:'oidc',token:'synthetic-npm-authority',created:new Date().toISOString(),expires:new Date(Date.now()+3600000).toISOString()},{status:201});
   if (endpoint.href === 'https://crates.io/api/v1/trusted_publishing/tokens' && options.method === 'POST') return Response.json({token:'cio_tp_'+'a'.repeat(32)});
   throw new Error('Unexpected provider route');
