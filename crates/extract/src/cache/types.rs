@@ -10,7 +10,7 @@ use crate::MemberKind;
 /// extraction semantics change, and give the reason in the commit message and
 /// the CHANGELOG. A stale version serves old extraction results from a warm
 /// cache. The `assert_cached_type_size!` guards below catch shape changes.
-pub(super) const CACHE_VERSION: u32 = 362;
+pub(super) const CACHE_VERSION: u32 = 363;
 
 /// Duplication token cache version. Bump it when duplicate tokenization,
 /// normalization, or the on-disk token cache schema changes, and give the
@@ -66,7 +66,7 @@ assert_cached_type_size!(CachedDynamicImport, 88);
 assert_cached_type_size!(CachedRequireCall, 96);
 assert_cached_type_size!(CachedReExport, 104);
 assert_cached_type_size!(CachedMember, 88);
-assert_cached_type_size!(CachedDynamicImportPattern, 64);
+assert_cached_type_size!(CachedDynamicImportPattern, 88);
 assert_cached_type_size!(crate::MemberAccess, 48);
 assert_cached_type_size!(fallow_types::extract::SemanticFact, 96);
 assert_cached_type_size!(fallow_types::extract::CalleeUse, 32);
@@ -606,6 +606,8 @@ pub struct CachedDynamicImportPattern {
     pub(crate) prefix: String,
     /// Static suffix, if any.
     pub(crate) suffix: Option<String>,
+    /// Globs of the files that the pattern does not load.
+    pub(crate) excludes: Vec<String>,
     /// Byte offset of the span start.
     pub(crate) span_start: u32,
     /// Byte offset of the span end.
