@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   REQUIRED_WORKFLOWS,
@@ -353,4 +356,19 @@ test("release CI gate exception rejects unsafe diagnostic and normal jobs", () =
     ),
   );
   assertReleaseJobsGated(jobs);
+});
+
+test("node scripts/verify-release-ci.mjs runs main and rejects a run without a token", () => {
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const env = { ...process.env };
+  delete env.GITHUB_TOKEN;
+  delete env.GH_TOKEN;
+  // The token check comes first, so this run cannot reach the GitHub API.
+  const result = spawnSync(
+    process.execPath,
+    ["scripts/verify-release-ci.mjs", "--sha", SHA, "--timeout-minutes", "150"],
+    { cwd: repoRoot, encoding: "utf8", env },
+  );
+  assert.equal(result.status, 1, result.stderr);
+  assert.equal(result.stdout, "::error::set GITHUB_TOKEN or GH_TOKEN\n");
 });
