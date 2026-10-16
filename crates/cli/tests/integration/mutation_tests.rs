@@ -1162,4 +1162,170 @@ export default {
             human.stderr
         );
     }
+
+    /// The test file of an order-dependent suite: `adds after prepares`
+    /// passes only after `prepares` ran in the same file.
+    const ORDER_DEPENDENT_TEST: &str = "import { expect, test } from \"vitest\";\nimport { add } from \"../src/math\";\n\nlet prepared = false;\n\ntest(\"prepares\", () => {\n  prepared = true;\n});\n\ntest(\"adds after prepares\", () => {\n  expect(prepared).toBe(true);\n  expect(add(2, 3)).toBe(5);\n});\n";
+
+    /// The dry run runs the whole file, so `adds after prepares` passes
+    /// there. A mutant run selects only the covering test of an `add`
+    /// mutant, so that test fails with no active mutant. The self-check
+    /// finds this before the first mutant job. The test becomes a baseline
+    /// failure and covers no mutant, and the run continues, so no `add`
+    /// mutant gets a false kill.
+    #[test]
+    fn a_test_that_fails_in_the_self_check_is_a_baseline_failure_and_the_run_continues() {
+        let Some(package) = companion_package() else {
+            return;
+        };
+        let (_project, root) = vitest_project(&package, "");
+        fs::write(root.join("test/math.test.ts"), ORDER_DEPENDENT_TEST).expect("test file");
+        commit_all(&root, "an order-dependent test");
+
+        let (output, report) = json_mutation(&root, &["src/math.ts", "--concurrency", "1"]);
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        let failures = report["baseline_failures"].as_array().expect("failures");
+        assert_eq!(failures.len(), 1, "{report}");
+        assert_eq!(
+            failures[0]["test_id"], "test/math.test.ts::adds after prepares",
+            "{report}"
+        );
+        assert!(
+            failures[0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("depend on another test of its file")),
+            "{report}"
+        );
+        let mutants = report["mutants"].as_array().expect("mutants");
+        let add: Vec<&serde_json::Value> = mutants
+            .iter()
+            .filter(|mutant| mutant["function"] == "add")
+            .collect();
+        assert!(!add.is_empty(), "{report}");
+        assert!(
+            add.iter().all(|mutant| mutant["status"] == "no_coverage"),
+            "{report}"
+        );
+        assert!(
+            mutants.iter().any(|mutant| mutant["status"] == "survived"),
+            "the static mutant runs with `prepares`: {report}"
+        );
+        assert_eq!(report["completion"]["status"], "partial", "{report}");
+    }
+
+    /// The same suite with only `add` in the module: the baseline failure
+    /// leaves each mutant without a test result, so the run measured nothing
+    /// and exits 2 with the baseline error.
+    #[test]
+    fn a_self_check_failure_that_leaves_no_test_result_exits_2_with_the_baseline_error() {
+        let Some(package) = companion_package() else {
+            return;
+        };
+        let (_project, root) = vitest_project(&package, "");
+        fs::write(
+            root.join("src/math.ts"),
+            "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+        )
+        .expect("math.ts");
+        fs::write(root.join("test/math.test.ts"), ORDER_DEPENDENT_TEST).expect("test file");
+        commit_all(&root, "an order-dependent test");
+
+        let (output, envelope) = json_mutation(&root, &["src/math.ts", "--concurrency", "1"]);
+        assert_eq!(output.code, 2, "{}", output.stderr);
+        assert_eq!(
+            envelope["code"], "FALLOW_MUTATION_BASELINE_FAILED",
+            "{envelope}"
+        );
+        let message = envelope["message"].as_str().unwrap_or_default();
+        assert!(message.contains("adds after prepares"), "{envelope}");
+        assert!(
+            message.contains("fails in a mutant run with no active mutant"),
+            "{envelope}"
+        );
+    }
+
+    /// A mutant of the guard throws when `src/math.ts` loads. The mutant run
+    /// executes no test and reports the load error. The same tests pass with
+    /// no active mutant, so the mutant stays `killed`, with no killer test.
+    #[test]
+    fn a_mutant_that_throws_at_module_load_stays_killed() {
+        let Some(package) = companion_package() else {
+            return;
+        };
+        let guard = "\nif (LIMIT !== 10) {\n  throw new Error(\"bad limit\");\n}\n";
+        let (_project, root) = vitest_project(&package, guard);
+
+        let (output, report) = json_mutation(&root, &["src/math.ts", "--concurrency", "1"]);
+        assert_eq!(output.code, 0, "{}", output.stderr);
+        let guard_line = fs::read_to_string(root.join("src/math.ts"))
+            .expect("math.ts")
+            .lines()
+            .position(|line| line.starts_with("if (LIMIT"))
+            .expect("the guard line")
+            + 1;
+        let guard_mutants: Vec<&serde_json::Value> = report["mutants"]
+            .as_array()
+            .expect("mutants")
+            .iter()
+            .filter(|mutant| mutant["line"] == guard_line)
+            .collect();
+        assert!(!guard_mutants.is_empty(), "{report}");
+        assert!(
+            guard_mutants
+                .iter()
+                .any(|mutant| mutant["status"] == "killed" && mutant["killed_by"].is_null()),
+            "{report}"
+        );
+        assert!(
+            report["mutants"]
+                .as_array()
+                .expect("mutants")
+                .iter()
+                .all(|mutant| mutant["status"] != "runtime_error"),
+            "{report}"
+        );
+    }
+
+    /// Parameterized tests: `it.each` with distinct and with equal names,
+    /// and `describe.each` with distinct and with equal suite names. Each
+    /// case is its own test id. The self-check selects these ids through the
+    /// mutant run path and must count each case once, so the run continues.
+    #[test]
+    fn parameterized_tests_pass_the_self_check_and_kill_mutants() {
+        let Some(package) = companion_package() else {
+            return;
+        };
+        let (_project, root) = vitest_project(&package, "");
+        fs::write(
+            root.join("test/math.test.ts"),
+            "import { describe, expect, it, test } from \"vitest\";\nimport { add, isPositive } from \"../src/math\";\n\nit.each([\n  [1, 1, 2],\n  [2, 3, 5],\n])(\"adds %i and %i\", (a, b, sum) => {\n  expect(add(a, b)).toBe(sum);\n});\n\nit.each([\n  [1, 2],\n  [2, 3],\n])(\"adds one\", (a, b) => {\n  expect(add(a, 1)).toBe(b);\n});\n\ndescribe.each([1, 2])(\"sign of %i\", (n) => {\n  test(\"is positive\", () => {\n    expect(isPositive(n)).toBe(true);\n  });\n});\n\ndescribe.each([3, 4])(\"sign\", (n) => {\n  test(\"is positive\", () => {\n    expect(isPositive(n)).toBe(true);\n  });\n});\n",
+        )
+        .expect("test file");
+        commit_all(&root, "parameterized tests");
+
+        let (output, report) = json_mutation(&root, &["src/math.ts", "--concurrency", "1"]);
+        assert_eq!(output.code, 0, "{}\n{report}", output.stderr);
+        assert_eq!(
+            report["baseline_failures"].as_array().map(Vec::len),
+            Some(0),
+            "{report}"
+        );
+        let mutants = report["mutants"].as_array().expect("mutants");
+        for function in ["add", "isPositive"] {
+            assert!(
+                mutants.iter().any(|mutant| mutant["function"] == function
+                    && mutant["status"] == "killed"
+                    && mutant["covering_tests"]
+                        .as_array()
+                        .is_some_and(|tests| tests.len() >= 2)),
+                "a {function} mutant is killed by its parameterized tests: {report}"
+            );
+        }
+        assert!(
+            mutants
+                .iter()
+                .all(|mutant| mutant["status"] != "runtime_error"),
+            "{report}"
+        );
+    }
 }

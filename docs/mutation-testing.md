@@ -180,7 +180,7 @@ or relational mutant, so it adds little test-strength signal for its run time.
 |---|---|
 | `0` | The plan, the run or inspect finished. Survivors do not fail a run. |
 | `1` | `--min-score` or `mutation.minScore` is set, and the score is lower. |
-| `2` | Invalid input or an execution error: a dirty worktree without `--allow-dirty`, a cache directory that hides project files, a missing runtime or runner, a companion file with a wrong digest, an invalid verdict document, `--typecheck` without a type-aware companion, a run in which baseline failures leave each mutant without a test result. |
+| `2` | Invalid input or an execution error: a dirty worktree without `--allow-dirty`, a cache directory that hides project files, a missing runtime or runner, a companion file with a wrong digest, an invalid verdict document, `--typecheck` without a type-aware companion, a run in which baseline failures leave each mutant without a test result, a run path that fails the self-check (see Run-path self-check). |
 
 The flag wins over the config key. The minimum applies to the score, in
 percent. A run in which no mutant has a test result has no score. It exits
@@ -378,6 +378,10 @@ slow or busy host can need more, because the dry run executes each test file.
 mutant. Their results decide no mutant status.
 
 - A test that fails in the first dry run never covers a mutant.
+- A test that fails in a control run (see Run-path self-check) is also a
+  baseline failure. Its message says that the test fails in a mutant run
+  with no active mutant but passed in the dry run of its whole file. A test
+  that depends on another test of its file gives this result.
 - Each restarted companion runs its own dry run. A covering test that does
   not pass there is a baseline failure of that companion, with the ids of the
   affected mutants in `mutant_ids`. The mutant runs with its other covering
@@ -392,6 +396,88 @@ mutant. Their results decide no mutant status.
 - A baseline failure makes the completion `partial` (`baseline-failure`).
 - A run in which baseline failures leave each mutant without a test
   result exits `2` (see Exit codes).
+
+## Run-path self-check
+
+The dry run selects whole test files. A mutant run selects the covering
+tests by id, so it uses another path of the runner API. When a runner
+release changes that path, each mutant run can fail with an error before a
+test starts. An error outside a test kills a mutant, so each mutant looks
+killed and the score is a false 100%. Vitest 4.0 had this fault.
+
+A control run is a `run` request with `mutant_id: null`. The companion runs
+the requested tests through the run path of a mutant run, with no active
+mutant. A control run does not stop at the first failure, so it names each
+covering test that fails. Its timeout is the timeout of the mutant job, and
+at least `--setup-timeout`. The scheduler uses control runs in two places:
+
+1. The self-check. After the dry run and before the first mutant job, the
+   first companion runs the tests of the first job as a control run.
+   - The control run passes when each requested test runs and passes, with
+     no error.
+   - When no test ran, the run path is broken. The run stops with exit
+     code 2 and `FALLOW_MUTATION_RUNNER_FAILED`, and no mutant gets a
+     status. The message says that the runner executes no tests in a mutant
+     run. It names the runner and its version, and the help asks you to
+     report it.
+   - When tests ran and some of them failed, the run continues. Each failed
+     test is a baseline failure, the same as a test that fails in the dry
+     run: it covers no mutant. A mutant with no covering test left is
+     `no_coverage`. When this leaves each mutant without a test result,
+     the run exits `2` with `FALLOW_MUTATION_BASELINE_FAILED` (see Exit
+     codes).
+   - When tests ran and none failed, but the result is still not a pass
+     (an error, or a requested test that did not run), the run stops with
+     `FALLOW_MUTATION_RUNNER_FAILED`. The message says that the runner gives
+     no trustworthy result in a mutant run.
+   - When the control run times out, the run stops with
+     `FALLOW_MUTATION_RUNNER_FAILED`. The message says that the self-check
+     timed out, and the help names `--setup-timeout` and a less loaded host.
+     A timeout is not reported as a broken run path.
+   - Each case of a parameterized test (`it.each`, `describe.each`,
+     `test.each`) and each `node:test` subtest is its own test id, so the
+     self-check counts it once.
+   - The check needs no run when no job exists: no mutant is covered, or
+     each covered mutant has a result from the cache. The check also needs
+     no run when the time budget ended before it.
+   - The check costs one run of the tests of one mutant. Its time is part of
+     `timings.mutants_ms`.
+   - The check runs only the tests of the first job. A test outside that set
+     that depends on another test of its file can still kill a mutant. The
+     check does not examine that kill again. A later control run can list
+     such a test as a baseline failure after it killed a mutant earlier in
+     the run.
+   - With `--max-mutants`, a planned mutant whose covering tests the check
+     drops becomes `no_coverage`. The jobs are built again after the check,
+     so the next covered `pending` mutant takes the free place, the same as
+     for a dry-run baseline failure. A mutant that becomes `no_coverage`
+     during the mutant runs (see item 2) leaves its place free: the jobs
+     already exist.
+2. A kill with no executed test. A mutant run that executes no test and
+   reports an error is `killed` only when the same tests pass in a control
+   run.
+   - A mutant that throws when its module loads gives this result. Its
+     tests pass with no active mutant, so it stays `killed`, with no killer
+     test.
+   - When the control run does not pass, the mutant is `runtime_error`, and
+     its `errors[]` entry gives the reason. The mutant gets no retry.
+   - A test that ran and failed in such a control run is a baseline
+     failure for the rest of the run. Each later mutant run leaves it out,
+     and `mutant_ids` of the failure lists those mutants. A later mutant
+     whose covering tests are all such failures is `no_coverage`, with no
+     retry, the same as after a drop by the self-check.
+   - The scheduler stores the control result of each test set for the run.
+     Each distinct test set gets at most one control run, and the test set
+     of the self-check gets none. A fault of the companion is not stored.
+   - A control run that times out is stored for its test set. The mutant
+     is `runtime_error` with no retry, and each later mutant of this kind
+     with the same tests gets the same reason at once. A test set that
+     hangs therefore costs one control run.
+   - After the `--time-budget` deadline, a control run that has no stored
+     result does not start, and the mutant is `pending`.
+
+A control result is never a mutant result, so the result cache never stores
+it.
 
 ## Runners
 
@@ -608,6 +694,7 @@ the key. A change to them does not invalidate a stored result. Each cache entry 
 report repeats it in `cache.not_keyed`.
 
 - A `timeout`, `flaky`, `runtime_error` or `pending` result is never stored.
+  A control run (see Run-path self-check) is never stored.
   A timeout depends on the load of the machine. A survivor that the time
   budget left without a retry is not stored. A survivor of a run without a
   dropped covering test (see Baseline failures) is not stored, because the
