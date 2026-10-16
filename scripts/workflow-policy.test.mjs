@@ -2440,6 +2440,7 @@ test("release auth check cannot start any release build or publication job", () 
     for (const name of names) {
       if (name === "publisher-auth-check") continue;
       const job = indentedBlock(workflow, name, 2);
+      assert.match(job, /^    if: \$\{\{ !inputs.auth_check \}\}$/mu, name);
       assert.doesNotMatch(job, /always\(\)|!cancelled\(\)/u);
       const needs =
         job
