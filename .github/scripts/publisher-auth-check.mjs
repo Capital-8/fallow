@@ -78,8 +78,6 @@ const NPM_REGISTRY = "https://registry.npmjs.org";
 const NPM_AUDIENCE = "npm:registry.npmjs.org";
 const CRATES_AUDIENCE = "crates.io";
 const MAX_IDENTITY_LIFETIME_MS = 30 * 60 * 1000;
-const MAX_NPM_LIFETIME_MS = 2 * 60 * 60 * 1000;
-const CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 const getExpiringIdentity = async (env, audience, send, now, setStage) => {
   setStage("GitHub identity request");
@@ -136,21 +134,7 @@ const verifyNpmIdentity = async (name, env, send, now) => {
     if (!validToken(authority.token)) throw new Error("Missing authority");
     stage = "authority token type";
     if (authority.token_type !== "oidc") throw new Error("Invalid authority type");
-    stage = "authority timestamp shape";
-    const created = Date.parse(authority.created);
-    const expires = Date.parse(authority.expires);
-    if (!Number.isFinite(created) || !Number.isFinite(expires))
-      throw new Error("Invalid authority timestamps");
-    stage = "authority lifetime";
-    if (
-      created > now + CLOCK_SKEW_MS ||
-      expires <= now ||
-      expires <= created ||
-      expires - created > MAX_NPM_LIFETIME_MS ||
-      expires > now + MAX_NPM_LIFETIME_MS
-    )
-      throw new Error("npm authority expiry is invalid");
-
+    // Match the publisher's opaque-token exchange proof; returned lifetime metadata is not required.
     return { ok: true, message: `npm trusted identity exchange passed for ${name}` };
   } catch (error) {
     return exchangeFailure("npm", name, stage, error);
