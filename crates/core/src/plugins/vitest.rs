@@ -11,7 +11,7 @@ use oxc_ast::ast::{Expression, ObjectExpression};
 
 use super::config_parser;
 use super::test_alias;
-use super::{Plugin, PluginResult};
+use super::{PathRule, Plugin, PluginResult};
 
 pub struct VitestPlugin;
 
@@ -196,7 +196,7 @@ fn apply_vitest_includes(result: &mut PluginResult, source: &str, config_path: &
     if !root_includes.is_empty() {
         result.replace_entry_patterns = true;
     }
-    result.extend_entry_patterns(root_includes);
+    push_vitest_include_entries(result, &root_includes);
 
     let project_includes = config_parser::extract_config_array_nested_string_or_array(
         source,
@@ -204,7 +204,18 @@ fn apply_vitest_includes(result: &mut PluginResult, source: &str, config_path: &
         &["test", "projects"],
         &["test", "include"],
     );
-    result.extend_entry_patterns(project_includes);
+    push_vitest_include_entries(result, &project_includes);
+}
+
+/// Register each Vitest `test.include` glob as an entry pattern. The extglob
+/// groups of the glob go through the shared rewrite, so a group such as
+/// `@(test|spec)` matches the files that Vitest runs.
+fn push_vitest_include_entries(result: &mut PluginResult, includes: &[String]) {
+    result.entry_patterns.extend(
+        includes
+            .iter()
+            .map(|include| PathRule::from_extglob(&vitest_extglob(include))),
+    );
 }
 
 /// The Vitest default `test.include`, `**/*.{test,spec}.?(c|m)[jt]s?(x)`, as
@@ -493,8 +504,36 @@ impl ProjectScope {
     }
 
     /// The include and exclude globs, relative to `config_dir`, of the files
-    /// that this project transforms. `None` when the project directory is
-    /// outside `config_dir`, because no rule glob can reach those files.
+    /// that this project transforms, in one or more groups. `None` when the
+    /// project directory is outside `config_dir`, because no rule glob can
+    /// reach those files.
+    ///
+    /// The excludes of a negated extglob group apply only to the include
+    /// glob of that group, so such an include gets a group of its own.
+    fn glob_groups(&self, config_dir: &Path) -> Option<Vec<(Vec<String>, Vec<String>)>> {
+        let (includes, exclude) = self.globs(config_dir)?;
+        let mut plain = Vec::new();
+        let mut groups = Vec::new();
+        for include in includes {
+            let rewritten = fallow_config::extglob::rewrite_include(&include);
+            if rewritten.excludes.is_empty() {
+                plain.push(rewritten.include);
+            } else {
+                let mut own_exclude = exclude.clone();
+                own_exclude.extend(rewritten.excludes);
+                groups.push((vec![rewritten.include], own_exclude));
+            }
+        }
+        if !plain.is_empty() {
+            groups.insert(0, (plain, exclude));
+        }
+        Some(groups)
+    }
+
+    /// The include globs, with their extglob groups, and the rewritten
+    /// exclude globs, relative to `config_dir`. An exclude glob never matches
+    /// more files than Vitest excludes, so an exclude with a negated group
+    /// is dropped.
     fn globs(&self, config_dir: &Path) -> Option<(Vec<String>, Vec<String>)> {
         let mut base = lexical_join(config_dir, self.root.as_deref().unwrap_or("."));
         if let Some(dir) = &self.dir {
@@ -533,7 +572,9 @@ impl ProjectScope {
             .into_iter()
             .chain(negated.iter().map(|pattern| &pattern[1..]))
         {
-            let Some(glob) = scoped(pattern) else {
+            let Some(glob) =
+                scoped(pattern).and_then(|glob| fallow_config::extglob::rewrite_exclude(&glob))
+            else {
                 continue;
             };
             // An exclude pattern that names a directory also excludes the
@@ -548,17 +589,18 @@ impl ProjectScope {
     }
 }
 
-/// A Vitest include or exclude pattern as a glob relative to `config_dir`.
+/// A Vitest include or exclude pattern as a glob relative to `config_dir`, with
+/// its extglob groups.
 /// `prefix` is the project directory relative to `config_dir`. An absolute
 /// pattern outside `config_dir` matches no project file, so it gives `None`.
 fn scoped_glob(prefix: &str, pattern: &str, config_dir: &Path) -> Option<String> {
     if pattern.starts_with('/') {
         let relative = Path::new(pattern).strip_prefix(config_dir).ok()?;
-        return Some(vitest_include_glob(&config_parser::path_to_config_string(
+        return Some(vitest_extglob(&config_parser::path_to_config_string(
             relative,
         )));
     }
-    let glob = vitest_include_glob(pattern);
+    let glob = vitest_extglob(pattern);
     if prefix.is_empty() {
         return Some(glob);
     }
@@ -710,27 +752,32 @@ fn add_vitest_jsx_import_sources(
         }
     }
     for scope in scopes {
-        let Some((include, exclude)) = scope.globs(config_dir) else {
+        let Some(groups) = scope.glob_groups(config_dir) else {
             continue;
         };
-        let rule = |source: String| JsxImportSourceRule {
-            source,
-            config_dir: config_dir.to_path_buf(),
-            include: include.clone(),
-            exclude: exclude.clone(),
+        let rules = |source: &str| -> Vec<JsxImportSourceRule> {
+            groups
+                .iter()
+                .map(|(include, exclude)| JsxImportSourceRule {
+                    source: source.to_string(),
+                    config_dir: config_dir.to_path_buf(),
+                    include: include.clone(),
+                    exclude: exclude.clone(),
+                })
+                .collect()
         };
         match scope.jsx.runtime() {
             JsxRuntime::None => {}
             JsxRuntime::Default => result
                 .jsx_package_credits
-                .push(rule(DEFAULT_JSX_IMPORT_SOURCE.to_string())),
+                .extend(rules(DEFAULT_JSX_IMPORT_SOURCE)),
             // A package runtime has no project file to reach, so it only
             // credits the package. A graph edge from test files alone would
             // also make a runtime dependency of the app look test-only.
             JsxRuntime::Source(source) if !is_path_source(&source) => result
                 .referenced_dependencies
                 .push(crate::resolve::extract_package_name(&source)),
-            JsxRuntime::Source(source) => result.jsx_import_sources.push(rule(source)),
+            JsxRuntime::Source(source) => result.jsx_import_sources.extend(rules(&source)),
         }
     }
 }
@@ -836,53 +883,26 @@ fn is_path_source(source: &str) -> bool {
     source.starts_with('.') || source.starts_with('/')
 }
 
-/// Rewrite the extglob groups of a Vitest include pattern as brace groups,
-/// which the glob matcher supports.
+/// A Vitest include or exclude pattern in the extglob syntax that
+/// [`fallow_config::extglob`] rewrites.
 ///
-/// Vitest matches `include` with picomatch. `@(a|b)`, `+(a|b)` and a plain
-/// `(a|b)` group become `{a,b}`, so `(*.)+(spec|test)` becomes
-/// `*.{spec,test}`. A `+(..)` group matches its body once only, which is the
-/// common case. Other forms (`!(..)`, `?(..)`, `*(..)`) and groups with
-/// nested syntax stay as written, so they match nothing and add no edge.
-fn vitest_include_glob(pattern: &str) -> String {
+/// Vitest matches globs with picomatch, which also reads a plain `(a|b)`
+/// group as one of its alternatives. This function marks each plain group
+/// as the equivalent `@(a|b)` group, so `(*.)+(spec|test)` becomes
+/// `@(*.)+(spec|test)`. It also removes a leading `./`.
+fn vitest_extglob(pattern: &str) -> String {
     let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
-    let mut out = String::with_capacity(pattern.len());
-    let mut rest = pattern;
-    while let Some(open) = rest.find('(') {
-        let (before, after_open) = (&rest[..open], &rest[open + 1..]);
-        let Some(close) = after_open.find(')') else {
-            break;
-        };
-        let body = &after_open[..close];
-        let operator = before.chars().next_back();
-        if matches!(operator, Some('!' | '*'))
-            || body.is_empty()
-            || body.contains(['(', '{', '}', ','])
-        {
-            return format!("{out}{rest}");
+    let mut out = String::with_capacity(pattern.len() + 2);
+    let mut previous = None;
+    let mut escaped = false;
+    for character in pattern.chars() {
+        if character == '(' && !escaped && !matches!(previous, Some('@' | '?' | '+' | '*' | '!')) {
+            out.push('@');
         }
-        let has_operator = matches!(operator, Some('@' | '+' | '?'));
-        out.push_str(if has_operator {
-            &before[..before.len() - 1]
-        } else {
-            before
-        });
-        let alternatives = body.replace('|', ",");
-        if operator == Some('?') {
-            // `?(a|b)` matches zero or one of the alternatives.
-            out.push_str("{,");
-            out.push_str(&alternatives);
-            out.push('}');
-        } else if body.contains('|') {
-            out.push('{');
-            out.push_str(&alternatives);
-            out.push('}');
-        } else {
-            out.push_str(body);
-        }
-        rest = &after_open[close + 1..];
+        escaped = character == '\\' && !escaped;
+        previous = Some(character);
+        out.push(character);
     }
-    out.push_str(rest);
     out
 }
 
@@ -1019,6 +1039,30 @@ mod tests {
     }
 
     #[test]
+    fn include_entry_patterns_accept_every_extglob_form() {
+        let result = resolve(
+            "export default defineConfig({ test: {
+                include: [
+                    'at/**/*.@(test|spec).ts',
+                    './neg/**/!(*.skip).spec.ts',
+                    'plain/*.(unit|e2e).ts',
+                ],
+                projects: [{ test: { include: ['proj/*.?(c)test.js'] } }],
+            } });",
+        );
+        let matches = |path: &str| super::super::entry_rules_match(&result, path);
+        assert!(matches("at/a/x.test.ts"));
+        assert!(matches("at/b.spec.ts"));
+        assert!(!matches("at/b.ts"));
+        assert!(matches("neg/a/b.spec.ts"));
+        assert!(!matches("neg/a/b.skip.spec.ts"));
+        assert!(matches("plain/a.unit.ts"));
+        assert!(!matches("plain/a.int.ts"));
+        assert!(matches("proj/a.test.js"));
+        assert!(matches("proj/a.ctest.js"));
+    }
+
+    #[test]
     fn package_jsx_import_source_credits_the_package_without_a_rule() {
         let result = VitestPlugin.resolve_config(
             std::path::Path::new("/project/vitest.config.ts"),
@@ -1030,14 +1074,6 @@ mod tests {
             result
                 .referenced_dependencies
                 .contains(&"@emotion/react".to_string())
-        );
-    }
-
-    #[test]
-    fn optional_extglob_groups_become_optional_brace_groups() {
-        assert_eq!(
-            vitest_include_glob("**/*.{test,spec}.?(c|m)[jt]s?(x)"),
-            "**/*.{test,spec}.{,c,m}[jt]s{,x}"
         );
     }
 
@@ -1121,7 +1157,9 @@ mod tests {
                     "./src/jsx".to_string(),
                     vec![
                         "src/**/*.spec.ts".to_string(),
-                        "src/**/*.{spec,test}.{ts,tsx,js}".to_string()
+                        // `globset` cannot repeat a group, so a `+(..)` group
+                        // becomes its alternatives and then `*`.
+                        "src/**/*.{spec,test}*.{ts,tsx,js}*".to_string()
                     ]
                 ),
                 (
@@ -1671,22 +1709,59 @@ mod tests {
     }
 
     #[test]
-    fn include_extglob_groups_become_brace_groups() {
+    fn plain_groups_become_exactly_one_groups() {
         assert_eq!(
-            vitest_include_glob("./src/**/(*.)+(spec|test).+(ts|tsx|js)"),
-            "src/**/*.{spec,test}.{ts,tsx,js}"
+            vitest_extglob("./src/**/(*.)+(spec|test).+(ts|tsx|js)"),
+            "src/**/@(*.)+(spec|test).+(ts|tsx|js)"
         );
-        assert_eq!(
-            vitest_include_glob("src/**/*.@(test|spec).tsx"),
-            "src/**/*.{test,spec}.tsx"
+        assert_eq!(vitest_extglob("src/(a|(b))/*.ts"), "src/@(a|@(b))/*.ts");
+        assert_eq!(vitest_extglob(r"src/\(a\)/*.ts"), r"src/\(a\)/*.ts");
+        assert_eq!(vitest_extglob("src/!(skip)/*.ts"), "src/!(skip)/*.ts");
+    }
+
+    #[test]
+    fn include_and_exclude_accept_every_extglob_form() {
+        let result = VitestPlugin.resolve_config(
+            Path::new("/project/vitest.config.ts"),
+            r"export default defineConfig({
+                oxc: { jsx: { runtime: 'automatic', importSource: './src/jsx' } },
+                test: {
+                    include: [
+                        'neg/**/!(*.skip).test.tsx',
+                        'opt/*.test.?(m)jsx',
+                        'plus/*.+(a|b).test.tsx',
+                        'star/x*(y).test.tsx',
+                        'at/*.@(unit|e2e).tsx',
+                        'plain/(*.)+(spec|check).tsx',
+                    ],
+                    exclude: ['at/*.@(e2e).tsx'],
+                },
+            });",
+            Path::new("/project"),
         );
-        assert_eq!(
-            vitest_include_glob("src/**/*.test.tsx"),
-            "src/**/*.test.tsx"
-        );
-        // Forms without a brace equivalent stay as written.
-        assert_eq!(vitest_include_glob("src/!(skip)/*.ts"), "src/!(skip)/*.ts");
-        assert_eq!(vitest_include_glob("src/(a|(b))/*.ts"), "src/(a|(b))/*.ts");
+        let rules = fallow_graph::resolve::compile_jsx_rules(&result.jsx_import_sources);
+        let matches = |path: &str| {
+            rules
+                .iter()
+                .any(|rule| rule.matches(&Path::new("/project").join(path)))
+        };
+
+        assert!(matches("neg/a.test.tsx"));
+        assert!(matches("neg/deep/a.test.tsx"));
+        assert!(!matches("neg/a.skip.test.tsx"));
+        // The negated group of one include does not exclude the files that
+        // another include matches.
+        assert!(matches("opt/a.skip.test.jsx"));
+        assert!(matches("opt/a.test.mjsx"));
+        assert!(matches("plus/c.a.test.tsx"));
+        assert!(matches("plus/c.ab.test.tsx"));
+        assert!(!matches("plus/c.test.tsx"));
+        assert!(matches("star/x.test.tsx"));
+        assert!(matches("star/xyy.test.tsx"));
+        assert!(matches("at/a.unit.tsx"));
+        assert!(!matches("at/a.e2e.tsx"));
+        assert!(matches("plain/a.spec.tsx"));
+        assert!(!matches("plain/a.other.tsx"));
     }
 
     /// Issue #2226: neither runner gives literal `X/__mocks__` imports special
