@@ -56,9 +56,6 @@ const ROOT_DIR_PLACEHOLDER: &str = "<rootDir>";
 /// The number of nested config levels that the plugin follows.
 const MAX_PROJECT_DEPTH: usize = 3;
 
-/// Limits for the expansion of a glob entry in `projects`.
-const MAX_PROJECT_GLOB_MATCHES: usize = 1_000;
-
 pub struct RstestPlugin;
 
 impl Plugin for RstestPlugin {
@@ -427,7 +424,8 @@ impl ResolveContext<'_> {
 }
 
 /// The files and directories that one `projects` path names. A plain path
-/// gives itself. A glob gives its matches, without `node_modules`. A path or a
+/// gives itself. A glob gives its matches, without `node_modules`. The glob
+/// walk does not enter `node_modules`, `.git`, or a gitignored path. A path or a
 /// glob base outside `root` gives nothing, so a pattern such as `../**` never
 /// walks the file system above the project.
 fn matching_paths(dir: &Path, pattern: &str, root: &Path) -> Vec<PathBuf> {
@@ -439,23 +437,15 @@ fn matching_paths(dir: &Path, pattern: &str, root: &Path) -> Vec<PathBuf> {
             Vec::new()
         };
     }
-    let Some(full) = glob_in(dir, pattern) else {
-        return Vec::new();
-    };
     if !config_parser::glob_base_is_inside_root(dir, pattern, root) {
         return Vec::new();
     }
-    let Ok(matches) = glob::glob(&full) else {
-        return Vec::new();
-    };
-    matches
-        .flatten()
-        .take(MAX_PROJECT_GLOB_MATCHES)
-        .filter(|path| config_parser::is_inside_root(path, root))
+    super::project_glob::expand(dir, pattern, root)
+        .paths
+        .into_iter()
         .filter(|path| {
-            !path
-                .components()
-                .any(|component| component.as_os_str() == "node_modules")
+            config_parser::is_inside_root(path, root)
+                && !super::project_glob::is_in_node_modules(path, root)
         })
         .collect()
 }
@@ -728,5 +718,14 @@ mod tests {
             .expect("create symlink");
         assert!(matching_paths(&root, "packages/*", &root).is_empty());
         assert!(matching_paths(&root, "packages/link", &root).is_empty());
+    }
+
+    #[test]
+    fn project_glob_with_a_node_modules_base_matches_nothing() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let root = tmp.path().join("app");
+        std::fs::create_dir_all(root.join("node_modules/pkg/a")).expect("create dir");
+        assert!(matching_paths(&root, "node_modules/pkg/*", &root).is_empty());
+        assert!(matching_paths(&root.join("node_modules/pkg"), "*", &root).is_empty());
     }
 }
