@@ -99,13 +99,13 @@ const getExpiringIdentity = async (env, audience, send, now, setStage) => {
   const claims = JSON.parse(
     Buffer.from(identity.value.split(".")[1], "base64url").toString("utf8"),
   );
+  setStage("identity audience");
+  if (claims.aud !== audience) throw new Error("Identity audience is invalid");
+  setStage("identity expiration shape");
+  if (!Number.isSafeInteger(claims.exp)) throw new Error("Identity expiration is invalid");
   const expiry = claims.exp * 1000;
-  if (
-    claims.aud !== audience ||
-    !Number.isSafeInteger(claims.exp) ||
-    expiry <= now ||
-    expiry > now + MAX_IDENTITY_LIFETIME_MS
-  ) {
+  setStage("identity lifetime");
+  if (expiry <= now || expiry > now + MAX_IDENTITY_LIFETIME_MS) {
     throw new Error("Identity audience or expiry is invalid");
   }
   return identity.value;
@@ -132,14 +132,17 @@ const verifyNpmIdentity = async (name, env, send, now) => {
       send,
       201,
     );
-    stage = "authority validation";
+    stage = "authority token shape";
+    if (!validToken(authority.token)) throw new Error("Missing authority");
+    stage = "authority token type";
+    if (authority.token_type !== "oidc") throw new Error("Invalid authority type");
+    stage = "authority timestamp shape";
     const created = Date.parse(authority.created);
     const expires = Date.parse(authority.expires);
+    if (!Number.isFinite(created) || !Number.isFinite(expires))
+      throw new Error("Invalid authority timestamps");
+    stage = "authority lifetime";
     if (
-      !validToken(authority.token) ||
-      authority.token_type !== "oidc" ||
-      !Number.isFinite(created) ||
-      !Number.isFinite(expires) ||
       created > now + CLOCK_SKEW_MS ||
       expires <= now ||
       expires <= created ||
@@ -174,7 +177,7 @@ const verifyCratesIdentity = async (env, send, now) => {
       },
       send,
     );
-    stage = "authority validation";
+    stage = "authority token shape";
     if (typeof authority.token !== "string" || !/^cio_tp_[A-Za-z0-9]{32}$/u.test(authority.token)) {
       throw new Error("crates authority is invalid");
     }

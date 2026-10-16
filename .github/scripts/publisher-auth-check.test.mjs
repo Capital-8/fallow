@@ -288,15 +288,15 @@ test("npm and crates exchanges validate authority expiration and retain independ
       assert.equal(call.headers.Authorization, `Bearer ${identity("npm:registry.npmjs.org")}`);
     }
   }
-  for (const invalid of [
-    { ...token, expires: new Date(now - 1).toISOString() },
-    { ...token, expires: "invalid" },
-    { ...token, created: "invalid" },
-    { ...token, created: new Date(now + 600_000).toISOString() },
-    { ...token, expires: new Date(now + 86_400_000).toISOString() },
-    { ...token, token_type: "persistent" },
-    { ...token, token: "" },
-    { ...token, token: "secret\r\n::error::private" },
+  for (const [invalid, stage] of [
+    [{ ...token, expires: new Date(now - 1).toISOString() }, "authority lifetime"],
+    [{ ...token, expires: "invalid" }, "authority timestamp shape"],
+    [{ ...token, created: "invalid" }, "authority timestamp shape"],
+    [{ ...token, created: new Date(now + 600_000).toISOString() }, "authority lifetime"],
+    [{ ...token, expires: new Date(now + 86_400_000).toISOString() }, "authority lifetime"],
+    [{ ...token, token_type: "persistent" }, "authority token type"],
+    [{ ...token, token: "" }, "authority token shape"],
+    [{ ...token, token: "secret\r\n::error::private" }, "authority token shape"],
   ]) {
     const refused = await run(invalid);
     assert.equal(refused.result.ok, false);
@@ -305,12 +305,17 @@ test("npm and crates exchanges validate authority expiration and retain independ
       NPM_PACKAGES.length,
     );
     assert.equal(refused.result.outcomes.at(-1).ok, true);
-    assert.doesNotMatch(JSON.stringify(refused.result), /synthetic/u);
+    assert.ok(refused.result.outcomes[0].error.includes(` ${stage} check failed`));
+    assert.doesNotMatch(JSON.stringify(refused.result), /synthetic|secret|private/u);
   }
-  for (const invalid of [
-    identity("wrong-audience"),
-    identity("npm:registry.npmjs.org", now - 1),
-    "not-a-jwt",
+  for (const [invalid, stage] of [
+    [identity("wrong-audience"), "identity audience"],
+    [identity("npm:registry.npmjs.org", now - 1), "identity lifetime"],
+    ["not-a-jwt", "identity claims"],
+    [
+      `e30.${Buffer.from(JSON.stringify({ aud: "npm:registry.npmjs.org", exp: "private" })).toString("base64url")}.synthetic`,
+      "identity expiration shape",
+    ],
   ]) {
     const refused = await run(null, invalid);
     assert.equal(refused.result.ok, false);
@@ -320,6 +325,7 @@ test("npm and crates exchanges validate authority expiration and retain independ
       ),
     );
     assert.ok(refused.result.outcomes.every((outcome) => !outcome.ok));
+    assert.ok(refused.result.outcomes[0].error.includes(` ${stage} check failed`));
   }
   const cratesRefusal = await run(null, null, true);
   assert.equal(cratesRefusal.result.ok, false);
@@ -377,7 +383,7 @@ test("registry diagnostics identify fixed stages without reflecting provider con
     ["identity-http", "GitHub identity request"],
     ["claims", "identity claims"],
     ["exchange-http", "trusted exchange"],
-    ["authority", "authority validation"],
+    ["authority", "authority token shape"],
   ]) {
     const send = async (url) => {
       const endpoint = new URL(url);
@@ -393,7 +399,7 @@ test("registry diagnostics identify fixed stages without reflecting provider con
       }
       if (failure === "exchange-http") return new Response("private provider", { status: 401 });
       return Response.json(
-        { token: "private provider" },
+        { token: "" },
         { status: endpoint.hostname === "registry.npmjs.org" ? 201 : 200 },
       );
     };
