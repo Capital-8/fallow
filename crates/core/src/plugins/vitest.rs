@@ -138,6 +138,16 @@ impl Plugin for VitestPlugin {
     }
 
     fn resolve_config(&self, config_path: &Path, source: &str, root: &Path) -> PluginResult {
+        self.resolve_config_in_project(config_path, source, root, root)
+    }
+
+    fn resolve_config_in_project(
+        &self,
+        config_path: &Path,
+        source: &str,
+        root: &Path,
+        project_root: &Path,
+    ) -> PluginResult {
         let mut result = PluginResult::default();
 
         let imports = config_parser::extract_imports(source, config_path);
@@ -158,8 +168,8 @@ impl Plugin for VitestPlugin {
                 inherit_by_default: !source.contains("projects")
                     || vitest_inherits_by_default(config_path, root),
             };
-            add_vitest_jsx_import_sources(&mut result, source, config_path, jsx);
-            add_vitest_project_config_files(&mut result, source, config_path, jsx);
+            add_vitest_jsx_import_sources(&mut result, source, config_path, project_root, jsx);
+            add_vitest_project_config_files(&mut result, source, config_path, project_root, jsx);
         }
 
         add_vitest_environment_dependency(&mut result, source, config_path);
@@ -675,10 +685,12 @@ fn project_base(
 /// as Vitest 5 does, unless `extends` is `false` or a path. On Vitest 4, a
 /// project merges it only with `extends: true`. A path names a config file
 /// that the project merges instead. A string entry names a project config
-/// file, which the plugin reads on its own.
+/// file, which the plugin reads on its own. An extended file outside
+/// `project_root` is not read, so the project keeps only its own values.
 fn collect_project_scopes(
     root: &ObjectExpression<'_>,
     config_path: &Path,
+    project_root: &Path,
     jsx: JsxContext,
 ) -> (Vec<ProjectScope>, Vec<PathBuf>) {
     let root_scope = ProjectScope::read(root);
@@ -700,6 +712,7 @@ fn collect_project_scopes(
         let scope = match project_base(project, config_path, jsx) {
             ProjectBase::DeclaringConfig => own.over(&root_scope),
             ProjectBase::None => own,
+            ProjectBase::File(path) if !config_parser::is_inside_root(&path, project_root) => own,
             ProjectBase::File(path) => match read_config_scope(&path) {
                 Some(base) => {
                     extended_files.push(path);
@@ -733,6 +746,7 @@ fn add_vitest_jsx_import_sources(
     result: &mut PluginResult,
     source: &str,
     config_path: &Path,
+    project_root: &Path,
     jsx: JsxContext,
 ) {
     let Some(config_dir) = config_path.parent() else {
@@ -741,7 +755,7 @@ fn add_vitest_jsx_import_sources(
     let Some((scopes, extended_files)) =
         config_parser::extract_from_source(source, config_path, |program| {
             config_parser::find_config_object(program)
-                .map(|config| collect_project_scopes(config, config_path, jsx))
+                .map(|config| collect_project_scopes(config, config_path, project_root, jsx))
         })
     else {
         return;
@@ -790,11 +804,13 @@ fn add_vitest_jsx_import_sources(
 /// standard name, such as `vitest.config.ts`. A file with another name, such
 /// as `vitest.e2e.config.ts`, is read here: the file is credited and its JSX
 /// rules apply. A glob entry is expanded on disk. A glob with a brace group
-/// is not followed, because the glob matcher has no brace support.
+/// is not followed, because the glob matcher has no brace support. A file
+/// outside the project root is not read.
 fn add_vitest_project_config_files(
     result: &mut PluginResult,
     source: &str,
     config_path: &Path,
+    project_root: &Path,
     jsx: JsxContext,
 ) {
     let Some(config_dir) = config_path.parent() else {
@@ -803,7 +819,7 @@ fn add_vitest_project_config_files(
     let entries =
         config_parser::extract_config_string_or_array(source, config_path, &["test", "projects"]);
     for entry in entries {
-        for path in project_config_paths(&entry, config_dir) {
+        for path in project_config_paths(&entry, config_dir, project_root) {
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
@@ -816,7 +832,7 @@ fn add_vitest_project_config_files(
             let Ok(project_source) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            add_vitest_jsx_import_sources(result, &project_source, &path, jsx);
+            add_vitest_jsx_import_sources(result, &project_source, &path, project_root, jsx);
             if !result.setup_files.contains(&path) {
                 result.setup_files.push(path);
             }
@@ -825,8 +841,10 @@ fn add_vitest_project_config_files(
 }
 
 /// The files that one `test.projects` string entry names. A plain path gives
-/// itself. A glob gives the files that match it, without `node_modules`.
-fn project_config_paths(entry: &str, config_dir: &Path) -> Vec<PathBuf> {
+/// itself. A glob gives the files that match it, without `node_modules`. A
+/// path outside `project_root` gives nothing, because the config comes from
+/// the analyzed repository.
+fn project_config_paths(entry: &str, config_dir: &Path, project_root: &Path) -> Vec<PathBuf> {
     // A glob that starts with `**` walks the whole tree, `node_modules`
     // included, on each run. Vitest configs name project directories, so
     // such an entry is not followed.
@@ -835,13 +853,24 @@ fn project_config_paths(entry: &str, config_dir: &Path) -> Vec<PathBuf> {
         return Vec::new();
     }
     if !entry.contains(['*', '?', '[']) {
-        return vec![lexical_join(config_dir, entry)];
+        let path = lexical_join(config_dir, entry);
+        return if config_parser::is_inside_root(&path, project_root) {
+            vec![path]
+        } else {
+            Vec::new()
+        };
+    }
+    if !config_parser::glob_base_is_inside_root(config_dir, relative, project_root) {
+        return Vec::new();
     }
     let Some(dir) = config_dir.to_str() else {
         return Vec::new();
     };
-    let relative = entry.strip_prefix("./").unwrap_or(entry);
-    let pattern = format!("{}/{relative}", glob::Pattern::escape(dir));
+    let pattern = format!(
+        "{}/{}",
+        glob::Pattern::escape(dir),
+        fallow_config::glob_validation::disk_glob_pattern(relative)
+    );
     let Ok(matches) = glob::glob(&pattern) else {
         return Vec::new();
     };
@@ -850,10 +879,12 @@ fn project_config_paths(entry: &str, config_dir: &Path) -> Vec<PathBuf> {
         .take(MAX_PROJECT_GLOB_MATCHES)
         .filter(|path| {
             path.is_file()
+                && config_parser::is_inside_root(path, project_root)
                 && !path
                     .components()
                     .any(|component| component.as_os_str() == "node_modules")
         })
+        .map(|path| config_parser::lexical_normalize(&path))
         .take(MAX_PROJECT_GLOB_CONFIGS)
         .collect()
 }
@@ -2409,5 +2440,139 @@ mod tests {
             "function-form defineConfig test.alias must be extracted: {:?}",
             result.path_aliases
         );
+    }
+
+    /// A `test.projects` entry that names a config outside the project root
+    /// is not read: plain paths, absolute paths, globs, and a `.*` segment
+    /// that the glob matcher also matches against `..`.
+    #[test]
+    fn project_entries_outside_the_root_are_not_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        std::fs::write(
+            outside.join("vitest.e2e.config.ts"),
+            "export default defineConfig({ oxc: { jsx: { importSource: './jsx' } } });",
+        )
+        .expect("write outside config");
+        let source = format!(
+            r"
+            export default defineConfig({{
+                test: {{
+                    projects: [
+                        '../outside/vitest.e2e.config.ts',
+                        '{}',
+                        '../outside/vitest.*.config.ts',
+                        '.*/outside/vitest.e2e.config.ts',
+                    ],
+                }},
+            }});
+        ",
+            outside
+                .join("vitest.e2e.config.ts")
+                .display()
+                .to_string()
+                .replace('\\', "/")
+        );
+        let result = VitestPlugin.resolve_config(&root.join("vitest.config.ts"), &source, &root);
+        assert!(
+            result.setup_files.is_empty(),
+            "a config outside the project root must not be read, got: {:?}",
+            result.setup_files
+        );
+        assert!(result.jsx_import_sources.is_empty());
+    }
+
+    /// A workspace package config can name a config in a sibling directory.
+    /// The sibling is outside the workspace root but inside the project root.
+    #[test]
+    fn project_entries_with_parent_segments_inside_the_project_root_are_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let web = root.join("apps/web");
+        std::fs::create_dir_all(&web).expect("create web");
+        std::fs::create_dir_all(root.join("apps/shared")).expect("create shared");
+        std::fs::write(
+            root.join("apps/shared/vitest.e2e.config.ts"),
+            "export default defineConfig({});",
+        )
+        .expect("write shared config");
+        let source = r"
+            export default defineConfig({
+                test: { projects: ['../shared/vitest.e2e.config.ts', '../shared/vitest.*.config.ts'] },
+            });
+        ";
+        let result = VitestPlugin.resolve_config_in_project(
+            &web.join("vitest.config.ts"),
+            source,
+            &web,
+            root,
+        );
+        assert_eq!(
+            result.setup_files,
+            vec![root.join("apps/shared/vitest.e2e.config.ts")]
+        );
+    }
+
+    /// An inline project that extends a config outside the project root does
+    /// not read that config.
+    #[test]
+    fn inline_project_extends_outside_the_root_is_not_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(temp.path().join("outside")).expect("create outside");
+        std::fs::write(
+            temp.path().join("outside/vite.config.ts"),
+            "export default defineConfig({ oxc: { jsx: { importSource: 'preact' } } });",
+        )
+        .expect("write outside config");
+        let source = r"
+            export default defineConfig({
+                test: { projects: [{ extends: '../outside/vite.config.ts', test: { name: 'a' } }] },
+            });
+        ";
+        let result = VitestPlugin.resolve_config(&root.join("vitest.config.ts"), source, &root);
+        assert!(
+            !result
+                .referenced_dependencies
+                .contains(&"preact".to_string()),
+            "a config outside the project root must not be read, got: {:?}",
+            result.referenced_dependencies
+        );
+        assert!(
+            result.setup_files.is_empty(),
+            "got: {:?}",
+            result.setup_files
+        );
+    }
+
+    /// An inline project that extends a config inside the project root still
+    /// reads it.
+    #[test]
+    fn inline_project_extends_inside_the_root_is_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        std::fs::write(
+            root.join("vite.base.config.ts"),
+            "export default defineConfig({ oxc: { jsx: { importSource: 'preact' } } });",
+        )
+        .expect("write base config");
+        let source = r"
+            export default defineConfig({
+                test: { projects: [{ extends: './vite.base.config.ts', test: { name: 'a' } }] },
+            });
+        ";
+        let result = VitestPlugin.resolve_config(&root.join("vitest.config.ts"), source, root);
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"preact".to_string()),
+            "got: {:?}",
+            result.referenced_dependencies
+        );
+        assert_eq!(result.setup_files, vec![root.join("vite.base.config.ts")]);
     }
 }

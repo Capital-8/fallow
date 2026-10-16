@@ -104,20 +104,44 @@ define_plugin!(
     package_json_config_key: "jest",
     script_config_binaries: &["jest"],
     resolve_config(config_path, source, root) {
-        let mut result = PluginResult::default();
-        let mut visited = FxHashSet::default();
-        extract_jest_config(config_path, source, root, &mut result, &mut visited, 0);
-        // Every config states which files it runs, so the configs of one
-        // project (unit, integration, e2e) add up instead of the last one
-        // replacing the defaults for all of them.
-        if result.entry_patterns.is_empty() {
-            result.extend_entry_patterns(DEFAULT_TEST_ENTRY_PATTERNS.iter().copied());
-        }
-        result.replace_entry_patterns = true;
-        result.accumulate_config_entry_patterns = true;
-        result
+        resolve_jest_config(config_path, source, root, root)
+    },
+    resolve_config_in_project(config_path, source, root, project_root) {
+        resolve_jest_config(config_path, source, root, project_root)
     },
 );
+
+/// Resolve a Jest config. Every config file that a `projects` entry names
+/// must be inside `project_root`.
+fn resolve_jest_config(
+    config_path: &Path,
+    source: &str,
+    root: &Path,
+    project_root: &Path,
+) -> PluginResult {
+    let mut result = PluginResult::default();
+    let mut walk = ProjectWalk {
+        project_root,
+        visited: FxHashSet::default(),
+    };
+    extract_jest_config(config_path, source, root, &mut result, &mut walk, 0);
+    // Every config states which files it runs, so the configs of one
+    // project (unit, integration, e2e) add up instead of the last one
+    // replacing the defaults for all of them.
+    if result.entry_patterns.is_empty() {
+        result.extend_entry_patterns(DEFAULT_TEST_ENTRY_PATTERNS.iter().copied());
+    }
+    result.replace_entry_patterns = true;
+    result.accumulate_config_entry_patterns = true;
+    result
+}
+
+/// The state of one walk over `projects` entries: the containment boundary
+/// and the configs already parsed.
+struct ProjectWalk<'a> {
+    project_root: &'a Path,
+    visited: FxHashSet<PathBuf>,
+}
 
 /// The package that Jest needs to load `config_path` when it is a TypeScript
 /// file: the package that the `@jest-config-loader` pragma names, else
@@ -154,11 +178,11 @@ fn extract_jest_config(
     source: &str,
     root: &Path,
     result: &mut PluginResult,
-    visited: &mut FxHashSet<PathBuf>,
+    walk: &mut ProjectWalk<'_>,
     depth: usize,
 ) {
     let key = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
-    if !visited.insert(key) {
+    if !walk.visited.insert(key) {
         return;
     }
 
@@ -198,18 +222,18 @@ fn extract_jest_config(
         config_path,
         root,
         result,
-        visited,
+        walk,
         depth,
     });
 }
 
-struct JestStringProjectsInput<'a> {
+struct JestStringProjectsInput<'a, 'b> {
     parse_source: &'a str,
     parse_path: &'a Path,
     config_path: &'a Path,
     root: &'a Path,
     result: &'a mut PluginResult,
-    visited: &'a mut FxHashSet<PathBuf>,
+    walk: &'a mut ProjectWalk<'b>,
     depth: usize,
 }
 
@@ -218,14 +242,14 @@ struct JestStringProjectsInput<'a> {
 ///
 /// Child `replace_entry_patterns` / `testMatch` flags are intentionally not
 /// merged: Jest scopes those per-project. See the leak-guard test.
-fn extract_jest_string_projects(input: JestStringProjectsInput<'_>) {
+fn extract_jest_string_projects(input: JestStringProjectsInput<'_, '_>) {
     let JestStringProjectsInput {
         parse_source,
         parse_path,
         config_path,
         root,
         result,
-        visited,
+        walk,
         depth,
     } = input;
     let project_entries =
@@ -235,7 +259,8 @@ fn extract_jest_string_projects(input: JestStringProjectsInput<'_>) {
     }
     let root_dir = jest_root_dir(parse_source, parse_path, root);
     for entry in &project_entries {
-        for child_config in expand_project_entry(entry, &root_dir, config_path, root) {
+        let configs = expand_project_entry(entry, &root_dir, config_path, root, walk.project_root);
+        for child_config in configs {
             let Ok(child_source) = std::fs::read_to_string(&child_config) else {
                 continue;
             };
@@ -249,7 +274,7 @@ fn extract_jest_string_projects(input: JestStringProjectsInput<'_>) {
                 &child_source,
                 &child_root,
                 &mut child_result,
-                visited,
+                walk,
                 depth + 1,
             );
             result
@@ -459,16 +484,32 @@ fn credit_inline_project_plugin_fields(
 /// of matches inspected (so `**/*` on a deep tree of non-config files
 /// still terminates promptly), and `MAX_EXPANDED_PROJECTS` limits the
 /// number of accepted child configs.
+///
+/// The config comes from the analyzed repository, so a match outside
+/// `project_root` is not read. The check also stops absolute entries,
+/// `..` segments, and symlinks that point out of the project.
 fn expand_project_entry(
     entry: &str,
     root_dir: &Path,
     config_path: &Path,
     root: &Path,
+    project_root: &Path,
 ) -> Vec<PathBuf> {
-    let resolved = resolve_project_pattern(entry, root_dir, config_path, root);
-    let pattern_str = resolved.to_string_lossy();
+    let (base, pattern) = resolve_project_pattern(entry, root_dir, config_path, root);
     let mut configs = Vec::new();
 
+    if !config_parser::glob_base_is_inside_root(base, pattern, project_root) {
+        return configs;
+    }
+    let pattern = fallow_config::glob_validation::disk_glob_pattern(pattern);
+    let pattern_str = if Path::new(pattern.as_ref()).is_absolute() {
+        pattern.into_owned()
+    } else {
+        format!(
+            "{}/{pattern}",
+            glob::Pattern::escape(&base.to_string_lossy())
+        )
+    };
     let Ok(matches) = glob::glob(&pattern_str) else {
         return configs;
     };
@@ -478,8 +519,11 @@ fn expand_project_entry(
         if iterations > MAX_GLOB_ITERATIONS || configs.len() >= MAX_EXPANDED_PROJECTS {
             break;
         }
+        if !config_parser::is_inside_root(&matched, project_root) {
+            continue;
+        }
         if matched.is_dir() {
-            if let Some(found) = probe_directory_for_jest_config(&matched) {
+            if let Some(found) = probe_directory_for_jest_config(&matched, project_root) {
                 configs.push(found);
             }
         } else if matched.is_file() && is_recognised_config_path(&matched) {
@@ -491,16 +535,20 @@ fn expand_project_entry(
 
 /// Probe a matched directory for a recognised Jest config in resolution
 /// order: dedicated `jest.config.{ts,js,mjs,cjs,json}` first, then
-/// `package.json` carrying a top-level `"jest"` key.
-fn probe_directory_for_jest_config(dir: &Path) -> Option<PathBuf> {
+/// `package.json` carrying a top-level `"jest"` key. A candidate that is a
+/// symlink to a file outside `project_root` is skipped.
+fn probe_directory_for_jest_config(dir: &Path, project_root: &Path) -> Option<PathBuf> {
     for filename in JEST_CONFIG_FILENAMES {
         let candidate = dir.join(filename);
-        if candidate.is_file() {
+        if candidate.is_file() && config_parser::is_inside_root(&candidate, project_root) {
             return Some(candidate);
         }
     }
     let pkg = dir.join(PACKAGE_JSON_FILENAME);
-    if pkg.is_file() && package_json_has_jest_key(&pkg) {
+    if pkg.is_file()
+        && config_parser::is_inside_root(&pkg, project_root)
+        && package_json_has_jest_key(&pkg)
+    {
         return Some(pkg);
     }
     None
@@ -531,25 +579,24 @@ fn is_recognised_config_path(path: &Path) -> bool {
     name == PACKAGE_JSON_FILENAME && package_json_has_jest_key(path)
 }
 
-/// Substitute `<rootDir>` and resolve relative paths against the config file.
+/// Split a `projects` entry into the directory that it resolves against and
+/// the glob pattern relative to that directory. An absolute entry keeps its
+/// own path as the pattern.
 ///
 /// Jest replaces `<rootDir>` in a string `projects` entry with the `rootDir`
-/// option of the config ([`jest_root_dir`]).
-fn resolve_project_pattern(
-    entry: &str,
-    root_dir: &Path,
-    config_path: &Path,
-    root: &Path,
-) -> PathBuf {
+/// option of the config ([`jest_root_dir`]). Other relative entries resolve
+/// against the config directory. The directory stays apart from the pattern,
+/// so a glob character in its path is not read as glob syntax.
+fn resolve_project_pattern<'a>(
+    entry: &'a str,
+    root_dir: &'a Path,
+    config_path: &'a Path,
+    root: &'a Path,
+) -> (&'a Path, &'a str) {
     if let Some(rest) = entry.strip_prefix("<rootDir>") {
-        let trimmed = rest.trim_start_matches(['/', '\\']);
-        return root_dir.join(trimmed);
+        return (root_dir, rest.trim_start_matches(['/', '\\']));
     }
-    let path = Path::new(entry);
-    if path.is_absolute() {
-        return path.to_path_buf();
-    }
-    config_path.parent().unwrap_or(root).join(entry)
+    (config_path.parent().unwrap_or(root), entry)
 }
 
 /// The directory that Jest substitutes for `<rootDir>`. Jest resolves the
@@ -1669,6 +1716,170 @@ mod tests {
                 .iter()
                 .any(|dep| dep == "ts-node"),
             "jest.config.ts must credit ts-node, got: {:?}",
+            result.referenced_dependencies,
+        );
+    }
+
+    fn write_preset_config(dir: &Path, preset: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("jest.config.js"),
+            format!(r#"module.exports = {{ preset: "{preset}" }};"#),
+        )
+        .unwrap();
+    }
+
+    /// A `projects` entry that names a config outside the project root is not
+    /// read: absolute paths, `..` segments, and a `.*` segment that the glob
+    /// matcher also matches against `..`.
+    #[test]
+    fn resolve_config_projects_outside_root_are_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        write_preset_config(&outside.join("a"), "outside-preset");
+        std::fs::create_dir_all(outside.join("b")).unwrap();
+        std::fs::write(
+            outside.join("b/package.json"),
+            r#"{ "jest": { "preset": "outside-pkg" } }"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+
+        let absolute = format!("{}/*", outside.display()).replace('\\', "/");
+        let parent_source = format!(
+            r#"module.exports = {{ projects: ["../outside/*", "{absolute}", ".*/outside/*", "<rootDir>/../outside/a"] }};"#
+        );
+        let parent_path = root.join("jest.config.js");
+        std::fs::write(&parent_path, &parent_source).unwrap();
+
+        let result = JestPlugin.resolve_config(&parent_path, &parent_source, &root);
+
+        for preset in ["outside-preset", "outside-pkg"] {
+            assert!(
+                !result.referenced_dependencies.contains(&preset.to_string()),
+                "a config outside the project root must not be read, got: {:?}",
+                result.referenced_dependencies,
+            );
+        }
+    }
+
+    /// A symlink inside the project root that points to a directory outside it
+    /// does not make that directory's config readable.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_config_projects_symlink_outside_root_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let outside = dir.path().join("outside");
+        write_preset_config(&outside, "outside-preset");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
+
+        let parent_source = r#"module.exports = { projects: ["<rootDir>/link", "<rootDir>/*"] };"#;
+        let parent_path = root.join("jest.config.js");
+        std::fs::write(&parent_path, parent_source).unwrap();
+
+        let result = JestPlugin.resolve_config(&parent_path, parent_source, &root);
+
+        assert!(
+            !result
+                .referenced_dependencies
+                .contains(&"outside-preset".to_string()),
+            "a symlink to a config outside the project root must not be read, got: {:?}",
+            result.referenced_dependencies,
+        );
+    }
+
+    /// `<rootDir>/../packages/*` from a config in a subdirectory stays inside
+    /// the project root and is still followed.
+    #[test]
+    fn resolve_config_projects_parent_segment_inside_root_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_preset_config(&root.join("packages/a"), "ts-jest");
+        std::fs::create_dir_all(root.join("config")).unwrap();
+
+        let parent_source = r#"module.exports = { projects: ["<rootDir>/../packages/*"] };"#;
+        let parent_path = root.join("config/jest.config.js");
+        std::fs::write(&parent_path, parent_source).unwrap();
+
+        let result = JestPlugin.resolve_config(&parent_path, parent_source, root);
+
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"ts-jest".to_string()),
+            "an in-root `..` project must be followed, got: {:?}",
+            result.referenced_dependencies,
+        );
+    }
+
+    /// A workspace package config can name a sibling package. The sibling is
+    /// outside the workspace root but inside the project root.
+    #[test]
+    fn resolve_config_projects_workspace_sibling_inside_project_root_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let web = root.join("packages/web");
+        write_preset_config(&root.join("packages/shared"), "ts-jest");
+        std::fs::create_dir_all(&web).unwrap();
+
+        let parent_source = r#"module.exports = { projects: ["<rootDir>/../shared"] };"#;
+        let parent_path = web.join("jest.config.js");
+        std::fs::write(&parent_path, parent_source).unwrap();
+
+        let result = JestPlugin.resolve_config_in_project(&parent_path, parent_source, &web, root);
+
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"ts-jest".to_string()),
+            "a sibling inside the project root must be followed, got: {:?}",
+            result.referenced_dependencies,
+        );
+    }
+
+    /// A `.*` segment still matches a dot directory inside the project root.
+    #[test]
+    fn resolve_config_projects_dot_wildcard_matches_dot_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_preset_config(&root.join(".jest/a"), "ts-jest");
+
+        let parent_source = r#"module.exports = { projects: ["<rootDir>/.*/a"] };"#;
+        let parent_path = root.join("jest.config.js");
+        std::fs::write(&parent_path, parent_source).unwrap();
+
+        let result = JestPlugin.resolve_config(&parent_path, parent_source, root);
+
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"ts-jest".to_string()),
+            "got: {:?}",
+            result.referenced_dependencies,
+        );
+    }
+
+    /// A glob character in the path of the project root is not glob syntax.
+    #[test]
+    fn resolve_config_projects_root_path_with_glob_characters_is_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("work{team}[1]");
+        write_preset_config(&root.join("packages/a"), "ts-jest");
+
+        let parent_source = r#"module.exports = { projects: ["<rootDir>/packages/*"] };"#;
+        let parent_path = root.join("jest.config.js");
+        std::fs::write(&parent_path, parent_source).unwrap();
+
+        let result = JestPlugin.resolve_config(&parent_path, parent_source, &root);
+
+        assert!(
+            result
+                .referenced_dependencies
+                .contains(&"ts-jest".to_string()),
+            "got: {:?}",
             result.referenced_dependencies,
         );
     }
