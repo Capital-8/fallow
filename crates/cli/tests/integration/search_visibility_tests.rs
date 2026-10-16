@@ -118,10 +118,17 @@ fn trace_export_reports_search_visibility_per_reference() {
         &["--trace", "src/lib.ts:formatDate", "--quiet", "--no-cache"],
     );
     let text = format!("{}{}", human.stdout, human.stderr);
+    let alias_path = Path::new("src").join("alias.ts");
+    let namespace_path = Path::new("src").join("ns.ts");
+    let direct_path = Path::new("src").join("direct.ts");
     assert!(
-        text.contains("src/alias.ts (named import) [used under another name, search fmt]")
-            && text.contains("src/ns.ts (namespace import) [name search misses it, search lib]")
-            && text.contains("src/direct.ts (named import)\n"),
+        text.contains(&format!(
+            "{} (named import) [used under another name, search fmt]",
+            alias_path.display()
+        )) && text.contains(&format!(
+            "{} (namespace import) [name search misses it, search lib]",
+            namespace_path.display()
+        )) && text.contains(&format!("{} (named import)\n", direct_path.display())),
         "human trace shows the search hint: {text}"
     );
 }

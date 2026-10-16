@@ -1295,12 +1295,10 @@ fn a_relative_output_file_resolves_against_the_process_directory() {
         options.output_paths,
         vec![cwd.join("reports/mutation.json")]
     );
-    relative.output_file = Some(Path::new("/tmp/mutation.json"));
+    let absolute = cwd.join("mutation.json");
+    relative.output_file = Some(&absolute);
     let options = run_options(&relative).expect("options");
-    assert_eq!(
-        options.output_paths,
-        vec![std::path::PathBuf::from("/tmp/mutation.json")]
-    );
+    assert_eq!(options.output_paths, vec![absolute]);
 }
 
 #[test]

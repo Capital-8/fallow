@@ -347,6 +347,8 @@ mod tests {
 
     #[test]
     fn inspect_forwards_the_mutant_and_report_to_the_cli() {
+        let report = Path::new("/repo").join("fallow-mutation.json");
+        let report = report.to_string_lossy();
         let args = build_mutation_inspect_args(&inspect_params(serde_json::json!({
             "mutant_id": " m_1a2b3c ",
             "report": "fallow-mutation.json",
@@ -370,7 +372,7 @@ mod tests {
                 "inspect",
                 "m_1a2b3c",
                 "--report",
-                "/repo/fallow-mutation.json",
+                report.as_ref(),
             ]
         );
     }
