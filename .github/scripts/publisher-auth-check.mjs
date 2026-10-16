@@ -170,7 +170,7 @@ export const verifyOtherRegistryIdentities = async (
   }
 };
 
-/** Check the fixed extension's trusted identity and target rights without uploading packages. */
+/** Exchange the fixed extension's trusted identity without uploading packages. */
 export const verifyOpenVsxIdentity = async (env = process.env, send = fetch) => {
   let stage = "GitHub identity";
   try {
@@ -203,17 +203,6 @@ export const verifyOpenVsxIdentity = async (env = process.env, send = fetch) => 
       201,
     );
     if (!validToken(authority.value)) throw new Error("Missing authority");
-    stage = "extension permission";
-    const permission = await requestJson(
-      `${REGISTRY}/api/-/size-limit?namespace=fallow-rs&extension=fallow-vscode`,
-      {
-        method: "GET",
-        headers: { Authorization: `Bearer ${authority.value}`, Accept: "application/json" },
-      },
-      send,
-    );
-    if (!Number.isSafeInteger(permission.maxSize) || permission.maxSize <= 0)
-      throw new Error("Missing permission");
     return { ok: true };
   } catch (error) {
     const status = Number.isInteger(error?.httpStatus) ? ` (HTTP ${error.httpStatus})` : "";
@@ -228,11 +217,11 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
       : { ok: false, error: "Unsupported identity check arguments" };
   console.log(
     result.ok
-      ? "Open VSX trusted identity has fixed extension publishing permission"
+      ? "Open VSX trusted identity exchange passed for fallow-rs.fallow-vscode; publisher permission requires owner verification"
       : result.error,
   );
-  const registries = result.ok ? await verifyOtherRegistryIdentities() : result;
-  if (result.ok) {
+  const registries = process.argv.length === 2 ? await verifyOtherRegistryIdentities() : result;
+  if (process.argv.length === 2) {
     if (registries.ok) {
       console.log(
         "npm trusted identity exchanges passed; stage-only policy still requires owner verification",
