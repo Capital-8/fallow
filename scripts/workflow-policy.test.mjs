@@ -2466,3 +2466,14 @@ test("release auth check cannot start any release build or publication job", () 
   );
   assert.match(auth, /node .github\/scripts\/publisher-auth-check.mjs/u);
 });
+
+test("auth-only npm exchanges use the exact release publication inventory", async () => {
+  const { NPM_PACKAGES } = await import("../.github/scripts/publisher-auth-check.mjs");
+  const workflow = readWorkflow(".github/workflows/release.yml");
+  const publish = indentedBlock(workflow, "npm-publish", 2);
+  const inventory = publish.match(/expected_names=\(([\s\S]*?)\)/u)?.[1];
+  assert.ok(inventory);
+  const expected = [...inventory.matchAll(/"([^"\n]+)"/gu)].map((match) => match[1]);
+  assert.deepEqual(NPM_PACKAGES, expected);
+  assert.equal(new Set(NPM_PACKAGES).size, NPM_PACKAGES.length);
+});

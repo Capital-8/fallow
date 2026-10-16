@@ -127,6 +127,27 @@ request does not consume that authority or upload a package. A successful
 check proves the binding and namespace publishing permission at that time;
 it does not prove an extension upload or change either active auth mode.
 
+The same fixed diagnostic path checks npm exchange for each package in the
+release workflow's exact npm inventory. It uses audience
+`npm:registry.npmjs.org`, requires the documented HTTP 201 OIDC response, and
+checks `created` and `expires` for a future, bounded lifetime. It then requests
+`crates.io` identity and performs one token-only exchange. Both identities
+must have the expected audience and a valid, bounded expiration before they
+reach a registry. Requests have fixed timeouts and refuse redirects. No
+package bytes, versions, upload, staging call or version reservation are sent.
+Authority remains in memory and is not written to logs, outputs or artifacts.
+
+An npm exchange does not prove that the `fallow` root's policy is stage-only:
+ordinary and staged publication use the same exchange. The crates.io response
+returns an opaque token with no crate inventory or expiration field. A valid
+response proves some matching configuration, not all release crates. The
+server defines its temporary lifetime, which this response cannot verify.
+Read back the full crate configuration inventory and npm root permissions
+with owner credentials before declaring complete publication readiness.
+References: [npm exchange API](https://api-docs.npmjs.com/),
+[pinned npm exchange implementation](https://github.com/npm/cli/blob/v11.19.0/lib/utils/oidc.js),
+and [crates.io exchange implementation](https://github.com/rust-lang/crates.io/blob/main/src/controllers/trustpub/tokens/exchange/mod.rs).
+
 App registration, federation, publisher membership, mode activation and legacy
 PAT retirement are separate owner actions. A prepared source route does not
 prove provider authorization. Keep the current PAT mode until the exact identity

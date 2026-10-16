@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       auth_check:
-        description: Check Open VSX identity without a release
+        description: Check registry identities without a release
         required: false
         default: false
         type: boolean
@@ -18,7 +18,7 @@ on:
         default: true
         type: boolean
 
-run-name: Release ${{ inputs.tag }} from ${{ github.sha }}
+run-name: ${{ inputs.auth_check && 'Check registry identities' || format('Release {0}', inputs.tag) }} from ${{ github.sha }}
 
 concurrency:
   group: release
@@ -2359,7 +2359,7 @@ jobs:
 
 
   publisher-auth-check:
-    name: Check Open VSX publishing identity
+    name: Check registry publishing identities
     if: inputs.auth_check && github.ref == 'refs/heads/main'
     environment: release
     runs-on: ubuntu-26.04
@@ -2379,5 +2379,5 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
-      - name: Check Open VSX trusted publishing permission
+      - name: Check trusted registry identities
         run: node .github/scripts/publisher-auth-check.mjs
