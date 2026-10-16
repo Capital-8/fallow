@@ -109,7 +109,10 @@ invariants in this file.
 
 ## Prepare
 
-6. Run `node scripts/changelog-fragments.mjs collect`. It moves every
+6. Create a release branch from the verified `main` before changing files:
+   `git switch -c "chore/release-v${VERSION}"`. Keep `main` protected, including
+   administrator enforcement and required pull requests.
+   Run `node scripts/changelog-fragments.mjs collect`. It moves every
    fragment in `changelog.d/` into `[Unreleased]` and deletes the fragment
    files. Pull requests write fragments instead of `CHANGELOG.md`, so a merge
    of one pull request cannot make another conflict in the changelog.
@@ -164,10 +167,17 @@ invariants in this file.
    entries legitimately name a migration source or a documented parity gap,
    while the public release surface does not.
 8. Apply version changes transactionally. Regenerate every public contract,
-   adapter, packaged skill, and version-bearing artifact. Synchronize
-   `fallow-docs` and `fallow-skills` from their canonical sources. For
-   `fallow-skills`, run `node scripts/sync-skills-companion.mjs`, then push the
-   commit that it prepares.
+   adapter, packaged skill, and version-bearing artifact. Prepare and review
+   `fallow-docs` changes from their canonical sources. Defer the final
+   `fallow-skills` synchronization to step 10: its source pin must already be
+   on `origin/main`, so it cannot pin the unmerged release branch.
+
+   The pull request's `Public skills contract` job compares the published
+   companion with the pull request base, not the candidate release tree.
+   Keep that base contract synchronized before opening the release pull
+   request. Review and validate the candidate generated contract locally;
+   synchronize its merged content after the protected merge, then require
+   the main contract check to pass. Do not bypass either check.
 
    Two version-bearing manifests sit outside the workspace bump and follow
    opposite rules. `scripts/sync-npm-versions.sh` rewrites both and is wired to
@@ -215,19 +225,67 @@ invariants in this file.
    paths before creating a signed release commit with the subject
    `chore: release vX.Y.Z`. The release workflow checks this subject: the
    push workflows exempt it from cancellation, and the CI gate needs its runs.
-   Do not create the version tag yet.
+   Push only the release branch and open a ready pull request against `main`.
+   Require review and every required pull request check. Do not create the
+   version tag yet. The local signed commit is preparation evidence; the
+   protected squash merge below creates the actual release SHA.
 
 ## Publish
 
-10. Push the release commit to `main`. While the version tag is still absent,
+10. Squash-merge the reviewed release pull request through branch protection.
+    Verify squash merging is enabled with
+    `gh api repos/fallow-rs/fallow --jq '.allow_squash_merge'` and require `true`.
+    Set `RELEASE_PR` to the ready release pull request and `REVIEWED_HEAD` to
+    its exact reviewed head SHA. Set `VERSION` to the prepared version:
+
+    ```bash
+    set -euo pipefail
+    gh pr checks "$RELEASE_PR" --required --watch
+    gh pr merge "$RELEASE_PR" --squash --match-head-commit "$REVIEWED_HEAD" \
+      --subject "chore: release v${VERSION}"
+    test "$(gh pr view "$RELEASE_PR" --json state --jq '.state')" = MERGED
+    RELEASE_COMMIT="$(gh pr view "$RELEASE_PR" --json mergeCommit --jq '.mergeCommit.oid')"
+    git fetch origin main
+    git switch main
+    git merge --ff-only origin/main
+    test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+    test "$(git log -1 --format=%s)" = "chore: release v${VERSION}"
+    ```
+
+    Do not use a normal merge commit or a default squash title with a pull
+    request suffix. `release-context` requires the exact subject
+    `chore: release vX.Y.Z`; its release-specific concurrency group also
+    depends on that subject. Never bypass protection or push directly to
+    `main`. Capture the actual merged SHA, not the signed local commit or
+    pull request head.
+
+    Synchronize `fallow-skills` against that merged tree with
+    `node scripts/sync-skills-companion.mjs --pin "$RELEASE_COMMIT"`.
+    The helper reads committed content, checks that the pin is on
+    `origin/main`, and prepares a companion commit only when released skill
+    content differs. An unchanged contract is a successful no-op; do not
+    invent a new companion version or force a repin. For changed content,
+    publish the prepared companion commit through its normal reviewed flow
+    and require its validation. Its `source-lock.json` names the actual
+    merged SHA, and its source-contract validator checks that exact checkout
+    as well as content. Fallow's `Public skills contract` check compares
+    content, so it must see the updated published companion before passing.
+    If an earlier main contract check failed during this synchronization,
+    rerun that failed check after the companion update. No failed check is
+    waived. Require all companion-repository checks from step 9 to pass.
+
+    Wait for all release-required push workflows on the actual release SHA:
+    `node scripts/verify-release-ci.mjs --sha "$RELEASE_COMMIT"`.
+    While `origin/main` is still that SHA and the version tag remains absent,
     dispatch the release workflow from `main` with the planned tag:
 
     ```bash
+    set -euo pipefail
     # Use the verified values established during release preparation.
     TAG="v${VERSION}"
     TITLE="${TAG}: ${SUMMARY}"
     NOTES_FILE="/tmp/fallow-release-${TAG}.md"
-    RELEASE_COMMIT="$(git rev-parse HEAD)"
+    # RELEASE_COMMIT is the actual squash-merged SHA captured above.
 
     test -s "$NOTES_FILE"
     grep -qF "https://github.com/fallow-rs/fallow/compare/${PREVIOUS_TAG}...${TAG}" "$NOTES_FILE"
@@ -245,13 +303,13 @@ invariants in this file.
      exit 1
     fi
 
-    git push origin main
     git fetch origin main
     if [ "$(git rev-parse origin/main)" != "$RELEASE_COMMIT" ]; then
      echo "origin/main moved away from the prepared release commit" >&2
      exit 1
     fi
-    if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+    remote_tag="$(git ls-remote --tags origin "refs/tags/${TAG}")"
+    if [ -n "$remote_tag" ]; then
      echo "release tag already exists: ${TAG}" >&2
      exit 1
     fi
@@ -259,6 +317,11 @@ invariants in this file.
     gh workflow run release.yml --ref main \
      -f tag="$TAG"
     ```
+
+    Read back the dispatched run and require its `headSha` to equal
+    `$RELEASE_COMMIT` before approving any protected publication job. A
+    concurrent merge can race the final branch check; stop if the run points
+    elsewhere. Do not dispatch from a feature branch or substitute a local SHA.
 
     The first job, `release-context`, has a CI gate. It runs
     `scripts/verify-release-ci.mjs` against the release commit, and nothing
@@ -279,12 +342,13 @@ invariants in this file.
       trigger, and `origin/main` is still the release commit, start it with
       `gh workflow run <file> --ref main`. Then dispatch the release again.
       `ci.yml` and `commitlint.yml` have no `workflow_dispatch` trigger. For
-      these, push a new commit to `main` and prepare the release from that
-      commit. The error line tells you which fix applies.
+      these, prepare a new signed release commit on a branch and use the
+      protected pull request and squash-merge flow above. The error line
+      tells you which fix applies.
     - A failed run: open the run from the error line. For a flaky failure,
       re-run it with `gh run rerun <id> --failed`. The gate reads the latest
-      attempt. For a real failure, fix it in a new commit on `main`, and
-      prepare the release from that commit.
+      attempt. For a real failure, fix it through a reviewed pull request,
+      then prepare a new release commit through the protected flow above.
     - A cancelled run: on `main`, a newer push cancels an older push run of
       the same workflow. The release commit is the exception: a commit whose
       message starts with `chore: release v` gets a concurrency group of its
