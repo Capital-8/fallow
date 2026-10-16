@@ -38,7 +38,7 @@ use fallow_output::{
     SimilarCodeVerdictMatch, SimilarCodeVerificationStatus,
 };
 use fallow_types::envelope::{ElapsedMs, ToolVersion};
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use globset::{GlobSet, GlobSetBuilder};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -1579,7 +1579,7 @@ fn load_session(resolved: &ProgrammaticAnalysisContext) -> ProgrammaticResult<An
 fn build_ignore_set(patterns: &[String]) -> ProgrammaticResult<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
-        builder.add(Glob::new(pattern).map_err(|error| {
+        builder.add(fallow_config::compile_path_glob(pattern).map_err(|error| {
             ProgrammaticError::new(
                 format!("invalid `similarCode.ignore` pattern `{pattern}`: {error}"),
                 2,
@@ -2064,6 +2064,13 @@ mod tests {
     use crate::similar_code::{
         EmbeddingBatch, EmbeddingBatchVector, EmbeddingSession, EmbeddingSessionFactory,
     };
+
+    #[test]
+    fn ignore_glob_single_star_stays_within_one_segment() {
+        let set = build_ignore_set(&["src/*.ts".to_string()]).unwrap();
+        assert!(set.is_match("src/a.ts"));
+        assert!(!set.is_match("src/nested/a.ts"));
+    }
 
     #[derive(Default)]
     struct FakeProviderState {

@@ -248,7 +248,7 @@ fn build_rule_report(rule: &ManifestEntryRule, root: &Path) -> RuleReport {
         return report;
     }
 
-    let Ok(glob) = globset::Glob::new(&rule.manifests) else {
+    let Ok(glob) = fallow_config::compile_path_glob(&rule.manifests) else {
         // Glob validity is enforced at config load; a compile failure here is
         // defensive and, like a non-matching glob, seeds nothing.
         report.warnings.push(CheckWarning::glob(
@@ -1229,6 +1229,29 @@ mod tests {
             !beta.seeded.iter().any(|s| s.contains("server/index")),
             "beta server:false must not seed the server entry, got {:?}",
             beta.seeded
+        );
+    }
+
+    #[test]
+    fn manifests_glob_single_star_stays_within_one_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_manifest(root, "plugins/alpha/kibana.jsonc", r#"{"type":"plugin"}"#);
+        write_manifest(
+            root,
+            "plugins/group/beta/kibana.jsonc",
+            r#"{"type":"plugin"}"#,
+        );
+        let ext = plugin_with(vec![rule(
+            "plugins/*/kibana.jsonc",
+            &[],
+            vec![seed("public/index.ts", &[])],
+        )]);
+
+        let reports = check_manifest_entries(&ext, root);
+        assert_eq!(
+            reports[0].manifests_matched,
+            vec!["plugins/alpha/kibana.jsonc".to_string()]
         );
     }
 
