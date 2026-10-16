@@ -42,7 +42,8 @@ graph. Publication uses prepared VSIX files, with no packaging step.
 ## VSIX publisher authorization
 
 The `release` environment variables `VSCE_AUTH_MODE` and `OVSX_AUTH_MODE`
-independently select `pat` or `oidc`; an unset variable preserves `pat`.
+independently select `pat` or `oidc`; Marketplace also accepts `azure`. An unset
+variable preserves `pat`.
 Unknown modes, a missing selected PAT, or unavailable GitHub OIDC identity
 fail before upload. In `oidc` mode the workflow excludes the legacy PAT from
 the step environment and explicitly requests trusted publishing. Registry
@@ -69,6 +70,51 @@ The frozen `@vscode/vsce@4.0.0` supports `--oidc`, requesting audience
 authority. Their graphs and binary signing keys are independent of this mode
 selection. Account policies, mode activation, legacy-token revocation and
 real publication require separate owner actions.
+
+## Marketplace Entra federation
+
+`VSCE_AUTH_MODE=azure` selects Microsoft Entra workload federation. Set the
+nonsecret `VSCE_AZURE_CLIENT_ID` and `VSCE_AZURE_TENANT_ID` variables in the
+protected `release` environment only after the publisher owner has verified the
+identity. The workflow validates the IDs and GitHub identity before login, uses
+pinned `azure/login` with `allow-no-subscriptions: true`, and requires its
+successful outcome before calling the frozen VSCE CLI with `--azure-credential`.
+It installs the frozen publisher graph before Azure credentials exist. Azure
+and direct OIDC modes never inject `VSCE_PAT`; the Azure route also clears
+inherited client-secret and certificate credentials before publication.
+
+The owner must authorize the app service principal's global Marketplace profile
+ID as a Contributor of the existing publisher. App/client IDs, application
+object IDs and service-principal object IDs are not that profile ID. Configure
+the app's federation issuer as `https://token.actions.githubusercontent.com`,
+subject as `repo:fallow-rs/fallow:environment:release`, and audience as
+`api://AzureADTokenExchange`. The default subject identifies the repository and
+environment, not the workflow filename, so keep environment review, main-only
+branch policy and disabled administrator bypass. No project, organization
+connection, Azure resource role or subscription ID is part of this workflow.
+
+The manual-only `verify-marketplace-identity.yml` workflow provides the profile
+lookup prerequisite after owner-approved source integration. It runs only on
+`main` in the protected `release` environment, uses the configured app's Entra
+identity, and makes only the fixed global profile GET with API version 7.1.
+It requires Azure CLI's active account to be the configured service principal
+and tenant before obtaining a token. It emits a validated profile ID, never a
+token or upstream response body, and refuses redirects. It has no signing, PAT, dependency installation or publication
+step. Running it still requires separate owner approval, app registration and
+federation setup; the prepared workflow is not provider verification. Use the
+returned ID for owner-controlled publisher membership and read it back there.
+The real publisher job must never be dispatched as an identity capability probe.
+
+App registration, federation, publisher membership, mode activation and legacy
+PAT retirement are separate owner actions. A prepared source route does not
+prove provider authorization. Keep the current PAT mode until the exact identity
+and publisher permissions have been verified without uploading an extension.
+This route changes publishing administration, not customer authentication or
+shipped extension behavior. Do not create paid resources to enable it.
+
+References: [Marketplace service-principal authorization](https://learn.microsoft.com/en-us/azure/devops/extend/publish/command-line),
+[Azure login without a subscription](https://github.com/Azure/login#login-without-subscription),
+and [federated app credentials](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation-create-trust).
 
 ## Invariants
 

@@ -2028,11 +2028,41 @@ jobs:
       - name: Install VS Code Marketplace publisher
         run: npm ci --prefix .github/publishers/marketplace --ignore-scripts --no-audit --no-fund
 
+      - name: Validate Marketplace Azure identity configuration
+        if: vars.VSCE_AUTH_MODE == 'azure'
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ vars.VSCE_AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.VSCE_AZURE_TENANT_ID }}
+        run: |
+          azure_id_pattern='^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$'
+          if ! [[ "${AZURE_CLIENT_ID:-}" =~ $azure_id_pattern ]] || \
+              ! [[ "${AZURE_TENANT_ID:-}" =~ $azure_id_pattern ]] || \
+              [ "${GITHUB_ACTIONS:-}" != "true" ] || \
+              [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || \
+              [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::Selected Azure identity configuration is incomplete"
+            exit 1
+          fi
+
+      - name: Authenticate Marketplace with Microsoft Entra
+        if: vars.VSCE_AUTH_MODE == 'azure'
+        id: marketplace_azure_login
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+        with:
+          client-id: ${{ vars.VSCE_AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.VSCE_AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+          audience: api://AzureADTokenExchange
+
       - name: Publish every target to VS Code Marketplace
         shell: bash
         env:
           VSCE_AUTH_MODE: ${{ vars.VSCE_AUTH_MODE || 'pat' }}
-          VSCE_PAT: ${{ vars.VSCE_AUTH_MODE != 'oidc' && secrets.VSCE_PAT || '' }}
+          VSCE_PAT: ${{ (vars.VSCE_AUTH_MODE == '' || vars.VSCE_AUTH_MODE == 'pat') && secrets.VSCE_PAT || '' }}
+          AZURE_CLIENT_ID: ${{ vars.VSCE_AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.VSCE_AZURE_TENANT_ID }}
+          MARKETPLACE_AZURE_AUTHENTICATED: ${{ steps.marketplace_azure_login.outcome == 'success' }}
         run: |
           set -u
           auth_args=()
@@ -2052,6 +2082,20 @@ jobs:
                 exit 1
               fi
               auth_args=(--oidc)
+              ;;
+            azure)
+              unset VSCE_PAT AZURE_CLIENT_SECRET AZURE_CLIENT_CERTIFICATE_PATH AZURE_CLIENT_CERTIFICATE_PASSWORD
+              azure_id_pattern='^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$'
+              if [ "${MARKETPLACE_AZURE_AUTHENTICATED:-}" != "true" ] || \
+                  ! [[ "${AZURE_CLIENT_ID:-}" =~ $azure_id_pattern ]] || \
+                  ! [[ "${AZURE_TENANT_ID:-}" =~ $azure_id_pattern ]] || \
+                  [ "${GITHUB_ACTIONS:-}" != "true" ] || \
+                  [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || \
+                  [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+                echo "::error::Selected Azure identity authorization is not available"
+                exit 1
+              fi
+              auth_args=(--azure-credential)
               ;;
             *)
               echo "::error::Unsupported publication authorization mode"
