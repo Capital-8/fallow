@@ -81,7 +81,8 @@ const MAX_IDENTITY_LIFETIME_MS = 30 * 60 * 1000;
 const MAX_NPM_LIFETIME_MS = 2 * 60 * 60 * 1000;
 const CLOCK_SKEW_MS = 5 * 60 * 1000;
 
-const getExpiringIdentity = async (env, audience, send, now) => {
+const getExpiringIdentity = async (env, audience, send, now, setStage) => {
+  setStage("GitHub identity request");
   const identity = await requestJson(
     getIdentityUrl(env, audience),
     {
@@ -93,6 +94,7 @@ const getExpiringIdentity = async (env, audience, send, now) => {
     },
     send,
   );
+  setStage("identity claims");
   if (!validToken(identity.value)) throw new Error("Missing identity");
   const claims = JSON.parse(
     Buffer.from(identity.value.split(".")[1], "base64url").toString("utf8"),
@@ -109,45 +111,56 @@ const getExpiringIdentity = async (env, audience, send, now) => {
   return identity.value;
 };
 
-/** Exchange fixed npm and crates identities without package bytes, versions or persistent credentials. */
-export const verifyOtherRegistryIdentities = async (
-  env = process.env,
-  send = fetch,
-  now = Date.now(),
-) => {
-  let registry = "npm";
-  let packageName = "identity";
+const exchangeFailure = (registry, target, stage, error) => {
+  const status = Number.isInteger(error?.httpStatus) ? ` (HTTP ${error.httpStatus})` : "";
+  return { ok: false, error: `${registry} ${stage} check failed for ${target}${status}` };
+};
+
+const verifyNpmIdentity = async (name, env, send, now) => {
+  let stage = "GitHub identity request";
   try {
-    for (const name of NPM_PACKAGES) {
-      packageName = name;
-      const identity = await getExpiringIdentity(env, NPM_AUDIENCE, send, now);
-      const authority = await requestJson(
-        `${NPM_REGISTRY}/-/npm/v1/oidc/token/exchange/package/${encodeURIComponent(name)}`,
-        {
-          method: "POST",
-          headers: { Authorization: `Bearer ${identity}`, Accept: "application/json" },
-        },
-        send,
-        201,
-      );
-      const created = Date.parse(authority.created);
-      const expires = Date.parse(authority.expires);
-      if (
-        !validToken(authority.token) ||
-        authority.token_type !== "oidc" ||
-        !Number.isFinite(created) ||
-        !Number.isFinite(expires) ||
-        created > now + CLOCK_SKEW_MS ||
-        expires <= now ||
-        expires <= created ||
-        expires - created > MAX_NPM_LIFETIME_MS ||
-        expires > now + MAX_NPM_LIFETIME_MS
-      )
-        throw new Error("npm authority expiry is invalid");
-    }
-    registry = "crates.io";
-    packageName = "matching configurations";
-    const cratesIdentity = await getExpiringIdentity(env, CRATES_AUDIENCE, send, now);
+    const identity = await getExpiringIdentity(env, NPM_AUDIENCE, send, now, (value) => {
+      stage = value;
+    });
+    stage = "trusted exchange";
+    const authority = await requestJson(
+      `${NPM_REGISTRY}/-/npm/v1/oidc/token/exchange/package/${name.replace("/", "%2f")}`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${identity}`, Accept: "application/json" },
+      },
+      send,
+      201,
+    );
+    stage = "authority validation";
+    const created = Date.parse(authority.created);
+    const expires = Date.parse(authority.expires);
+    if (
+      !validToken(authority.token) ||
+      authority.token_type !== "oidc" ||
+      !Number.isFinite(created) ||
+      !Number.isFinite(expires) ||
+      created > now + CLOCK_SKEW_MS ||
+      expires <= now ||
+      expires <= created ||
+      expires - created > MAX_NPM_LIFETIME_MS ||
+      expires > now + MAX_NPM_LIFETIME_MS
+    )
+      throw new Error("npm authority expiry is invalid");
+
+    return { ok: true, message: `npm trusted identity exchange passed for ${name}` };
+  } catch (error) {
+    return exchangeFailure("npm", name, stage, error);
+  }
+};
+
+const verifyCratesIdentity = async (env, send, now) => {
+  let stage = "GitHub identity request";
+  try {
+    const cratesIdentity = await getExpiringIdentity(env, CRATES_AUDIENCE, send, now, (value) => {
+      stage = value;
+    });
+    stage = "trusted exchange";
     const authority = await requestJson(
       "https://crates.io/api/v1/trusted_publishing/tokens",
       {
@@ -161,13 +174,31 @@ export const verifyOtherRegistryIdentities = async (
       },
       send,
     );
+    stage = "authority validation";
     if (typeof authority.token !== "string" || !/^cio_tp_[A-Za-z0-9]{32}$/u.test(authority.token)) {
       throw new Error("crates authority is invalid");
     }
-    return { ok: true };
-  } catch {
-    return { ok: false, error: `${registry} trusted identity exchange failed for ${packageName}` };
+
+    return {
+      ok: true,
+      message:
+        "crates.io trusted identity exchange passed; matching configurations only, not complete crate scope",
+    };
+  } catch (error) {
+    return exchangeFailure("crates.io", "matching configurations", stage, error);
   }
+};
+
+/** Check every fixed npm package and crates independently without uploading package bytes. */
+export const verifyOtherRegistryIdentities = async (
+  env = process.env,
+  send = fetch,
+  now = Date.now(),
+) => {
+  const outcomes = [];
+  for (const name of NPM_PACKAGES) outcomes.push(await verifyNpmIdentity(name, env, send, now));
+  outcomes.push(await verifyCratesIdentity(env, send, now));
+  return { ok: outcomes.every((outcome) => outcome.ok), outcomes };
 };
 
 /** Exchange the fixed extension's trusted identity without uploading packages. */
@@ -222,14 +253,9 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   );
   const registries = process.argv.length === 2 ? await verifyOtherRegistryIdentities() : result;
   if (process.argv.length === 2) {
-    if (registries.ok) {
-      console.log(
-        "npm trusted identity exchanges passed; stage-only policy still requires owner verification",
-      );
-      console.log(
-        "crates.io trusted identity exchange passed; matching configurations only, not complete crate scope",
-      );
-    } else console.log(registries.error);
+    for (const outcome of registries.outcomes)
+      console.log(outcome.ok ? outcome.message : outcome.error);
+    console.log("npm stage-only policy still requires owner verification");
   }
   process.exitCode = result.ok && registries.ok ? 0 : 1;
 }
