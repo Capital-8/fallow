@@ -2363,3 +2363,61 @@ test("Marketplace identity verification is a protected manual read with no publi
   const profile = job.indexOf("- name: Read validated Marketplace profile ID");
   assert.ok(config >= 0 && config < login && login < profile);
 });
+
+test("release preflight checks secrets for the active publisher modes", () => {
+  const procedure = readFileSync("docs/development/release-procedure.md", "utf8");
+  const block = procedure.match(/```bash\n(   set -euo pipefail\n   custom=[\s\S]*?)   ```/u)?.[1];
+  assert.ok(block, "release credential preflight shell block must exist");
+  const run = (
+    vsce,
+    ovsx,
+    repoSecrets,
+    envSecrets,
+    client = "18767c00-8be6-4496-8b73-e2cccd03a87a",
+  ) => {
+    const shell = `gh() {
+      case "$*" in
+        *custom_branch_policies*) echo true ;;
+        *deployment-branch-policies*) echo main ;;
+        *"variable list"*) printf '%s' "$TEST_VARIABLES" ;;
+        *"secret list"*"--env release"*) printf '%s' "$TEST_ENV_SECRETS" ;;
+        *"secret list"*) printf '%s' "$TEST_REPO_SECRETS" ;;
+        *) return 2 ;;
+      esac
+    }
+${block}`;
+    return runProcess("bash", ["-eu", "-c", shell], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        TEST_VARIABLES: JSON.stringify([
+          { name: "VSCE_AUTH_MODE", value: vsce },
+          { name: "OVSX_AUTH_MODE", value: ovsx },
+          { name: "VSCE_AZURE_CLIENT_ID", value: client },
+          { name: "VSCE_AZURE_TENANT_ID", value: "3e942fa4-e6cf-44a2-b0ef-dc2b0c6c3761" },
+        ]),
+        TEST_REPO_SECRETS: repoSecrets.join("\n"),
+        TEST_ENV_SECRETS: envSecrets.join("\n"),
+      },
+    });
+  };
+  const signing = "ED25519_BINARY_SIGNING_PRIVATE_KEY";
+  const azure = run("azure", "oidc", [], [signing]);
+  assert.equal(azure.status, 0, azure.stderr);
+  assert.equal(run("oidc", "oidc", [], [signing]).status, 0);
+  assert.notEqual(run("azure", "oidc", [], [signing], "invalid").status, 0);
+  assert.notEqual(run("invalid", "oidc", [], [signing]).status, 0);
+  assert.notEqual(run("azure", "invalid", [], [signing]).status, 0);
+  const missing = run("", "", [], [signing]);
+  assert.notEqual(missing.status, 0);
+  assert.match(missing.stderr, /VSCE_PAT is missing/u);
+  assert.equal(run("pat", "pat", [], [signing, "VSCE_PAT", "OVSX_PAT"]).status, 0);
+  const retained = run("azure", "oidc", ["VSCE_PAT", "OVSX_PAT"], [signing]);
+  assert.equal(retained.status, 0, retained.stderr);
+  assert.match(retained.stderr, /VSCE_PAT is a repository secret/u);
+  assert.match(retained.stderr, /OVSX_PAT is a repository secret/u);
+  const duplicate = run("azure", "oidc", ["VSCE_PAT"], [signing, "VSCE_PAT"]);
+  assert.notEqual(duplicate.status, 0);
+  assert.match(duplicate.stderr, /VSCE_PAT exists at both levels/u);
+  assert.notEqual(run("azure", "oidc", [], []).status, 0);
+});

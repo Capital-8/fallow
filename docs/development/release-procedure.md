@@ -31,9 +31,11 @@ invariants in this file.
    secret, readable by a workflow on any ref, and the environment does not
    protect it: the check names those secrets instead of failing. Once a secret
    is in the environment the repository copy must be gone, and the check fails
-   on a secret that exists at both levels or at neither:
+   on duplicate copies. A missing secret fails only when its active mode requires it.
+   Run this block with Bash and stop on any failed command:
 
    ```bash
+   set -euo pipefail
    custom="$(gh api repos/fallow-rs/fallow/environments/release \
      --jq '.deployment_branch_policy.custom_branch_policies')"
    [ "$custom" = "true" ] || { echo "release environment has no custom branch policy" >&2; exit 1; }
@@ -42,7 +44,31 @@ invariants in this file.
    [ "$branches" = "main" ] || { echo "release environment admits: ${branches:-nothing}" >&2; exit 1; }
    repo_secrets="$(gh secret list --repo fallow-rs/fallow --json name --jq '.[].name')"
    env_secrets="$(gh secret list --repo fallow-rs/fallow --env release --json name --jq '.[].name')"
+   repo_vars="$(gh variable list --repo fallow-rs/fallow --json name,value)"
+   env_vars="$(gh variable list --repo fallow-rs/fallow --env release --json name,value)"
+   auth_vars="$(jq -cn --argjson repo "$repo_vars" --argjson env "$env_vars" \
+     '$repo + $env | map({key: .name, value: .value}) | from_entries')"
+   vsce_mode="$(jq -r '.VSCE_AUTH_MODE // "pat" | if . == "" then "pat" else . end' <<<"$auth_vars")"
+   ovsx_mode="$(jq -r '.OVSX_AUTH_MODE // "pat" | if . == "" then "pat" else . end' <<<"$auth_vars")"
+   case "$vsce_mode" in
+     pat|oidc) ;;
+     azure)
+       azure_id_pattern='^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$'
+       for variable in VSCE_AZURE_CLIENT_ID VSCE_AZURE_TENANT_ID; do
+         value="$(jq -r --arg name "$variable" '.[] | select(.name == $name) | .value' <<<"$env_vars")"
+         [[ "$value" =~ $azure_id_pattern ]] || { echo "$variable is invalid or absent from release" >&2; exit 1; }
+       done
+       ;;
+     *) echo "Unsupported VSCE_AUTH_MODE: $vsce_mode" >&2; exit 1 ;;
+   esac
+   case "$ovsx_mode" in
+     pat|oidc) ;;
+     *) echo "Unsupported OVSX_AUTH_MODE: $ovsx_mode" >&2; exit 1 ;;
+   esac
    for name in VSCE_PAT OVSX_PAT ED25519_BINARY_SIGNING_PRIVATE_KEY; do
+     required=1
+     [ "$name" != VSCE_PAT ] || [ "$vsce_mode" = pat ] || required=0
+     [ "$name" != OVSX_PAT ] || [ "$ovsx_mode" = pat ] || required=0
      in_repo=0; in_env=0
      grep -qx "$name" <<<"$repo_secrets" && in_repo=1
      grep -qx "$name" <<<"$env_secrets" && in_env=1
@@ -50,7 +76,7 @@ invariants in this file.
        10) ;;
        11) echo "$name exists at both levels; delete the repository copy" >&2; exit 1 ;;
        01) echo "NOTE: $name is a repository secret, unprotected by the release environment; move it at its next rotation" >&2 ;;
-       *) echo "$name is missing" >&2; exit 1 ;;
+       00) [ "$required" = 0 ] || { echo "$name is missing" >&2; exit 1; } ;;
      esac
    done
    ```
@@ -63,8 +89,11 @@ invariants in this file.
    global profile ID. This read-only path requests no signing/PAT secret and
    performs no publication. The publisher owner adds that ID as a Contributor
    and verifies the member before authorizing Azure-mode activation. When
-   `azure` or direct `oidc` has been approved, omit `VSCE_PAT` from the secret
-   presence loop above; neither route reads it. Repository-copy retirement and
+   `azure` or direct `oidc` is active, the check permits an absent `VSCE_PAT`.
+   Open VSX `oidc` permits an absent `OVSX_PAT`. Confirm each provider binding
+   and permission as described in `release-security.md`; variable validation
+   alone does not prove provider access. The check still reports retained
+   repository PATs and rejects duplicate copies. Repository-copy retirement and
    provider token revocation require separate approval. No subscription purchase,
    organization directory reconnection or end-user login change is a release
    prerequisite for the prepared Entra workflow.
