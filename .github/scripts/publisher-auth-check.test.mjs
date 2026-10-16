@@ -15,41 +15,33 @@ const env = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: "synthetic-request",
 };
 
-test("Open VSX accepts the server 201 exchange and checks the fixed extension without packages or PAT", async () => {
+test("Open VSX exchanges the fixed identity without unsupported production permission routes", async () => {
   const calls = [];
   const send = async (url, options) => {
     calls.push({ url: String(url), ...options });
-    const payloads = [
-      { value: "synthetic-identity" },
-      { value: "synthetic-authority" },
-      { maxSize: 536870912 },
-    ];
-    return Response.json(payloads[calls.length - 1], { status: calls.length === 2 ? 201 : 200 });
+    if (calls.length === 1) return Response.json({ value: "synthetic-identity" });
+    if (String(url) === "https://open-vsx.org/api/-/trusted-publishing/token") {
+      assert.equal(options.method, "POST");
+      assert.deepEqual(JSON.parse(options.body), {
+        namespace: "fallow-rs",
+        extension: "fallow-vscode",
+        token: "synthetic-identity",
+      });
+      return Response.json({ value: "synthetic-authority" }, { status: 201 });
+    }
+    return Response.json({ error: "Unsupported production route" }, { status: 404 });
   };
   assert.deepEqual(await verifyOpenVsxIdentity({ ...env, OVSX_PAT: "must-not-be-used" }, send), {
     ok: true,
   });
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 2);
   assert.equal(new URL(calls[0].url).searchParams.get("audience"), "https://open-vsx.org");
   assert.equal(calls[0].headers.Authorization, "Bearer synthetic-request");
-  assert.equal(calls[1].url, "https://open-vsx.org/api/-/trusted-publishing/token");
-  assert.equal(calls[1].method, "POST");
-  assert.deepEqual(JSON.parse(calls[1].body), {
-    namespace: "fallow-rs",
-    extension: "fallow-vscode",
-    token: "synthetic-identity",
-  });
-  assert.equal(
-    calls[2].url,
-    "https://open-vsx.org/api/-/size-limit?namespace=fallow-rs&extension=fallow-vscode",
-  );
-  assert.equal(calls[2].method, "GET");
-  assert.equal(calls[2].headers.Authorization, "Bearer synthetic-authority");
   for (const call of calls) assert.equal(call.redirect, "error");
 });
 
-test("Open VSX refuses identity and permission failures without token fallback or publication", async () => {
-  for (const failedRequest of [0, 1, 2]) {
+test("Open VSX refuses identity exchange failures without token fallback or publication", async () => {
+  for (const failedRequest of [0, 1]) {
     let calls = 0;
     const send = async () => {
       const index = calls++;
@@ -87,67 +79,30 @@ test("Open VSX refuses identity and permission failures without token fallback o
   );
 });
 
-test("Open VSX rejects incorrect HTTP statuses and malformed target permission responses", async () => {
-  for (const [statuses, permission, expected] of [
-    [[200, 200, 200], { maxSize: 1024 }, "Open VSX trusted exchange check failed (HTTP 200)"],
-    [[200, 201, 201], { maxSize: 1024 }, "Open VSX extension permission check failed (HTTP 201)"],
-    [[200, 201, 200], { success: "Valid token" }, "Open VSX extension permission check failed"],
-    [[200, 201, 200], { maxSize: "1024" }, "Open VSX extension permission check failed"],
-    [[200, 201, 200], { maxSize: 0 }, "Open VSX extension permission check failed"],
-    [[200, 201, 200], { maxSize: -1 }, "Open VSX extension permission check failed"],
-    [[200, 201, 200], { maxSize: 1.5 }, "Open VSX extension permission check failed"],
+test("Open VSX rejects incorrect exchange statuses and malformed authority", async () => {
+  for (const [status, authority, expected] of [
+    [200, { value: "synthetic-token" }, "Open VSX trusted exchange check failed (HTTP 200)"],
+    [403, { error: "private provider token" }, "Open VSX trusted exchange check failed (HTTP 403)"],
+    [201, { success: "Valid token" }, "Open VSX trusted exchange check failed"],
+    [201, { value: "" }, "Open VSX trusted exchange check failed"],
+    [201, { value: "token\r\n::error::private" }, "Open VSX trusted exchange check failed"],
     [
-      [200, 201, 200],
-      { error: "private provider token", maxSize: 1024 },
-      "Open VSX extension permission check failed",
+      201,
+      { value: "synthetic-token", error: "private provider token" },
+      "Open VSX trusted exchange check failed",
     ],
   ]) {
     let calls = 0;
-    const send = async () => {
-      const index = calls++;
-      return Response.json(index === 2 ? permission : { value: "synthetic-token" }, {
-        status: statuses[index],
-      });
-    };
+    const send = async () =>
+      ++calls === 1
+        ? Response.json({ value: "synthetic-identity" })
+        : Response.json(authority, { status });
     assert.deepEqual(await verifyOpenVsxIdentity(env, send), { ok: false, error: expected });
-    assert.equal(calls, statuses[1] === 200 ? 2 : 3);
+    assert.equal(calls, 2);
   }
 });
 
-test("extension permission read rejects a token scoped to another extension", async () => {
-  for (const scope of ["fallow-vscode", "other-extension"]) {
-    let calls = 0;
-    const send = async (url, options) => {
-      calls++;
-      if (calls === 1) return Response.json({ value: "synthetic-identity" });
-      if (calls === 2) {
-        assert.deepEqual(JSON.parse(options.body), {
-          namespace: "fallow-rs",
-          extension: "fallow-vscode",
-          token: "synthetic-identity",
-        });
-        return Response.json({ value: "synthetic-extension-token" }, { status: 201 });
-      }
-      const target = new URL(url);
-      assert.equal(target.pathname, "/api/-/size-limit");
-      assert.equal(target.searchParams.get("namespace"), "fallow-rs");
-      assert.equal(target.searchParams.get("extension"), "fallow-vscode");
-      assert.equal(options.headers.Authorization, "Bearer synthetic-extension-token");
-      return scope === target.searchParams.get("extension")
-        ? Response.json({ maxSize: 1024 })
-        : Response.json({ error: "private scope refusal" }, { status: 403 });
-    };
-    assert.deepEqual(
-      await verifyOpenVsxIdentity(env, send),
-      scope === "fallow-vscode"
-        ? { ok: true }
-        : { ok: false, error: "Open VSX extension permission check failed (HTTP 403)" },
-    );
-    assert.equal(calls, 3);
-  }
-});
-
-test("Open VSX check exercises HTTP exchange and permission reads on loopback", async (t) => {
+test("Open VSX check exercises HTTP identity exchange on loopback", async (t) => {
   const { createServer } = await import("node:http");
   let requests = 0;
   const server = createServer(async (request, response) => {
@@ -171,10 +126,8 @@ test("Open VSX check exercises HTTP exchange and permission reads on loopback", 
       response.end(JSON.stringify({ value: "synthetic-authority" }));
       return;
     }
-    assert.equal(request.url, "/api/-/size-limit?namespace=fallow-rs&extension=fallow-vscode");
-    assert.equal(request.method, "GET");
-    assert.equal(request.headers.authorization, "Bearer synthetic-authority");
-    response.end(JSON.stringify({ maxSize: 536870912 }));
+    response.statusCode = 404;
+    response.end(JSON.stringify({ error: "Unsupported production route" }));
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(async () => {
@@ -190,7 +143,7 @@ test("Open VSX check exercises HTTP exchange and permission reads on loopback", 
     );
   };
   assert.deepEqual(await verifyOpenVsxIdentity(env, send), { ok: true });
-  assert.equal(requests, 3);
+  assert.equal(requests, 2);
 });
 
 test("auth-only CLI checks npm and crates without uploading bytes or printing authority", async (t) => {
@@ -212,35 +165,58 @@ globalThis.fetch = async (url, options) => {
     const claims={aud:endpoint.searchParams.get('audience'),exp:Math.floor(Date.now()/1000)+600};
     return Response.json({value:'e30.'+Buffer.from(JSON.stringify(claims)).toString('base64url')+'.synthetic'});
   }
-  if (endpoint.hostname === 'open-vsx.org') return Response.json(endpoint.pathname === '/api/-/size-limit'?{maxSize:536870912}:{value:'synthetic-authority'},{status:options.method==='POST'?201:200});
+  if (endpoint.href === 'https://open-vsx.org/api/-/trusted-publishing/token' && options.method === 'POST') return process.env.TEST_REFUSE_OPENVSX === 'true' ? new Response('private provider authority', {status:403}) : Response.json({value:'synthetic-authority'},{status:201});
   if (endpoint.hostname === 'registry.npmjs.org' && options.method === 'POST' && endpoint.pathname.startsWith('/-/npm/v1/oidc/token/exchange/package/')) return Response.json({token_type:'oidc',token:'synthetic-npm-authority',created:new Date().toISOString(),expires:new Date(Date.now()+3600000).toISOString()},{status:201});
   if (endpoint.href === 'https://crates.io/api/v1/trusted_publishing/tokens' && options.method === 'POST') return Response.json({token:'cio_tp_'+'a'.repeat(32)});
   throw new Error('Unexpected provider route');
 };`,
   );
-  const result = spawnSync(
+  for (const refuseOpenVsx of [false, true]) {
+    writeFileSync(trace, "");
+    const result = spawnSync(
+      process.execPath,
+      ["--import", hook, ".github/scripts/publisher-auth-check.mjs"],
+      {
+        env: { ...process.env, ...env, TEST_REFUSE_OPENVSX: String(refuseOpenVsx) },
+        encoding: "utf8",
+        timeout: 15_000,
+      },
+    );
+    assert.equal(result.status, refuseOpenVsx ? 1 : 0, result.stderr);
+    assert.match(
+      result.stdout,
+      refuseOpenVsx
+        ? /Open VSX trusted exchange check failed \(HTTP 403\)/u
+        : /Open VSX trusted identity exchange passed/u,
+    );
+    assert.doesNotMatch(result.stdout, /has fixed extension publishing permission/u);
+    assert.match(result.stdout, /npm trusted identity exchanges passed/u);
+    assert.match(result.stdout, /crates.io trusted identity exchange passed/u);
+    assert.doesNotMatch(result.stdout + result.stderr, /synthetic|cio_tp_|private provider/u);
+    const calls = readFileSync(trace, "utf8").trim().split("\n").map(JSON.parse);
+    assert.ok(calls.some((call) => call.url.endsWith("/package/fallow") && call.method === "POST"));
+    assert.ok(
+      calls.some((call) => call.url === "https://crates.io/api/v1/trusted_publishing/tokens"),
+    );
+    assert.ok(
+      calls.every(
+        (call) => !call.url.includes("/publish") || call.url.includes("trusted-publishing/token"),
+      ),
+    );
+  }
+  writeFileSync(trace, "");
+  const unsupported = spawnSync(
     process.execPath,
-    ["--import", hook, ".github/scripts/publisher-auth-check.mjs"],
+    ["--import", hook, ".github/scripts/publisher-auth-check.mjs", "--unsupported"],
     {
       env: { ...process.env, ...env },
       encoding: "utf8",
       timeout: 15_000,
     },
   );
-  assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /npm trusted identity exchanges passed/u);
-  assert.match(result.stdout, /crates.io trusted identity exchange passed/u);
-  assert.doesNotMatch(result.stdout + result.stderr, /synthetic|cio_tp_/u);
-  const calls = readFileSync(trace, "utf8").trim().split("\n").map(JSON.parse);
-  assert.ok(calls.some((call) => call.url.endsWith("/package/fallow") && call.method === "POST"));
-  assert.ok(
-    calls.some((call) => call.url === "https://crates.io/api/v1/trusted_publishing/tokens"),
-  );
-  assert.ok(
-    calls.every(
-      (call) => !call.url.includes("/publish") || call.url.includes("trusted-publishing/token"),
-    ),
-  );
+  assert.equal(unsupported.status, 1);
+  assert.match(unsupported.stdout, /Unsupported identity check arguments/u);
+  assert.equal(readFileSync(trace, "utf8"), "");
 });
 
 test("npm and crates exchanges validate authority expiration and stop on refusal", async () => {

@@ -123,16 +123,20 @@ context guard regresses. The check runs only on `main` in the protected
 publication jobs skip. The separate check job installs no dependencies and
 reads no package, PAT or signing secret. It requests GitHub identity for
 `https://open-vsx.org`, exchanges it for the fixed `fallow-rs.fallow-vscode`
-extension, and calls the namespace permission GET with Bearer authority.
+extension, and validates the exchange response.
 No registry URL or namespace is supplied by an input. Redirects and refusal
 fail closed, with no PAT fallback and no provider response or token in logs.
 
-The exchange issues short-lived authority at the provider. The permission
-request does not consume that authority or upload a package. A successful
-check proves the binding and namespace publishing permission at that time;
-it does not prove an extension upload or change either active auth mode.
+The exchange issues short-lived authority at the provider without uploading a
+package. A successful check proves the fixed extension identity binding at
+that time. It does not prove current namespace publishing permission or an
+extension upload, or change either active auth mode. The pinned production
+server source has no read-only permission probe usable by this extension-scoped
+token;
+verify publisher membership separately with owner access.
 
-The same fixed diagnostic path checks npm exchange for each package in the
+The same fixed diagnostic path checks npm exchange even if Open VSX fails,
+while the combined result remains a failure. It checks each package in the
 release workflow's exact npm inventory. It uses audience
 `npm:registry.npmjs.org`, requires the documented HTTP 201 OIDC response, and
 checks `created` and `expires` for a future, bounded lifetime. It then requests
