@@ -1344,17 +1344,34 @@ pub(super) fn collect_playwright_fixture_member_uses(
         .collect()
 }
 
-pub(super) fn playwright_extend_base_name(call: &CallExpression<'_>) -> Option<String> {
+/// The object that an `.extend(...)` call extends, or `None` when `call` is not
+/// an `.extend(...)` call.
+fn playwright_extend_receiver<'b, 'a>(call: &'b CallExpression<'a>) -> Option<&'b Expression<'a>> {
     let Expression::StaticMemberExpression(member) = &call.callee else {
         return None;
     };
     if member.property.name != "extend" {
         return None;
     }
-    let Expression::Identifier(base) = &member.object else {
-        return None;
-    };
-    Some(base.name.to_string())
+    Some(&member.object)
+}
+
+/// The `.extend(...)` calls of a chain such as `base.extend<A>({}).extend<B>({})`,
+/// outermost first, and the expression that the innermost call extends. The
+/// root is an identifier (`base`) or a call (`mergeTests(a, b)`, issue #3462).
+/// `None` when `call` is not an `.extend(...)` call.
+pub(super) fn playwright_extend_chain<'b, 'a>(
+    call: &'b CallExpression<'a>,
+) -> Option<(Vec<&'b CallExpression<'a>>, &'b Expression<'a>)> {
+    let mut receiver = playwright_extend_receiver(call)?;
+    let mut calls = vec![call];
+    while let Expression::CallExpression(inner) = receiver
+        && let Some(next) = playwright_extend_receiver(inner)
+    {
+        calls.push(inner);
+        receiver = next;
+    }
+    Some((calls, receiver))
 }
 
 pub(super) fn collect_fixture_type_bindings_from_type(
