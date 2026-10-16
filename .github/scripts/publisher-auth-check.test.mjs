@@ -166,23 +166,34 @@ globalThis.fetch = async (url, options) => {
     return Response.json({value:'e30.'+Buffer.from(JSON.stringify(claims)).toString('base64url')+'.synthetic'});
   }
   if (endpoint.href === 'https://open-vsx.org/api/-/trusted-publishing/token' && options.method === 'POST') return process.env.TEST_REFUSE_OPENVSX === 'true' ? new Response('private provider authority', {status:403}) : Response.json({value:'synthetic-authority'},{status:201});
-  if (endpoint.hostname === 'registry.npmjs.org' && options.method === 'POST' && endpoint.pathname.startsWith('/-/npm/v1/oidc/token/exchange/package/')) return Response.json({token_type:'oidc',token:'synthetic-npm-authority',created:new Date().toISOString(),expires:new Date(Date.now()+3600000).toISOString()},{status:201});
-  if (endpoint.href === 'https://crates.io/api/v1/trusted_publishing/tokens' && options.method === 'POST') return Response.json({token:'cio_tp_'+'a'.repeat(32)});
+  if (endpoint.hostname === 'registry.npmjs.org' && options.method === 'POST' && endpoint.pathname.startsWith('/-/npm/v1/oidc/token/exchange/package/')) return process.env.TEST_REFUSE_NPM === 'true' ? new Response('private provider authority',{status:401}) : Response.json({token_type:'oidc',token:'synthetic-npm-authority',created:new Date().toISOString(),expires:new Date(Date.now()+3600000).toISOString()},{status:201});
+  if (endpoint.href === 'https://crates.io/api/v1/trusted_publishing/tokens' && options.method === 'POST') return process.env.TEST_REFUSE_CRATES === 'true' ? new Response('private provider authority',{status:403}) : Response.json({token:'cio_tp_'+'a'.repeat(32)});
   throw new Error('Unexpected provider route');
 };`,
   );
-  for (const refuseOpenVsx of [false, true]) {
+  for (const [refuseOpenVsx, refuseNpm, refuseCrates] of [
+    [false, false, false],
+    [true, false, false],
+    [false, true, false],
+    [false, false, true],
+  ]) {
     writeFileSync(trace, "");
     const result = spawnSync(
       process.execPath,
       ["--import", hook, ".github/scripts/publisher-auth-check.mjs"],
       {
-        env: { ...process.env, ...env, TEST_REFUSE_OPENVSX: String(refuseOpenVsx) },
+        env: {
+          ...process.env,
+          ...env,
+          TEST_REFUSE_OPENVSX: String(refuseOpenVsx),
+          TEST_REFUSE_NPM: String(refuseNpm),
+          TEST_REFUSE_CRATES: String(refuseCrates),
+        },
         encoding: "utf8",
         timeout: 15_000,
       },
     );
-    assert.equal(result.status, refuseOpenVsx ? 1 : 0, result.stderr);
+    assert.equal(result.status, refuseOpenVsx || refuseNpm || refuseCrates ? 1 : 0, result.stderr);
     assert.match(
       result.stdout,
       refuseOpenVsx
@@ -190,8 +201,18 @@ globalThis.fetch = async (url, options) => {
         : /Open VSX trusted identity exchange passed/u,
     );
     assert.doesNotMatch(result.stdout, /has fixed extension publishing permission/u);
-    assert.match(result.stdout, /npm trusted identity exchanges passed/u);
-    assert.match(result.stdout, /crates.io trusted identity exchange passed/u);
+    assert.match(
+      result.stdout,
+      refuseNpm
+        ? /npm trusted exchange check failed for fallow \(HTTP 401\)/u
+        : /npm trusted identity exchange passed for fallow/u,
+    );
+    assert.match(
+      result.stdout,
+      refuseCrates
+        ? /crates.io trusted exchange check failed for matching configurations \(HTTP 403\)/u
+        : /crates.io trusted identity exchange passed/u,
+    );
     assert.doesNotMatch(result.stdout + result.stderr, /synthetic|cio_tp_|private provider/u);
     const calls = readFileSync(trace, "utf8").trim().split("\n").map(JSON.parse);
     assert.ok(calls.some((call) => call.url.endsWith("/package/fallow") && call.method === "POST"));
@@ -219,7 +240,7 @@ globalThis.fetch = async (url, options) => {
   assert.equal(readFileSync(trace, "utf8"), "");
 });
 
-test("npm and crates exchanges validate authority expiration and stop on refusal", async () => {
+test("npm and crates exchanges validate authority expiration and retain independent outcomes", async () => {
   const now = Date.parse("2026-10-16T12:00:00Z");
   const identity = (audience, expires = now + 600_000) =>
     `e30.${Buffer.from(JSON.stringify({ aud: audience, exp: Math.floor(expires / 1000) })).toString("base64url")}.synthetic`;
@@ -251,7 +272,8 @@ test("npm and crates exchanges validate authority expiration and stop on refusal
     return { result: await verifyOtherRegistryIdentities(env, send, now), calls };
   };
   const success = await run();
-  assert.deepEqual(success.result, { ok: true });
+  assert.equal(success.result.ok, true);
+  assert.ok(success.result.outcomes.every((outcome) => outcome.ok));
   assert.deepEqual(
     success.calls
       .filter((call) => call.url.startsWith("https://registry.npmjs.org/"))
@@ -266,31 +288,131 @@ test("npm and crates exchanges validate authority expiration and stop on refusal
       assert.equal(call.headers.Authorization, `Bearer ${identity("npm:registry.npmjs.org")}`);
     }
   }
-  for (const invalid of [
-    { ...token, expires: new Date(now - 1).toISOString() },
-    { ...token, expires: "invalid" },
-    { ...token, created: "invalid" },
-    { ...token, created: new Date(now + 600_000).toISOString() },
-    { ...token, expires: new Date(now + 86_400_000).toISOString() },
-    { ...token, token_type: "persistent" },
-    { ...token, token: "" },
+  for (const [invalid, stage] of [
+    [{ ...token, expires: new Date(now - 1).toISOString() }, "authority lifetime"],
+    [{ ...token, expires: "invalid" }, "authority timestamp shape"],
+    [{ ...token, created: "invalid" }, "authority timestamp shape"],
+    [{ ...token, created: new Date(now + 600_000).toISOString() }, "authority lifetime"],
+    [{ ...token, expires: new Date(now + 86_400_000).toISOString() }, "authority lifetime"],
+    [{ ...token, token_type: "persistent" }, "authority token type"],
+    [{ ...token, token: "" }, "authority token shape"],
+    [{ ...token, token: "secret\r\n::error::private" }, "authority token shape"],
   ]) {
     const refused = await run(invalid);
     assert.equal(refused.result.ok, false);
-    assert.equal(refused.calls.length, 2);
-    assert.doesNotMatch(JSON.stringify(refused.result), /synthetic/u);
+    assert.equal(
+      refused.calls.filter((call) => new URL(call.url).hostname === "registry.npmjs.org").length,
+      NPM_PACKAGES.length,
+    );
+    assert.equal(refused.result.outcomes.at(-1).ok, true);
+    assert.ok(refused.result.outcomes[0].error.includes(` ${stage} check failed`));
+    assert.doesNotMatch(JSON.stringify(refused.result), /synthetic|secret|private/u);
   }
-  for (const invalid of [
-    identity("wrong-audience"),
-    identity("npm:registry.npmjs.org", now - 1),
-    "not-a-jwt",
+  for (const [invalid, stage] of [
+    [identity("wrong-audience"), "identity audience"],
+    [identity("npm:registry.npmjs.org", now - 1), "identity lifetime"],
+    ["not-a-jwt", "identity claims"],
+    [
+      `e30.${Buffer.from(JSON.stringify({ aud: "npm:registry.npmjs.org", exp: "private" })).toString("base64url")}.synthetic`,
+      "identity expiration shape",
+    ],
   ]) {
     const refused = await run(null, invalid);
     assert.equal(refused.result.ok, false);
-    assert.equal(refused.calls.length, 1);
+    assert.ok(
+      refused.calls.every(
+        (call) => new URL(call.url).hostname === "vstoken.actions.githubusercontent.com",
+      ),
+    );
+    assert.ok(refused.result.outcomes.every((outcome) => !outcome.ok));
+    assert.ok(refused.result.outcomes[0].error.includes(` ${stage} check failed`));
   }
   const cratesRefusal = await run(null, null, true);
   assert.equal(cratesRefusal.result.ok, false);
-  assert.match(cratesRefusal.result.error, /crates.io trusted identity exchange failed/u);
-  assert.doesNotMatch(cratesRefusal.result.error, /secret provider/u);
+  assert.match(
+    cratesRefusal.result.outcomes.at(-1).error,
+    /crates.io trusted exchange check failed for matching configurations \(HTTP 403\)/u,
+  );
+  assert.doesNotMatch(JSON.stringify(cratesRefusal.result), /secret provider/u);
+});
+
+test("npm uses official escapedName wire paths and continues after refusal through crates", async () => {
+  const now = Date.parse("2026-10-16T12:00:00Z");
+  const calls = [];
+  const send = async (url, options) => {
+    const endpoint = new URL(url);
+    calls.push(endpoint.href);
+    if (endpoint.hostname === "vstoken.actions.githubusercontent.com") {
+      const claims = { aud: endpoint.searchParams.get("audience"), exp: now / 1000 + 600 };
+      return Response.json({
+        value: `e30.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.synthetic`,
+      });
+    }
+    if (endpoint.hostname === "registry.npmjs.org") {
+      assert.equal(options.method, "POST");
+      return new Response("private provider authority", { status: 401 });
+    }
+    assert.equal(endpoint.href, "https://crates.io/api/v1/trusted_publishing/tokens");
+    return Response.json({ token: `cio_tp_${"a".repeat(32)}` });
+  };
+  const result = await verifyOtherRegistryIdentities(env, send, now);
+  assert.equal(result.ok, false);
+  assert.equal(
+    calls.filter((call) => call.startsWith("https://registry.npmjs.org/")).length,
+    NPM_PACKAGES.length,
+  );
+  assert.deepEqual(
+    calls.filter((call) => call.startsWith("https://registry.npmjs.org/")),
+    NPM_PACKAGES.map(
+      (name) =>
+        `https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/${name.replace("/", "%2f")}`,
+    ),
+  );
+  assert.ok(calls.includes("https://crates.io/api/v1/trusted_publishing/tokens"));
+  assert.match(
+    result.outcomes[0].error,
+    /npm trusted exchange check failed for @fallow-cli\/darwin-arm64 \(HTTP 401\)/u,
+  );
+  assert.equal(result.outcomes.at(-1).ok, true);
+  assert.doesNotMatch(JSON.stringify(result), /private provider|synthetic|cio_tp_/u);
+});
+
+test("registry diagnostics identify fixed stages without reflecting provider content", async () => {
+  const now = Date.parse("2026-10-16T12:00:00Z");
+  for (const [failure, expected] of [
+    ["identity-http", "GitHub identity request"],
+    ["claims", "identity claims"],
+    ["exchange-http", "trusted exchange"],
+    ["authority", "authority token shape"],
+  ]) {
+    const send = async (url) => {
+      const endpoint = new URL(url);
+      if (endpoint.hostname === "vstoken.actions.githubusercontent.com") {
+        if (failure === "identity-http") return new Response("private provider", { status: 403 });
+        const claims = { aud: endpoint.searchParams.get("audience"), exp: now / 1000 + 600 };
+        return Response.json({
+          value:
+            failure === "claims"
+              ? "private-provider"
+              : `e30.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.synthetic`,
+        });
+      }
+      if (failure === "exchange-http") return new Response("private provider", { status: 401 });
+      return Response.json(
+        { token: "" },
+        { status: endpoint.hostname === "registry.npmjs.org" ? 201 : 200 },
+      );
+    };
+    const result = await verifyOtherRegistryIdentities(env, send, now);
+    assert.equal(result.ok, false);
+    for (const outcome of result.outcomes) {
+      assert.equal(outcome.ok, false);
+      assert.ok(outcome.error.includes(` ${expected} check failed for `));
+      assert.match(outcome.error, failure.endsWith("http") ? /\(HTTP (401|403)\)$/u : /[^)]$/u);
+    }
+    assert.doesNotMatch(
+      JSON.stringify(result),
+      /private provider|private-provider|synthetic|cio_tp_|2026/u,
+    );
+  }
 });

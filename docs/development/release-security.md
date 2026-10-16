@@ -139,8 +139,10 @@ The same fixed diagnostic path checks npm exchange even if Open VSX fails,
 while the combined result remains a failure. It checks each package in the
 release workflow's exact npm inventory. It uses audience
 `npm:registry.npmjs.org`, requires the documented HTTP 201 OIDC response, and
-checks `created` and `expires` for a future, bounded lifetime. It then requests
-`crates.io` identity and performs one token-only exchange. Both identities
+checks `created` and `expires` for a future, bounded lifetime. Every fixed npm
+package is checked independently. The check requests `crates.io` identity and
+performs one token-only exchange even if npm fails. Failures report only the
+fixed package, request stage and HTTP status, without provider content. Both identities
 must have the expected audience and a valid, bounded expiration before they
 reach a registry. Requests have fixed timeouts and refuse redirects. No
 package bytes, versions, upload, staging call or version reservation are sent.
