@@ -101,11 +101,37 @@ invariants in this file.
    organization directory reconnection or end-user login change is a release
    prerequisite for the prepared Entra workflow.
 
+   Dispatch the identity checks only when one of these changed since the
+   previous release:
+
+   - a publisher binding, for example publisher membership or a profile role;
+   - a trusted-publisher configuration on npm, crates.io, Marketplace, or
+     Open VSX;
+   - an environment secret or variable of the `release` environment;
+   - a release credential, for example a PAT rotation or a signing-key
+     transfer.
+
+   Also dispatch them when the previous release run had an authentication
+   failure. Otherwise, skip both checks. The identity checks are the
+   `release.yml` run with `auth_check=true`, `tag=auth-check`, and
+   `pgo=false`, and the `verify-marketplace-identity.yml` run:
+
+   ```bash
+   gh workflow run release.yml --ref main \
+     -f auth_check=true -f tag=auth-check -f pgo=false
+   ```
+
+   A waiting `auth_check` run holds the `release` concurrency group. A release
+   dispatch then waits behind it and does not start. Thus, approve or cancel it
+   before the publication dispatch.
+
 4. Derive the semantic-version bump from every commit since the prior release
    unless the user supplied an explicit bump. Confirm a major bump before
    mutating versions unless the user explicitly requested it.
 5. Dispatch the reusable release-validation workflow against `main` and require
    a completed successful result before changing versions or creating a tag.
+   It includes the similar-code sidecar dependency audit, so a new upstream
+   advisory fails here and not after the release dispatch.
 
 ## Prepare
 
@@ -274,8 +300,15 @@ invariants in this file.
     rerun that failed check after the companion update. No failed check is
     waived. Require all companion-repository checks from step 9 to pass.
 
-    Wait for all release-required push workflows on the actual release SHA:
-    `node scripts/verify-release-ci.mjs --sha "$RELEASE_COMMIT"`.
+    Wait for all release-required workflows on the actual release SHA:
+    `node scripts/verify-release-ci.mjs --sha "$RELEASE_COMMIT" --dispatch-missing`.
+    Path filters can skip some workflows on a release commit, for example the
+    benchmarks, fuzz, cross-architecture, ecosystem, and protocol parity
+    workflows. With `--dispatch-missing`, the script starts each workflow
+    that has no run once with `gh workflow run <file> --ref main`, and then
+    waits for it. It refuses to start runs when `main` on GitHub is not the
+    release commit. Locally, the token comes from `gh auth token` and the
+    repository from the `origin` remote.
     While `origin/main` is still that SHA and the version tag remains absent,
     dispatch the release workflow from `main` with the planned tag:
 
@@ -340,7 +373,8 @@ invariants in this file.
     - A missing run: a path filter did not match the release commit, or the
       run did not start. When the workflow has a `workflow_dispatch`
       trigger, and `origin/main` is still the release commit, start it with
-      `gh workflow run <file> --ref main`. Then dispatch the release again.
+      `gh workflow run <file> --ref main`, or run the local gate with
+      `--dispatch-missing`. Then dispatch the release again.
       `ci.yml` and `commitlint.yml` have no `workflow_dispatch` trigger. For
       these, prepare a new signed release commit on a branch and use the
       protected pull request and squash-merge flow above. The error line
@@ -371,10 +405,14 @@ invariants in this file.
     the exception: the workflow stages it and step 11 approves it. The VS Code release is
     published by separate Marketplace and Open VSX jobs. A credential-free
     public verifier checks every exact target before the final release gate.
-11. The run pauses once, in `Wait for the approved fallow root`, and the
-    maintainer approval is what lets it continue. Monitor the run until the
-    `Publish to npm` job has completed successfully; the crates publish in
-    parallel and the wait job is then running.
+11. The run pauses once, for the npm approval, and the maintainer approval is
+    what lets it continue. One review of the `release` environment starts
+    `Publish to npm`, `Publish Rust crates`, and both VSIX publishers
+    together. Monitor the run until the `Publish to npm` job has completed
+    successfully; the crates publish in parallel. The job
+    `Wait for the approved fallow root` and the first step of each VSIX
+    publisher are then running. If `Publish to npm` fails, the VSIX
+    publishers keep waiting. Cancel the run, then rerun its failed jobs.
 
     The workflow stages the `fallow` npm root instead of publishing it. Its
     trusted publisher grants stage publish only, so the version becomes
@@ -410,9 +448,10 @@ invariants in this file.
     recovery is a rerun of the `Publish to npm` job, which skips every package
     that already landed. The version tag remains available for the recovered run.
 
-    After the approval the wait job downloads the public tarball, requires its
-    sha256 to equal the digest `Publish to npm` recorded, and releases both VSIX
-    publishers; a public tarball with other bytes fails the run instead. The
+    After the approval the wait job and each VSIX publisher download the public
+    tarball and require its sha256 to equal the digest of the staged tarball.
+    Only then does a VSIX publisher upload; a public tarball with other bytes
+    fails the run instead. The
     wait gives up after a bounded time with the recovery in its message:
     approve, then rerun the failed jobs of the same run. Monitor the run through
     `status=completed` and `conclusion=success`; a successful watch command
