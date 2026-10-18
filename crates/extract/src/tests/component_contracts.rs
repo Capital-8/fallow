@@ -393,3 +393,74 @@ fn template_alias_target_is_retained() {
         "{facts:?}"
     );
 }
+
+#[test]
+fn component_contract_text_less_than_keeps_later_invocations() {
+    for (path, source) in [
+        (
+            "View.vue",
+            "<script setup>import Button from './Button.vue';</script><template><p>{{ a < b }}<Button size=\"lg\" /></p></template>",
+        ),
+        (
+            "View.vue",
+            "<script setup>import Button from './Button.vue';</script><template><p>{{ a<b }}<Button size=\"lg\" /></p></template>",
+        ),
+        (
+            "View.svelte",
+            "<script>import Button from './Button.svelte';</script><p>{a < b}<Button size=\"lg\" /></p>",
+        ),
+        (
+            "View.svelte",
+            "<script>import Button from './Button.svelte';</script><p>{a<b}<Button size=\"lg\" /></p>",
+        ),
+        (
+            "View.svelte",
+            "<script>import Button from './Button.svelte';</script>{#if a<b}<Button size=\"lg\" />{/if}",
+        ),
+        (
+            "main.gts",
+            "import Button from './Button';<template>{{!-- don't render <Card /> --}}<p>{{if (lt a b) 'x'}}</p><Button @size=\"lg\" />{{! won't }}</template>",
+        ),
+    ] {
+        let info = parse_at_path(path, source);
+        let facts = info.component_contracts.as_deref().expect("contracts");
+        let caller = facts
+            .invocations
+            .iter()
+            .find(|caller| {
+                matches!(&caller.target, ComponentReference::Import { local, .. } if local == "Button")
+            })
+            .unwrap_or_else(|| panic!("Button invocation in {source}: {facts:?}"));
+        assert_eq!(caller.supplied, ["size"], "{source}");
+        assert!(
+            facts.incomplete_frameworks.is_empty(),
+            "{source}: {facts:?}"
+        );
+    }
+
+    let info = parse_at_path(
+        "view.component.html",
+        "<p>{{ a<b }}<app-button size=\"lg\"></app-button></p>",
+    );
+    let facts = info.component_contracts.as_deref().expect("contracts");
+    assert!(
+        facts
+            .invocations
+            .iter()
+            .any(|caller| caller.target == ComponentReference::Selector("app-button".into())),
+        "{facts:?}"
+    );
+}
+
+#[test]
+fn component_contract_glimmer_arg_tag_keeps_attribute_escapes() {
+    let source = "import Card from './Card';import Child from 'external-renderer';<template><@slot @renderer={{Card}} /><Child /></template>";
+    let info = parse_at_path("main.gts", source);
+    let facts = info.component_contracts.as_deref().unwrap();
+    assert!(
+        facts.escapes.iter().any(
+            |target| matches!(target, ComponentReference::Import { local, .. } if local == "Card")
+        ),
+        "{facts:?}"
+    );
+}
