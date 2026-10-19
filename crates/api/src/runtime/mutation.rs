@@ -38,12 +38,14 @@ use crate::mutation::run_dir::{RunFile, write_run_dir};
 use crate::mutation::runner_select::{Runner, select_runner};
 use crate::mutation::scheduler::{
     ResultLookup, ScheduleConfig, ScheduleError, ScheduleIssue, ScheduleOutcome, SchedulePlan,
-    ScheduledMutant, run_schedule,
+    ScheduledMutant, run_schedule_with_progress,
 };
 use crate::mutation::transport::ProcessSpawner;
 use crate::mutation::typecheck::typecheck_survivors;
 use crate::mutation::worktree::{Exclusions, WorktreeSnapshot, canonical_path, snapshot};
-use crate::mutation::{MutationRunOptions, MutationRunScope};
+use crate::mutation::{
+    MutationProgress, MutationProgressSink, MutationRunOptions, MutationRunScope,
+};
 
 type ProgrammaticResult<T> = Result<T, ProgrammaticError>;
 
@@ -208,6 +210,70 @@ struct Planned {
     runner: Runner,
     plan: MutationPlan,
     base_ref: Option<String>,
+    /// The selected runner config file, relative to the project root.
+    runner_config: Option<String>,
+}
+
+/// The selected runner config: the caller option, else the
+/// `mutation.runnerConfig` config key. The result is relative to the project
+/// root, with `/` separators, as the companion resolves it against the root.
+///
+/// # Errors
+///
+/// Returns an exit-2 error when the file does not exist, is not a file, is
+/// outside the project root, or when the runner reads no config file.
+fn runner_config(
+    options: &MutationRunOptions,
+    session: &AnalysisSession,
+    root: &Path,
+    runner: Runner,
+) -> ProgrammaticResult<Option<String>> {
+    let Some(raw) = options.runner_config.clone().or_else(|| {
+        session
+            .config()
+            .mutation
+            .runner_config
+            .as_ref()
+            .map(PathBuf::from)
+    }) else {
+        return Ok(None);
+    };
+    let invalid = |message: String| {
+        mutation_error("FALLOW_INVALID_MUTATION_OPTIONS", message)
+            .with_context("mutation.runnerConfig")
+    };
+    let shown = raw.display();
+    if runner != Runner::Vitest {
+        return Err(invalid(format!(
+            "the runner config `{shown}` needs the Vitest runner, but the run uses `{}`; only Vitest reads a config file",
+            runner.name()
+        )));
+    }
+    let candidate = if raw.is_absolute() {
+        raw.clone()
+    } else {
+        root.join(&raw)
+    };
+    if !candidate.is_file() {
+        return Err(invalid(format!(
+            "the runner config `{shown}` is not a file; a relative path is relative to the project root"
+        )));
+    }
+    let root = canonical_path(root);
+    let file = canonical_path(&candidate);
+    let Ok(relative) = file.strip_prefix(&root) else {
+        return Err(invalid(format!(
+            "the runner config `{shown}` is outside the project root `{}`",
+            root.display()
+        )));
+    };
+    Ok(Some(
+        relative
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/"),
+    ))
 }
 
 fn plan_for(
@@ -246,12 +312,14 @@ fn plan_for(
         .map_err(|error| mutation_error("FALLOW_MUTATION_PLAN_FAILED", error.to_string()))?;
     let runner =
         selected.unwrap_or_else(|| select_runner(configured, resolved.root(), &plan.test_files));
+    let runner_config = runner_config(options, &session, resolved.root(), runner)?;
     Ok(Planned {
         resolved,
         cache_dir,
         runner,
         plan,
         base_ref,
+        runner_config,
     })
 }
 
@@ -556,16 +624,22 @@ fn open_result_cache(
     mutation_cache: &Path,
     root: &Path,
     runner: &str,
-    plan: &MutationPlan,
+    files: KeyFiles,
 ) -> Option<Arc<ResultCache>> {
-    (!no_cache).then(|| {
-        Arc::new(ResultCache::open(
-            mutation_cache,
-            root,
-            runner,
-            KeyFiles::from_plan(plan),
-        ))
-    })
+    (!no_cache).then(|| Arc::new(ResultCache::open(mutation_cache, root, runner, files)))
+}
+
+/// The key files of the result cache. A selected runner config file is a
+/// support file of the key, so a result of one config content is never the
+/// result of another.
+fn key_files(plan: &MutationPlan, runner_config: Option<&str>) -> KeyFiles {
+    let mut files = KeyFiles::from_plan(plan);
+    if let Some(config) = runner_config
+        && !files.support_files.iter().any(|file| file == config)
+    {
+        files.support_files.push(config.to_owned());
+    }
+    files
 }
 
 /// Stores the new results of `outcome` in `cache` and writes the cache file.
@@ -605,6 +679,7 @@ fn execute(
     options: &MutationRunOptions,
     planned: &Planned,
     deadline: Option<Instant>,
+    progress: MutationProgressSink<'_>,
 ) -> ProgrammaticResult<Execution> {
     let plan = &planned.plan;
     let schedule = schedule_plan(plan);
@@ -620,6 +695,9 @@ fn execute(
             setup_ms: 0,
         });
     }
+    progress(MutationProgress::Setup {
+        mutants: schedule.mutants.len(),
+    });
     let setup_started = Instant::now();
     let manifest = manifest()
         .map_err(|message| mutation_error("FALLOW_MUTATION_PROTOCOL_INVALID", message))?;
@@ -650,12 +728,13 @@ fn execute(
     let run_dir = write_run_dir(&mutation_cache, &files, Some(&companion)).map_err(cache_error)?;
     let resolved = &planned.resolved;
     let root = resolved.root().to_path_buf();
-    let result_cache = open_result_cache(resolved.no_cache, &mutation_cache, &root, name, plan);
+    let files = key_files(plan, planned.runner_config.as_deref());
+    let result_cache = open_result_cache(resolved.no_cache, &mutation_cache, &root, name, files);
     let config = ScheduleConfig {
         init: InitRequest {
             root: root.to_string_lossy().into_owned(),
             runner: name.to_owned(),
-            config_path: None,
+            config_path: planned.runner_config.clone(),
             run_dir: run_dir.dir.to_string_lossy().into_owned(),
             path_map: run_dir.path_map.clone(),
             options: init_options(runner, &root),
@@ -676,7 +755,7 @@ fn execute(
         session_token_env: manifest.session_token_env.clone(),
     };
     let setup_ms = millis(setup_started.elapsed());
-    let mut outcome = run_schedule(&spawner, &schedule, &config)
+    let mut outcome = run_schedule_with_progress(&spawner, &schedule, &config, progress)
         .map_err(|error| schedule_error(&error, &config.runner, config.runner_timeout))?;
     let runner = outcome.ready.as_ref().map(|ready| MutationRunnerOutput {
         name: name.to_owned(),
@@ -765,6 +844,22 @@ fn guard_typecheck_companion(enabled: bool, root: &Path) -> ProgrammaticResult<(
 /// companion file that changed after install, or a test suite that fails
 /// with no active mutant outside each test file.
 pub fn run_mutation(options: &MutationRunOptions) -> ProgrammaticResult<MutationReport> {
+    run_mutation_with_progress(options, &|_| {})
+}
+
+/// [`run_mutation`] that sends a [`MutationProgress`] event at the start of
+/// each run phase and after each finished mutant.
+///
+/// The events arrive on the calling thread and on the scheduler worker
+/// threads. A sink must return quickly, because a worker waits for it.
+///
+/// # Errors
+///
+/// Returns the same errors as [`run_mutation`].
+pub fn run_mutation_with_progress(
+    options: &MutationRunOptions,
+    progress: MutationProgressSink<'_>,
+) -> ProgrammaticResult<MutationReport> {
     let started = Instant::now();
     let deadline = options.time_budget.map(|budget| started + budget);
     let mut start_snapshot = None;
@@ -776,7 +871,8 @@ pub fn run_mutation(options: &MutationRunOptions) -> ProgrammaticResult<Mutation
     guard_cache_holds_no_planned_file(planned.resolved.root(), &planned.cache_dir, &planned.plan)?;
     guard_typecheck_companion(options.typecheck, planned.resolved.root())?;
     let plan_ms = millis(started.elapsed());
-    let execution = execute(options, &planned, deadline);
+    let execution = execute(options, &planned, deadline, progress);
+    progress(MutationProgress::Finalize);
     let worktree_end = settle_worktree(start_snapshot.as_ref(), |start| {
         take_worktree_snapshot(
             planned.resolved.root(),
@@ -809,6 +905,8 @@ pub fn run_mutation(options: &MutationRunOptions) -> ProgrammaticResult<Mutation
         worktree_unchecked: check_error.is_some(),
         unretried: outcome.is_some_and(|outcome| !outcome.unretried.is_empty()),
         unloaded_paths: outcome.map_or(&[], |outcome| outcome.unloaded_paths.as_slice()),
+        undiscovered_test_files: outcome
+            .map_or(&[], |outcome| outcome.undiscovered_test_files.as_slice()),
         typecheck_failed: typecheck.issue.is_some(),
         promoted: outcome.map_or(&[], |outcome| outcome.promoted.as_slice()),
     });
@@ -1033,8 +1131,26 @@ mod tests {
             skipped_files: Vec::new(),
             unmatched_paths: Vec::new(),
         };
-        assert!(open_result_cache(true, dir.path(), dir.path(), "vitest", &plan).is_none());
-        assert!(open_result_cache(false, dir.path(), dir.path(), "vitest", &plan).is_some());
+        assert!(
+            open_result_cache(
+                true,
+                dir.path(),
+                dir.path(),
+                "vitest",
+                KeyFiles::from_plan(&plan)
+            )
+            .is_none()
+        );
+        assert!(
+            open_result_cache(
+                false,
+                dir.path(),
+                dir.path(),
+                "vitest",
+                KeyFiles::from_plan(&plan)
+            )
+            .is_some()
+        );
     }
 
     fn empty_plan() -> MutationPlan {

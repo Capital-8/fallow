@@ -24,7 +24,7 @@ read-only next steps. It never writes a test and never proposes a code change.
   because the plan cannot narrow to a workspace yet. Pass the workspace
   directory as a path.
 - The run flags are `--max-mutants`, `--time-budget` (`90s`, `10m`, `1h`),
-  `--setup-timeout` (default `2m`),
+  `--setup-timeout` (default `2m`), `--runner-config`,
   `--concurrency`, `--runtime`, `--allow-dirty`, `--allow-side-effects`,
   `--min-score`, `--operators`, `--verdicts` and `--typecheck`. The global
   `--no-cache` flag also turns off the result cache (see "Result cache").
@@ -262,6 +262,15 @@ shows as `pending`.
   `mutation.minScore` use percent.
 - Only `completion.status: "complete"` makes an empty survivor list
   conclusive.
+- The runner can leave out a static test file, for example a test that only
+  a second Vitest config includes. The tests of that file never run. The
+  `errors` entry `test-files-not-discovered` names each such file, and the
+  completion is `partial` (`test-files-not-discovered`). A survivor or a
+  `no_coverage` mutant that such a file reaches is then not proof of a
+  test gap.
+- A `partial` completion does not change the exit code. The run exits `0`,
+  or `1` when the score is under `--min-score`, or `2` when baseline
+  failures leave each mutant without a test result (see Exit codes).
 
 ## Retries
 
@@ -533,6 +542,31 @@ the exclusion removes stays a test entry point when another glob matches it.
 The parser does not read a `.borp.yaml` file. A project that sets its test
 files in `.borp.yaml` and runs a bare `borp` command gets the default glob.
 
+### Runner config
+
+`--runner-config <path>` (or the `mutation.runnerConfig` config key) selects
+the config file of the test runner. Use it for a project that keeps its
+integration, UI or browser tests in a separate Vitest config, for example:
+
+```bash
+fallow mutation src/math.ts --runner-config vitest.integration.config.mjs
+```
+
+- The flag wins over the config key. `--config` is not this flag: it selects
+  the Fallow config.
+- A relative flag path resolves against the project root, then against the
+  current directory. A relative config key path resolves against the project
+  root.
+- The file must exist inside the project root. Otherwise the run exits with
+  code 2, `FALLOW_INVALID_MUTATION_OPTIONS` and the context
+  `mutation.runnerConfig`.
+- Only the Vitest adapter reads a config file. With the `node-test` or
+  `bun-test` runner, a selected config exits with code 2.
+- Without a selection, Vitest finds its config the usual way.
+- The selected config sets the test files that Vitest lists. A static test
+  file of the plan that the selected config does not include stays visible as
+  a `test-files-not-discovered` error, and the run is `partial`.
+
 `--runtime` must name a runtime that the runner accepts. A Bun runtime for
 `node-test`, or a Node runtime for `bun-test`, exits with code 2 and
 `FALLOW_MUTATION_RUNTIME_NOT_FOUND`.
@@ -672,7 +706,9 @@ The key hashes these parts:
   (`vitest.config.*`, `vite.config.*` and `vitest.workspace.*`), and of the
   files that they reach through static imports (`MutationPlan::support_files`).
   A change to a config fragment that the runner config imports changes the
-  key;
+  key. A runner config that `--runner-config` or `mutation.runnerConfig`
+  selects is a support file too, so a change to it changes the key. The key
+  does not hash the files that a selected config imports;
 - the lockfiles of the first directory from the root upward that has one;
 - the runner config files at the root: `vitest.config.*`, `vite.config.*`,
   `vitest.workspace.*`, `bunfig.toml`, `package.json` and `tsconfig.json`. An
@@ -869,6 +905,25 @@ reads files only. It runs no test.
   output formats (SARIF, CodeClimate, markdown, compact) do not show it.
 - The score uses the final statuses after the retries (see Retries).
 
+## Progress
+
+- A run with human output and no `--quiet` prints phase lines on stderr.
+  Each line starts with `fallow: mutation:` and ends with the run time, for
+  example `fallow: mutation: 8/20 mutants done (1m25s)`.
+- The phases are the runner setup, the baseline run, the mutant runs, the
+  retries of survivors and timeouts, and the final worktree check and
+  report. A run with no covered mutant and no test file prints only the
+  final phase.
+- The start of each phase prints at once. A mutant count prints at most
+  once in each interval and at the end of its phase. A phase that prints
+  nothing for one interval prints a line that says it continues. The
+  interval is 5 seconds on a terminal and 15 seconds in captured output.
+- `--format json` and `--quiet` print no progress lines. Stdout never gets
+  a progress line.
+- `fallow_api::run_mutation_with_progress` sends the same phases as
+  `fallow_api::MutationProgress` events to a caller of the programmatic
+  API.
+
 ## Human output
 
 - The output uses the section headers and colors of the other commands.
@@ -938,7 +993,8 @@ reads files only. It runs no test.
     "operators": ["arithmetic-operator", "relational-operator"],
     "minScore": 80,
     "concurrency": 4,
-    "typecheck": true
+    "typecheck": true,
+    "runnerConfig": "vitest.integration.config.mjs"
   }
 }
 ```
@@ -946,6 +1002,8 @@ reads files only. It runs no test.
 - `runner` is `auto`, `vitest`, `node-test` or `bun-test`. See
   [Runners](#runners).
 - `operators`, `minScore` and `concurrency` apply to each run. A CLI flag wins.
+- `runnerConfig` selects the runner config file for each run.
+  `--runner-config` wins. See [Runner config](#runner-config).
 - `typecheck: true` turns on the survivor type check for each run.
   `--typecheck` turns it on for one run. No flag turns it off.
 - The section has no source globs and no timeout keys. `MutationRunOptions`

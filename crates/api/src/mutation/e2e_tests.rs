@@ -2,7 +2,7 @@ use std::fs;
 use std::process::Command;
 
 use fallow_engine::changed_files::clear_ambient_git_env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::mutation::{MutationRunOptions, MutationRunScope};
@@ -367,6 +367,55 @@ fn invalid_limits_are_refused() {
     assert_eq!(
         plan_mutation(&budget).unwrap_err().code.as_deref(),
         Some("FALLOW_INVALID_MUTATION_OPTIONS")
+    );
+}
+
+#[test]
+fn a_runner_config_must_be_a_vitest_file_inside_the_root() {
+    let project = small_project();
+    let root = project.path();
+    fs::write(
+        root.join("vitest.integration.config.mjs"),
+        "export default {};\n",
+    )
+    .expect("write");
+    let outside = tempfile::tempdir().expect("dir");
+    fs::write(
+        outside.path().join("vitest.config.mjs"),
+        "export default {};\n",
+    )
+    .expect("write");
+    let refused = |runner_config: PathBuf| {
+        let mut plan = options(root, MutationRunScope::All);
+        plan.runner_config = Some(runner_config);
+        let error = plan_mutation(&plan).unwrap_err();
+        assert_eq!(
+            error.code.as_deref(),
+            Some("FALLOW_INVALID_MUTATION_OPTIONS")
+        );
+        assert_eq!(error.context.as_deref(), Some("mutation.runnerConfig"));
+        error.message
+    };
+    assert!(refused(PathBuf::from("vitest.missing.config.mjs")).contains("is not a file"));
+    assert!(refused(PathBuf::from("src")).contains("is not a file"));
+    assert!(refused(outside.path().join("vitest.config.mjs")).contains("outside the project root"));
+
+    let mut plan = options(root, MutationRunScope::All);
+    plan.runner_config = Some(PathBuf::from("vitest.integration.config.mjs"));
+    plan_mutation(&plan).expect("a Vitest config inside the root is valid");
+
+    // The config key selects the file too, and only Vitest reads one.
+    fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"mutation":{"runner":"node-test","runnerConfig":"vitest.integration.config.mjs"}}"#,
+    )
+    .expect("write");
+    let error = plan_mutation(&options(root, MutationRunScope::All)).unwrap_err();
+    assert_eq!(error.context.as_deref(), Some("mutation.runnerConfig"));
+    assert!(
+        error.message.contains("needs the Vitest runner"),
+        "{}",
+        error.message
     );
 }
 
@@ -869,5 +918,205 @@ mod end_to_end {
         assert_eq!(runner.name, "bun-test");
         assert_eq!(runner.runtime.name, "bun");
         assert_math_statuses(&report);
+    }
+
+    /// The fixture of #3596: the root Vitest config includes only the unit
+    /// test, and a second config includes the integration test. The runner
+    /// does not list the integration test, so its tests never run.
+    fn two_config_project(package: &Path, root_include: &str) -> (tempfile::TempDir, PathBuf) {
+        let project = tempfile::tempdir().expect("dir");
+        let root = dunce::canonicalize(project.path()).expect("root");
+        let files = [
+            (
+                "package.json",
+                r#"{"name":"mutation-discovery-repro","private":true,"type":"module","scripts":{"test":"vitest run","test:integration":"vitest run --config vitest.integration.config.mjs"},"devDependencies":{"vitest":"5.0.4"}}"#
+                    .to_owned(),
+            ),
+            (
+                "src/math.ts",
+                "export const add = (a: number, b: number): number => a + b;\n".to_owned(),
+            ),
+            (
+                "test/unit.test.ts",
+                "import { expect, test } from \"vitest\";\nimport { add } from \"../src/math\";\ntest(\"nonnegative\", () => { expect(add(2, 2)).toBeGreaterThanOrEqual(0); });\n"
+                    .to_owned(),
+            ),
+            (
+                "test/integration.test.ts",
+                "import { expect, test } from \"vitest\";\nimport { add } from \"../src/math\";\ntest(\"adds exactly\", () => { expect(add(2, 2)).toBe(4); });\n"
+                    .to_owned(),
+            ),
+            (
+                "vitest.config.mjs",
+                format!("export default {{ test: {{ include: [\"{root_include}\"] }} }};\n"),
+            ),
+            (
+                "vitest.integration.config.mjs",
+                "export default { test: { include: [\"test/integration.test.ts\"] } };\n"
+                    .to_owned(),
+            ),
+            (".gitignore", "node_modules\n".to_owned()),
+        ];
+        for (file, content) in files {
+            let target = root.join(file);
+            fs::create_dir_all(target.parent().expect("parent")).expect("dir");
+            fs::write(&target, content).expect("write");
+        }
+        fs::create_dir_all(root.join("node_modules")).expect("dir");
+        std::os::unix::fs::symlink(
+            package.join("node_modules/vitest"),
+            root.join("node_modules/vitest"),
+        )
+        .expect("symlink");
+        commit_all(&root);
+        (project, root)
+    }
+
+    fn arithmetic_run(root: &Path) -> fallow_output::MutationReport {
+        let mut run = options(
+            root,
+            MutationRunScope::Paths(vec![PathBuf::from("src/math.ts")]),
+        );
+        run.operators = Some(vec![fallow_engine::mutation::Operator::ArithmeticOperator]);
+        run_mutation(&run).expect("the run completes")
+    }
+
+    fn has_discovery_error(report: &fallow_output::MutationReport) -> bool {
+        report.errors.iter().any(|error| {
+            error.code == "test-files-not-discovered"
+                && error.message.contains("test/integration.test.ts")
+        })
+    }
+
+    #[test]
+    fn a_test_file_that_vitest_does_not_list_makes_the_run_partial() {
+        use fallow_output::MutationIncompleteReason;
+        let Some(package) = companion_fixture() else {
+            return;
+        };
+        let (_project, root) = two_config_project(&package, "test/unit.test.ts");
+        let report = arithmetic_run(&root);
+        assert!(has_discovery_error(&report), "{:#?}", report.errors);
+        assert!(
+            report
+                .mutants
+                .iter()
+                .any(|mutant| mutant.status == MutantStatus::Survived),
+            "{:#?}",
+            report.mutants
+        );
+        assert_eq!(report.completion.status, MutationCompletionStatus::Partial);
+        assert_eq!(
+            report.completion.reasons,
+            vec![MutationIncompleteReason::TestFilesNotDiscovered]
+        );
+
+        // No listed test reaches the mutant, so the survivor list is empty.
+        // The list is still not conclusive.
+        let (_project, root) = two_config_project(&package, "test/missing.test.ts");
+        let report = arithmetic_run(&root);
+        assert!(has_discovery_error(&report), "{:#?}", report.errors);
+        assert!(
+            report
+                .mutants
+                .iter()
+                .all(|mutant| mutant.status == MutantStatus::NoCoverage),
+            "{:#?}",
+            report.mutants
+        );
+        assert_eq!(report.completion.status, MutationCompletionStatus::Partial);
+        assert_eq!(
+            report.completion.reasons,
+            vec![MutationIncompleteReason::TestFilesNotDiscovered]
+        );
+
+        // The control: the root config lists both tests, and the run is
+        // complete.
+        let (_project, root) = two_config_project(&package, "test/*.test.ts");
+        let report = arithmetic_run(&root);
+        assert!(!has_discovery_error(&report), "{:#?}", report.errors);
+        assert_eq!(
+            report.completion.status,
+            MutationCompletionStatus::Complete,
+            "{report:#?}"
+        );
+    }
+
+    /// #3598: `runner_config` selects the integration config of the #3596
+    /// fixture. Its exact test kills the arithmetic mutant that the unit
+    /// test of the root config lets survive. The unit test is not in the
+    /// selected config, so the report still names it as not discovered.
+    #[test]
+    fn a_selected_vitest_config_runs_its_tests() {
+        use fallow_output::MutationIncompleteReason;
+        let Some(package) = companion_fixture() else {
+            return;
+        };
+        let (_project, root) = two_config_project(&package, "test/unit.test.ts");
+        let mut run = options(
+            &root,
+            MutationRunScope::Paths(vec![PathBuf::from("src/math.ts")]),
+        );
+        run.operators = Some(vec![fallow_engine::mutation::Operator::ArithmeticOperator]);
+        run.runner_config = Some(PathBuf::from("vitest.integration.config.mjs"));
+        let report = run_mutation(&run).expect("the run completes");
+        assert!(
+            !report.mutants.is_empty()
+                && report
+                    .mutants
+                    .iter()
+                    .all(|mutant| mutant.status == MutantStatus::Killed),
+            "{:#?}",
+            report.mutants
+        );
+        assert!(
+            report.errors.iter().any(|error| {
+                error.code == "test-files-not-discovered"
+                    && error.message.contains("test/unit.test.ts")
+            }),
+            "{:#?}",
+            report.errors
+        );
+        assert_eq!(
+            report.completion.reasons,
+            vec![MutationIncompleteReason::TestFilesNotDiscovered]
+        );
+    }
+
+    /// The selected config file is in the result cache key: a changed
+    /// config runs the mutant again.
+    #[test]
+    fn a_changed_selected_vitest_config_is_a_cache_miss() {
+        let Some(package) = companion_fixture() else {
+            return;
+        };
+        let (_project, root) = two_config_project(&package, "test/unit.test.ts");
+        let mut run = options(
+            &root,
+            MutationRunScope::Paths(vec![PathBuf::from("src/math.ts")]),
+        );
+        run.analysis.no_cache = false;
+        run.allow_dirty = true;
+        run.operators = Some(vec![fallow_engine::mutation::Operator::ArithmeticOperator]);
+        run.runner_config = Some(PathBuf::from("vitest.integration.config.mjs"));
+        let first = run_mutation(&run).expect("the first run completes");
+        assert!(first.mutants.iter().all(|mutant| !mutant.cached));
+        let again = run_mutation(&run).expect("the second run completes");
+        assert!(
+            again.mutants.iter().all(|mutant| mutant.cached),
+            "{:#?}",
+            again.mutants
+        );
+        fs::write(
+            root.join("vitest.integration.config.mjs"),
+            "export default { test: { include: [\"test/integration.test.ts\"], testTimeout: 9000 } };\n",
+        )
+        .expect("write");
+        let changed = run_mutation(&run).expect("the third run completes");
+        assert!(
+            changed.mutants.iter().all(|mutant| !mutant.cached),
+            "{:#?}",
+            changed.mutants
+        );
     }
 }
