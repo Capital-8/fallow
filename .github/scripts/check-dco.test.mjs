@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -54,8 +54,20 @@ test("parseLog splits records into commits", () => {
   assert.deepEqual(checkDco(commits), { ok: false, missing: ["bbb"] });
 });
 
+// A git variable from the caller (for example GIT_AUTHOR_EMAIL, or GIT_DIR
+// from a hook) would change the author that the script reads.
+const cleanEnv = (extra = {}) => {
+  const env = { ...process.env, ...extra };
+  for (const key of Object.keys(env)) {
+    if (/^GIT_(AUTHOR|COMMITTER)_/u.test(key) || key === "GIT_DIR" || key === "GIT_INDEX_FILE") {
+      delete env[key];
+    }
+  }
+  return env;
+};
+
 const git = (cwd, args) => {
-  const run = spawnSync("git", args, { cwd, encoding: "utf8" });
+  const run = spawnSync("git", args, { cwd, env: cleanEnv(), encoding: "utf8" });
   assert.equal(run.status, 0, run.stderr);
   return run.stdout.trim();
 };
@@ -77,7 +89,7 @@ const withRepo = (callback) => {
 const runScript = (cwd, base) =>
   spawnSync(process.execPath, [SCRIPT_PATH], {
     cwd,
-    env: { ...process.env, BASE_SHA: base },
+    env: cleanEnv({ BASE_SHA: base }),
     encoding: "utf8",
   });
 
@@ -104,4 +116,37 @@ test("the script exits 2 without BASE_SHA", () => {
   delete env.BASE_SHA;
   const run = spawnSync(process.execPath, [SCRIPT_PATH], { env, encoding: "utf8" });
   assert.equal(run.status, 2);
+});
+
+const runOnMessage = (cwd, message) => {
+  const file = join(cwd, "COMMIT_MSG");
+  writeFileSync(file, message);
+  return spawnSync(process.execPath, [SCRIPT_PATH, "--message-file", file], {
+    cwd,
+    env: cleanEnv(),
+    encoding: "utf8",
+  });
+};
+
+test("the commit-msg mode exits 1 for a message without the author sign-off", () => {
+  withRepo((dir) => {
+    const run = runOnMessage(dir, "fix: unsigned\n");
+    assert.equal(run.status, 1);
+    assert.match(run.stderr, /git commit -s/u);
+  });
+});
+
+test("the commit-msg mode exits 0 for a message signed off by the author", () => {
+  withRepo((dir) => {
+    const run = runOnMessage(dir, "fix: signed\n\nSigned-off-by: Dev One <dev@example.com>\n");
+    assert.equal(run.status, 0, run.stderr);
+  });
+});
+
+test("the commit-msg mode skips a merge commit", () => {
+  withRepo((dir, base) => {
+    writeFileSync(join(dir, ".git", "MERGE_HEAD"), `${base}\n`);
+    const run = runOnMessage(dir, "Merge branch 'main'\n");
+    assert.equal(run.status, 0, run.stderr);
+  });
 });
