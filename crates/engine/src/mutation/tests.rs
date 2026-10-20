@@ -889,6 +889,139 @@ fn each_response_shaping_row_names_a_catalogue_row_with_an_io_effect() {
 }
 
 #[test]
+fn a_function_that_writes_through_an_orm_is_pruned_unless_allowed() {
+    let root = fixture("mutation-plan-orm-write");
+    let mut allowed = MutationPlanRequest::new(MutationScope::All);
+    allowed.allow_side_effects = true;
+    let [default, allowed] = plans(
+        &root,
+        None,
+        &[MutationPlanRequest::new(MutationScope::All), allowed],
+    )
+    .try_into()
+    .expect("two plans");
+    let pruned = MutantDisposition::Pruned(PruneReason::SideEffectSink);
+    assert_eq!(
+        function_dispositions(&default, "src/save.ts"),
+        BTreeMap::from([("clamp".to_owned(), PLANNED), ("save".to_owned(), pruned)])
+    );
+    assert_eq!(
+        function_dispositions(&default, "src/person.ts"),
+        BTreeMap::from([("addPerson".to_owned(), pruned)])
+    );
+    assert_eq!(
+        function_dispositions(&default, "src/cache.ts"),
+        BTreeMap::from([("evict".to_owned(), PLANNED)])
+    );
+    assert_eq!(
+        function_dispositions(&default, "src/pgjs.ts").get("countUsers"),
+        Some(&PLANNED),
+        "a read template is not a write"
+    );
+    assert_eq!(
+        function_dispositions(&default, "src/runner.ts"),
+        BTreeMap::from([("runTask".to_owned(), PLANNED)]),
+        "`run` counts only in a module that loads a database package itself"
+    );
+    assert_eq!(
+        function_dispositions(&default, "src/statements.ts").get("findStored"),
+        Some(&PLANNED),
+        "a prepared `SELECT` statement is not a write"
+    );
+    assert_eq!(
+        function_dispositions(&default, "src/statements.ts").get("countStored"),
+        Some(&PLANNED),
+        "a prepared `SELECT` in a tagged template is not a write"
+    );
+    assert_eq!(
+        function_dispositions(&default, "src/routes.ts"),
+        BTreeMap::from([
+            ("<top-level>".to_owned(), PLANNED),
+            ("delete".to_owned(), PLANNED),
+            ("pageCount".to_owned(), PLANNED),
+        ]),
+        "a route registration with a path is not a database delete"
+    );
+    assert_eq!(
+        function_dispositions(&default, "src/pattern.ts"),
+        BTreeMap::from([
+            ("<top-level>".to_owned(), PLANNED),
+            ("parseId".to_owned(), PLANNED),
+            ("parseStored".to_owned(), PLANNED),
+            ("parseWord".to_owned(), PLANNED),
+        ]),
+        "`exec` on a regular expression is not a statement run"
+    );
+    for (file, function) in [
+        ("src/cjs.cjs", "cjsSave"),
+        ("src/lazy.ts", "lazySave"),
+        ("src/mongo.ts", "addRecord"),
+        ("src/remove.ts", "removeRecord"),
+        ("src/prisma.ts", "runAll"),
+        ("src/prisma.ts", "clearAll"),
+        ("src/typed.ts", "insertRow"),
+        ("src/pgjs.ts", "addUser"),
+        ("src/vercel.ts", "addValue"),
+        ("src/lite.ts", "insertValue"),
+        ("src/lite.ts", "clearValues"),
+        ("src/lite.ts", "insertPrepared"),
+        ("src/pg.ts", "addRow"),
+        ("src/computed.ts", "addComputed"),
+        ("src/statements.ts", "addStored"),
+        ("src/statements.ts", "addInline"),
+    ] {
+        assert_eq!(
+            function_dispositions(&default, file).get(function),
+            Some(&pruned),
+            "{file} {function}"
+        );
+        assert_eq!(
+            function_dispositions(&allowed, file).get(function),
+            Some(&PLANNED),
+            "{file} {function} with --allow-side-effects"
+        );
+    }
+    assert_eq!(
+        function_dispositions(&allowed, "src/save.ts"),
+        BTreeMap::from([("clamp".to_owned(), PLANNED), ("save".to_owned(), PLANNED)])
+    );
+    assert_eq!(
+        function_dispositions(&allowed, "src/person.ts"),
+        BTreeMap::from([("addPerson".to_owned(), PLANNED)])
+    );
+}
+
+#[test]
+fn a_prepared_statement_in_a_class_field_or_an_assignment_is_pruned() {
+    let plan = plan_all(&fixture("mutation-plan-orm-write"));
+    let pruned = MutantDisposition::Pruned(PruneReason::SideEffectSink);
+    let functions = function_dispositions(&plan, "src/repository.ts");
+    for function in ["clearAssigned", "addField", "setField"] {
+        assert_eq!(functions.get(function), Some(&pruned), "{function}");
+    }
+    assert_eq!(
+        functions.get("findField"),
+        Some(&PLANNED),
+        "a prepared `SELECT` class field is not a write"
+    );
+}
+
+#[test]
+fn a_prepared_statement_in_a_map_a_private_field_or_a_static_field_is_pruned() {
+    let plan = plan_all(&fixture("mutation-plan-orm-write"));
+    let pruned = MutantDisposition::Pruned(PruneReason::SideEffectSink);
+    let functions = function_dispositions(&plan, "src/holders.ts");
+    for function in ["addMapped", "addPrivate", "addStatic"] {
+        assert_eq!(functions.get(function), Some(&pruned), "{function}");
+    }
+    assert_eq!(
+        functions.get("findMapped"),
+        Some(&PLANNED),
+        "a prepared `SELECT` in a statement map is not a write"
+    );
+}
+
+#[test]
 fn a_provenance_row_prunes_only_the_calls_of_its_import_source() {
     let plan = plan_all(&fixture("mutation-plan-provenance"));
     let pruned = MutantDisposition::Pruned(PruneReason::SideEffectSink);

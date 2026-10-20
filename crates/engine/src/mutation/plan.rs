@@ -14,6 +14,7 @@ use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
 
+use super::database_write;
 use super::layout::Layout;
 use super::{
     FunctionFacts, MutantDisposition, MutantTestReach, MutationPlan, MutationPlanCounts,
@@ -55,6 +56,30 @@ pub(super) const RESPONSE_SHAPING_ROWS: [&str; 5] = [
     "permissive-cors",
 ];
 
+/// Import sources of database clients, ORMs and query builders. A subpath
+/// such as `drizzle-orm/libsql` matches its package.
+const DATABASE_PACKAGES: [&str; 19] = [
+    "@libsql/client",
+    "@neondatabase/serverless",
+    "@planetscale/database",
+    "@prisma/client",
+    "@vercel/postgres",
+    "better-sqlite3",
+    "drizzle-orm",
+    "knex",
+    "kysely",
+    "libsql",
+    "mongodb",
+    "mongoose",
+    "mysql",
+    "mysql2",
+    "pg",
+    "postgres",
+    "sequelize",
+    "sqlite3",
+    "typeorm",
+];
+
 /// One file that the scope selects.
 struct Candidate<'a> {
     file_id: FileId,
@@ -71,6 +96,7 @@ struct Context<'a> {
     inputs: &'a MutationPlanInputs<'a>,
     request: &'a MutationPlanRequest,
     graph: &'a ModuleGraph,
+    modules: FxHashMap<FileId, &'a ModuleInfo>,
     dead_files: FxHashSet<&'a Path>,
     options: MutationOptions,
     /// The test entry points that reach each selected test-reachable file,
@@ -79,6 +105,8 @@ struct Context<'a> {
     /// The test-reachable files that only type tests reach. No runner test
     /// covers them.
     type_test_only: FxHashSet<FileId>,
+    /// The files that load a database client package.
+    database_files: FxHashSet<FileId>,
 }
 
 /// The result for one file.
@@ -104,6 +132,11 @@ pub(super) fn build(
         inputs,
         request,
         graph,
+        modules: inputs
+            .modules
+            .iter()
+            .map(|module| (module.file_id, module))
+            .collect(),
         dead_files: inputs
             .results
             .unused_files
@@ -119,6 +152,7 @@ pub(super) fn build(
         },
         test_entries: FxHashMap::default(),
         type_test_only: FxHashSet::default(),
+        database_files: database_files(graph),
     };
     let (candidates, unmatched_paths) = select_files(&context);
     let reachable: Vec<FileId> = candidates
@@ -189,12 +223,6 @@ pub(super) fn build(
 /// The second value holds the `Paths` scope entries that select no file.
 fn select_files<'a>(context: &Context<'a>) -> (Vec<Candidate<'a>>, Vec<String>) {
     let root = context.inputs.root;
-    let modules: FxHashMap<FileId, &ModuleInfo> = context
-        .inputs
-        .modules
-        .iter()
-        .map(|module| (module.file_id, module))
-        .collect();
     let mut matched = match &context.request.scope {
         MutationScope::Paths(paths) => vec![false; paths.len()],
         _ => Vec::new(),
@@ -239,7 +267,7 @@ fn select_files<'a>(context: &Context<'a>) -> (Vec<Candidate<'a>>, Vec<String>) 
                 path: &node.path,
                 rel,
                 layout,
-                module: modules.get(&node.file_id).copied(),
+                module: context.modules.get(&node.file_id).copied(),
                 added_lines,
             })
         })
@@ -434,13 +462,18 @@ impl<'a> FileFacts<'a> {
         let sink_starts = if context.request.allow_side_effects {
             Vec::new()
         } else {
-            module
+            let mut starts: Vec<u32> = module
                 .security_sinks
                 .iter()
                 .filter(|site| is_side_effect_sink(module, site))
                 .map(|site| site.span_start)
-                .filter(|&start| in_script(start))
-                .collect()
+                .collect();
+            if has_database_reach(context, candidate.file_id) {
+                let direct = context.database_files.contains(&candidate.file_id);
+                starts.extend(database_write::starts(source, candidate.layout, direct));
+            }
+            starts.retain(|&start| in_script(start));
+            starts
         };
         let top_level_sink =
             !sink_starts.is_empty() && has_top_level_site(&sink_starts, source, candidate.layout);
@@ -713,6 +746,37 @@ fn is_side_effect_sink(module: &ModuleInfo, site: &SinkSite) -> bool {
                     ProvenanceBindings::ReleasedModule,
                 )
         })
+}
+
+/// Whether the module loads a database client package, or loads a project
+/// module that loads one. One hop covers the common layout where a `db`
+/// module creates the client and the other modules import it. A type-only
+/// import counts too: a function that takes the client as a parameter often
+/// imports only its type.
+fn has_database_reach(context: &Context<'_>, file_id: FileId) -> bool {
+    context.database_files.contains(&file_id)
+        || context
+            .graph
+            .edges_for(file_id)
+            .iter()
+            .any(|target| context.database_files.contains(target))
+}
+
+/// The files that load a database client package with an ES import, a
+/// `require()` call or an `import()` call. The graph keeps these facts after
+/// the release of the module payload, which drains `require_calls` and
+/// `dynamic_imports`.
+fn database_files(graph: &ModuleGraph) -> FxHashSet<FileId> {
+    graph
+        .package_usage
+        .iter()
+        .filter(|(package, _)| {
+            DATABASE_PACKAGES
+                .iter()
+                .any(|database| fallow_security::import_source_matches(package, database))
+        })
+        .flat_map(|(_, users)| users.iter().copied())
+        .collect()
 }
 
 /// Whether one of the offsets lies outside every function and arrow
