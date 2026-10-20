@@ -61,13 +61,20 @@ fn build_typo_target_index(
     by_len
 }
 
+/// The project-wide inputs of the typo check, shared by every markup file.
+struct TypoTargets<'a> {
+    defined: &'a rustc_hash::FxHashSet<String>,
+    by_len: rustc_hash::FxHashMap<usize, Vec<&'a str>>,
+    /// The project loads Tailwind, so utility-shaped tokens are not checked.
+    uses_tailwind: bool,
+}
+
 /// Collect the likely-typo class references in one markup source into `out`,
 /// deduping by `(rel, line, value)` via `seen`.
-fn collect_unresolved_class_refs_in_file<'a>(
+fn collect_unresolved_class_refs_in_file(
     source: &str,
     rel: &str,
-    defined: &rustc_hash::FxHashSet<String>,
-    by_len: &'a rustc_hash::FxHashMap<usize, Vec<&'a str>>,
+    targets: &TypoTargets<'_>,
     seen: &mut rustc_hash::FxHashSet<(String, u32, String)>,
     out: &mut Vec<fallow_output::UnresolvedClassReference>,
 ) {
@@ -75,11 +82,12 @@ fn collect_unresolved_class_refs_in_file<'a>(
     for token in crate::css::scan_markup_class_tokens(source).static_tokens {
         if token.value.len() < MIN_TOKEN_LEN
             || is_tailwind_shaped(&token.value)
-            || defined.contains(&token.value)
+            || (targets.uses_tailwind && tailwind_utilities::is_tailwind_utility(&token.value))
+            || targets.defined.contains(&token.value)
         {
             continue;
         }
-        let Some(suggestion) = best_class_suggestion(&token.value, by_len) else {
+        let Some(suggestion) = best_class_suggestion(&token.value, &targets.by_len) else {
             continue;
         };
         let key = (rel.to_owned(), token.line, token.value.clone());
@@ -143,7 +151,14 @@ pub(super) fn scan_unresolved_class_references(
     if defined.is_empty() {
         return Vec::new();
     }
-    let by_len = build_typo_target_index(defined);
+    let targets = TypoTargets {
+        defined,
+        by_len: build_typo_target_index(defined),
+        // A Tailwind utility (`w-full`) is generated, never authored, so it is
+        // not in the defined set. Skip utility-shaped tokens when the project
+        // loads Tailwind, else `w-full` reads as a typo of an authored `wl-full`.
+        uses_tailwind: class_inventory.loads_tailwind || project_uses_tailwind(&config.root),
+    };
 
     let mut out: Vec<UnresolvedClassReference> = Vec::new();
     let mut seen: rustc_hash::FxHashSet<(String, u32, String)> = rustc_hash::FxHashSet::default();
@@ -151,7 +166,7 @@ pub(super) fn scan_unresolved_class_references(
         let Some((rel, source)) = read_markup_scan_source(file, ctx) else {
             continue;
         };
-        collect_unresolved_class_refs_in_file(&source, &rel, defined, &by_len, &mut seen, &mut out);
+        collect_unresolved_class_refs_in_file(&source, &rel, &targets, &mut seen, &mut out);
     }
 
     out.sort_by(|a, b| {
@@ -344,28 +359,127 @@ pub(super) fn collect_quoted_class_tokens(
 /// always surface as a (false) unreferenced-class candidate. `:global` is the
 /// author's explicit "not locally scoped, applied elsewhere" marker, so excluding
 /// these from the candidate set is semantically correct, not a heuristic guess.
+///
+/// Three forms are recognized: the function form `:global(.x)`, the Svelte 5
+/// block form `:global { .x {} }`, and the selector form `div :global .x {}`,
+/// where the rest of the selector up to `{` or `,` is global.
 fn collect_global_scoped_classes(source: &str, out: &mut rustc_hash::FxHashSet<String>) {
+    const MARKER: &str = ":global";
+    // A `:global` word in a comment is prose, not a selector.
+    let blanked = blank_block_comments(source);
+    let source = blanked.as_str();
     let bytes = source.as_bytes();
     let mut i = 0;
-    while let Some(rel) = source[i..].find(":global(") {
-        let open = i + rel + ":global(".len();
-        // Balance parentheses so a `:global(:is(.a, .b))` still closes correctly.
-        let mut depth = 1usize;
-        let mut j = open;
-        while j < bytes.len() && depth > 0 {
-            match bytes[j] {
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ => {}
+    while let Some(rel) = source[i..].find(MARKER) {
+        let after = i + rel + MARKER.len();
+        i = match bytes.get(after) {
+            Some(b'(') => collect_global_function(source, after + 1, out),
+            Some(byte) if byte.is_ascii_whitespace() || *byte == b'{' => {
+                collect_global_unparenthesized(source, after, out)
             }
-            j += 1;
-        }
-        let inner_end = j.saturating_sub(1).max(open);
-        if let Some(inner) = source.get(open..inner_end) {
-            extract_dotted_class_names(inner, out);
-        }
-        i = j.max(open + 1);
+            _ => after,
+        };
     }
+}
+
+/// Replace each `/* ... */` comment with spaces of the same byte length, so
+/// byte offsets into the result match the source. An unclosed comment runs to
+/// the end of the source, as in CSS.
+fn blank_block_comments(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        let comment_len = rest[start + 2..]
+            .find("*/")
+            .map_or(rest.len() - start, |end| end + 4);
+        out.extend(std::iter::repeat_n(' ', comment_len));
+        rest = &rest[start + comment_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Collect the classes of a `:global(...)` argument that starts at `open`.
+/// Returns the index after the closing parenthesis.
+fn collect_global_function(
+    source: &str,
+    open: usize,
+    out: &mut rustc_hash::FxHashSet<String>,
+) -> usize {
+    let bytes = source.as_bytes();
+    // Balance parentheses so a `:global(:is(.a, .b))` still closes correctly.
+    let mut depth = 1usize;
+    let mut j = open;
+    while j < bytes.len() && depth > 0 {
+        match bytes[j] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    let inner_end = j.saturating_sub(1).max(open);
+    if let Some(inner) = source.get(open..inner_end) {
+        extract_dotted_class_names(inner, out);
+    }
+    j.max(open)
+}
+
+/// Collect the classes of a `:global` marker without parentheses that ends at
+/// `start`: a block (`:global { .x {} }`) or the rest of a selector
+/// (`:global .x {}`). Returns the index where the scan continues.
+fn collect_global_unparenthesized(
+    source: &str,
+    start: usize,
+    out: &mut rustc_hash::FxHashSet<String>,
+) -> usize {
+    let rest = &source[start..];
+    let Some(end) = rest.find(['{', ',', ';', '}']) else {
+        return source.len();
+    };
+    let prelude = &rest[..end];
+    if !prelude.trim().is_empty() {
+        extract_dotted_class_names(prelude, out);
+        return start + end;
+    }
+    if rest.as_bytes()[end] != b'{' {
+        return start + end;
+    }
+    collect_global_block(source, start + end + 1, out)
+}
+
+/// Collect the classes in the rule selectors of a `:global { ... }` block whose
+/// body starts at `open`. Declarations are skipped, so a value such as
+/// `url(./a.png)` adds no class. Returns the index after the closing brace.
+fn collect_global_block(
+    source: &str,
+    open: usize,
+    out: &mut rustc_hash::FxHashSet<String>,
+) -> usize {
+    let bytes = source.as_bytes();
+    let mut depth = 1usize;
+    let mut segment_start = open;
+    let mut j = open;
+    while j < bytes.len() && depth > 0 {
+        match bytes[j] {
+            b'{' => {
+                if let Some(selector) = source.get(segment_start..j) {
+                    extract_dotted_class_names(selector, out);
+                }
+                depth += 1;
+                segment_start = j + 1;
+            }
+            b'}' => {
+                depth -= 1;
+                segment_start = j + 1;
+            }
+            b';' => segment_start = j + 1,
+            _ => {}
+        }
+        j += 1;
+    }
+    j
 }
 
 /// Push every `.class` token in a CSS selector fragment (the bare name, no dot)
@@ -404,12 +518,15 @@ pub(super) struct CssClassInventory {
     preprocessor_files: usize,
     typo_target_classes: rustc_hash::FxHashSet<String>,
     defined_classes: Vec<(String, Vec<(String, u32)>)>,
+    /// A stylesheet or style block loads Tailwind (`@import "tailwindcss"`).
+    loads_tailwind: bool,
 }
 
 /// Collect both class surfaces in one file pass. The typo-target set includes
-/// every authored class from standalone stylesheets and Astro/Vue/Svelte style
-/// blocks. The located standalone set powers the unreferenced-global-class
-/// check and omits `:global(...)` selectors.
+/// every authored class from standalone stylesheets and Astro/Vue/Svelte/HTML
+/// style blocks, `:global(...)` classes included. The located standalone set
+/// powers the unreferenced-global-class check and omits `:global(...)`
+/// selectors.
 ///
 /// The typo-target surface is not narrowed by `changed_files` or workspace
 /// roots. A definition in an unchanged file must still suppress an unresolved
@@ -426,7 +543,7 @@ pub(super) fn css_class_inventory(
         let extension = path.extension().and_then(|ext| ext.to_str());
         let is_preprocessor = matches!(extension, Some("scss" | "sass" | "less"));
         let is_css = extension == Some("css") || is_preprocessor;
-        let has_style_blocks = matches!(extension, Some("astro" | "vue" | "svelte"));
+        let has_style_blocks = matches!(extension, Some("astro" | "vue" | "svelte" | "html"));
         if !is_css && !has_style_blocks {
             continue;
         }
@@ -444,6 +561,11 @@ pub(super) fn css_class_inventory(
         };
         if has_style_blocks {
             for style in crate::css::extract_sfc_styles(&source) {
+                inventory.loads_tailwind |=
+                    tailwind_utilities::stylesheet_loads_tailwind(&style.body);
+                // A component styles a class passed to a child component's root
+                // through `:global(.x)`. The class is authored, so it is defined.
+                collect_global_scoped_classes(&style.body, &mut inventory.typo_target_classes);
                 let is_style_scss = style
                     .lang
                     .as_deref()
@@ -456,8 +578,12 @@ pub(super) fn css_class_inventory(
             }
             continue;
         }
+        inventory.loads_tailwind |= tailwind_utilities::stylesheet_loads_tailwind(&source);
         let mut global_scoped: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         collect_global_scoped_classes(&source, &mut global_scoped);
+        inventory
+            .typo_target_classes
+            .extend(global_scoped.iter().cloned());
         let mut seen: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         let mut classes: Vec<(String, u32)> = Vec::new();
         for export in crate::css::extract_css_module_exports(&source, is_preprocessor) {
@@ -1095,6 +1221,44 @@ mod tests {
     use super::*;
     use fallow_config::{FallowConfig, OutputFormat};
     use fallow_types::discover::{DiscoveredFile, FileId};
+
+    fn global_classes(source: &str) -> Vec<String> {
+        let mut out = rustc_hash::FxHashSet::default();
+        collect_global_scoped_classes(source, &mut out);
+        let mut classes: Vec<String> = out.into_iter().collect();
+        classes.sort();
+        classes
+    }
+
+    #[test]
+    fn global_marker_inside_a_comment_marks_no_class() {
+        assert!(global_classes("/* use :global here */\n.foo { color: red; }\n.bar {}").is_empty());
+        assert_eq!(
+            global_classes("/* :global */ .a {} :global(.b) {}"),
+            vec!["b".to_string()]
+        );
+    }
+
+    #[test]
+    fn global_scoped_classes_cover_every_global_form() {
+        assert_eq!(
+            global_classes("nav :global(.fn-a:is(.fn-b)) { color: red; }"),
+            ["fn-a", "fn-b"]
+        );
+        assert_eq!(
+            global_classes("div :global .sel-a .sel-b, .local { color: red; }"),
+            ["sel-a", "sel-b"]
+        );
+        assert_eq!(
+            global_classes(
+                ":global {\n  .blk-a { background: url(./img.png); }\n  \
+                 .blk-b { margin: 0 } .blk-c:hover { .blk-d { color: red; } }\n}\n\
+                 .local { color: blue; }"
+            ),
+            ["blk-a", "blk-b", "blk-c", "blk-d"]
+        );
+        assert!(global_classes(".local { color: red; }").is_empty());
+    }
 
     fn reference_surface(sources: &[(&str, &str)]) -> CssReferenceSurface {
         let dir = tempfile::tempdir().unwrap();
