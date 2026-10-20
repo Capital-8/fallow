@@ -3682,6 +3682,24 @@
             "null"
           ],
           "description": "Audit-mode flag indicating whether the finding is new versus the base\nsnapshot. A complexity finding is new when no base finding has the same\npath and function name, or when a metric that it exceeds has a higher\nvalue than in that base finding."
+        },
+        "attribution": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AuditFindingAttribution"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Audit-mode class of the finding against the base snapshot:\n`introduced`, `worsened` or `inherited`. A worsened finding matches a\nbase finding, is not introduced, and has a higher value in at least one\nmeasured metric. Absent outside an audit with a base snapshot."
+        },
+        "worsened_metrics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/WorsenedMetric"
+          },
+          "description": "Audit-mode list of the measured metrics that are higher than in the\nmatched base finding, with the base value and the head value. Present\non a worsened finding, and on an introduced finding that matches a base\nfinding. Absent when no metric grew."
         }
       },
       "required": [
@@ -8617,6 +8635,10 @@
           "description": "Configured gate: `new-only` fails only on introduced findings,\n`all` also fails on inherited ones.",
           "$ref": "#/definitions/AuditGate"
         },
+        "worsened": {
+          "description": "How a worsened complexity finding affects the verdict under the\n`new-only` gate. `warn` gives at least a `warn` verdict. `error` counts\nthe finding like an introduced finding.",
+          "$ref": "#/definitions/AuditWorsened"
+        },
         "dead_code_introduced": {
           "type": "integer",
           "description": "Dead-code findings absent from the base snapshot."
@@ -8632,6 +8654,10 @@
         "complexity_inherited": {
           "type": "integer",
           "description": "Complexity findings already present in the base snapshot."
+        },
+        "complexity_worsened": {
+          "type": "integer",
+          "description": "Complexity findings whose `attribution` is `worsened`. These findings\nare in the base snapshot, and a measured value is higher now. They are\nalso counted in `complexity_inherited`."
         },
         "duplication_introduced": {
           "type": "integer",
@@ -34265,6 +34291,94 @@
         }
       ],
       "description": "How a run detected a mutant."
+    },
+    "AuditWorsened": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "warn",
+          "description": "A worsened finding makes the verdict at least `warn` and does not fail\nthe run. The default."
+        },
+        {
+          "type": "string",
+          "const": "error",
+          "description": "A worsened finding counts like an introduced finding."
+        },
+        {
+          "type": "string",
+          "const": "off",
+          "description": "No finding is worsened: a grown inherited finding stays inherited and\ndoes not change the verdict. This is the behavior before `worsened`\nexisted."
+        }
+      ],
+      "description": "Value of `audit.worsened`: how a worsened complexity finding affects the\n`fallow audit` verdict."
+    },
+    "AuditFindingAttribution": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "introduced",
+          "description": "No base finding matches, or a metric that the finding exceeds grew."
+        },
+        {
+          "type": "string",
+          "const": "worsened",
+          "description": "A base finding matches and a measured metric grew, but no metric that\nthe finding exceeds grew."
+        },
+        {
+          "type": "string",
+          "const": "inherited",
+          "description": "A base finding matches and no measured metric grew."
+        }
+      ],
+      "description": "Audit-mode class of a complexity finding against the base snapshot."
+    },
+    "WorsenedMetric": {
+      "type": "object",
+      "properties": {
+        "metric": {
+          "description": "The metric.",
+          "$ref": "#/definitions/WorsenedMetricKind"
+        },
+        "base": {
+          "type": "number",
+          "description": "Value in the matched base finding."
+        },
+        "head": {
+          "type": "number",
+          "description": "Value in the head finding. Always higher than `base`."
+        }
+      },
+      "required": [
+        "metric",
+        "base",
+        "head"
+      ],
+      "description": "One measured metric that is higher at head than in the matched base\nfinding."
+    },
+    "WorsenedMetricKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "cyclomatic",
+          "description": "Cyclomatic complexity."
+        },
+        {
+          "type": "string",
+          "const": "cognitive",
+          "description": "Cognitive complexity."
+        },
+        {
+          "type": "string",
+          "const": "crap",
+          "description": "CRAP score. Compared only when both sides have coverage data."
+        },
+        {
+          "type": "string",
+          "const": "line_count",
+          "description": "Lines of code in the function body."
+        }
+      ],
+      "description": "A measured metric of a complexity finding."
     }
   }
 }

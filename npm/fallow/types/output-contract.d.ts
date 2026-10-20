@@ -150,6 +150,11 @@ export type ElapsedMs = number
  */
 export type AuditGate = ("new-only" | "all")
 /**
+ * Value of `audit.worsened`: how a worsened complexity finding affects the
+ * `fallow audit` verdict.
+ */
+export type AuditWorsened = ("warn" | "error" | "off")
+/**
  * What a gate concluded on this run.
  *
  * Four-valued rather than a boolean because audit's verdict has a warn tier
@@ -886,6 +891,14 @@ export type ThresholdSource = "override"
  * `suppress-line`.
  */
 export type HealthFindingActionType = ("refactor-function" | "add-tests" | "increase-coverage" | "suppress-file" | "suppress-line")
+/**
+ * Audit-mode class of a complexity finding against the base snapshot.
+ */
+export type AuditFindingAttribution = ("introduced" | "worsened" | "inherited")
+/**
+ * A measured metric of a complexity finding.
+ */
+export type WorsenedMetricKind = ("cyclomatic" | "cognitive" | "crap" | "line_count")
 /**
  * Coverage model used for CRAP score computation.
  */
@@ -1868,6 +1881,7 @@ duplication_clone_groups: number
  */
 export interface AuditAttribution {
 gate: AuditGate
+worsened?: AuditWorsened
 /**
  * Dead-code findings absent from the base snapshot.
  */
@@ -1884,6 +1898,12 @@ complexity_introduced: number
  * Complexity findings already present in the base snapshot.
  */
 complexity_inherited: number
+/**
+ * Complexity findings whose `attribution` is `worsened`. These findings
+ * are in the base snapshot, and a measured value is higher now. They are
+ * also counted in `complexity_inherited`.
+ */
+complexity_worsened?: number
 /**
  * Clone groups absent from the base snapshot.
  */
@@ -8056,6 +8076,20 @@ actions: HealthFindingAction[]
  * value than in that base finding.
  */
 introduced?: (boolean | null)
+/**
+ * Audit-mode class of the finding against the base snapshot:
+ * `introduced`, `worsened` or `inherited`. A worsened finding matches a
+ * base finding, is not introduced, and has a higher value in at least one
+ * measured metric. Absent outside an audit with a base snapshot.
+ */
+attribution?: (AuditFindingAttribution | null)
+/**
+ * Audit-mode list of the measured metrics that are higher than in the
+ * matched base finding, with the base value and the head value. Present
+ * on a worsened finding, and on an introduced finding that matches a base
+ * finding. Absent when no metric grew.
+ */
+worsened_metrics?: WorsenedMetric[]
 }
 /**
  * Per-component React hook profile derived from the cached `hook_uses` IR at
@@ -8326,6 +8360,21 @@ placement?: (string | null)
  * Absent when the action's target is the finding's own file.
  */
 target_path?: (string | null)
+}
+/**
+ * One measured metric that is higher at head than in the matched base
+ * finding.
+ */
+export interface WorsenedMetric {
+metric: WorsenedMetricKind
+/**
+ * Value in the matched base finding.
+ */
+base: number
+/**
+ * Value in the head finding. Always higher than `base`.
+ */
+head: number
 }
 /**
  * Summary statistics for the health report.

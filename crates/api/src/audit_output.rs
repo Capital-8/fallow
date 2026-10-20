@@ -1,6 +1,6 @@
 //! Shared audit JSON payload contracts for programmatic consumers.
 
-use fallow_config::AuditGate;
+use fallow_config::{AuditGate, AuditWorsened};
 use fallow_output::{AuditCommand, CodeClimateIssue, codeclimate_issues_to_value};
 use fallow_types::duplicates::DuplicationReport;
 use fallow_types::envelope::{ElapsedMs, SchemaVersion, ToolVersion};
@@ -59,6 +59,11 @@ pub struct AuditAttribution {
     /// Configured gate: `new-only` fails only on introduced findings,
     /// `all` also fails on inherited ones.
     pub gate: AuditGate,
+    /// How a worsened complexity finding affects the verdict under the
+    /// `new-only` gate. `warn` gives at least a `warn` verdict. `error` counts
+    /// the finding like an introduced finding.
+    #[serde(default)]
+    pub worsened: AuditWorsened,
     /// Dead-code findings absent from the base snapshot.
     pub dead_code_introduced: usize,
     /// Dead-code findings already present in the base snapshot.
@@ -67,6 +72,11 @@ pub struct AuditAttribution {
     pub complexity_introduced: usize,
     /// Complexity findings already present in the base snapshot.
     pub complexity_inherited: usize,
+    /// Complexity findings whose `attribution` is `worsened`. These findings
+    /// are in the base snapshot, and a measured value is higher now. They are
+    /// also counted in `complexity_inherited`.
+    #[serde(default)]
+    pub complexity_worsened: usize,
     /// Clone groups absent from the base snapshot.
     pub duplication_introduced: usize,
     /// Clone groups already present in the base snapshot.

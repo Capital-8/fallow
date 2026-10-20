@@ -1874,6 +1874,20 @@ pub enum Command {
         #[arg(long, value_enum)]
         gate: Option<AuditGateArg>,
 
+        /// How a worsened complexity finding affects the audit verdict.
+        ///
+        /// A worsened finding was already in the base snapshot, and a measured
+        /// value is higher now. Any growth of cyclomatic, cognitive or CRAP
+        /// counts. The line count must grow by at least 5 lines. It includes
+        /// comments and blank lines in the function.
+        /// warn (default): the verdict is at least warn, and the run does not
+        /// fail. error: a worsened finding counts like an introduced finding.
+        /// off: no finding is worsened, and the verdict does not change.
+        /// Overrides `audit.worsened` in config. Has no effect with
+        /// `--gate all`, which counts every finding.
+        #[arg(long, value_enum)]
+        worsened: Option<AuditWorsenedArg>,
+
         /// Runtime coverage input. Accepts a V8 directory, a single V8 JSON
         /// file, or an Istanbul coverage map JSON. Runs the `fallow-cov`
         /// sidecar inside the audit, so the `hot-path-touched` verdict shows
@@ -3168,6 +3182,27 @@ pub enum AuditGateArg {
     NewOnly,
     /// All findings in changed files affect the verdict.
     All,
+}
+
+/// CLI value of `--worsened`, mirroring `fallow_config::AuditWorsened`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum AuditWorsenedArg {
+    /// A worsened finding makes the verdict at least warn.
+    Warn,
+    /// A worsened finding counts like an introduced finding.
+    Error,
+    /// No finding is worsened, and the verdict does not change.
+    Off,
+}
+
+impl From<AuditWorsenedArg> for fallow_config::AuditWorsened {
+    fn from(value: AuditWorsenedArg) -> Self {
+        match value {
+            AuditWorsenedArg::Warn => Self::Warn,
+            AuditWorsenedArg::Error => Self::Error,
+            AuditWorsenedArg::Off => Self::Off,
+        }
+    }
 }
 
 impl From<AuditGateArg> for fallow_config::AuditGate {

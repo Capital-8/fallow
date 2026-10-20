@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use fallow_config::{AuditGate, OutputFormat, ProductionAnalysis};
+use fallow_config::{AuditGate, AuditWorsened, OutputFormat, ProductionAnalysis};
 use fallow_engine::project_config::ProductionFlags;
 use rustc_hash::{FxHashMap, FxHashSet};
 use xxhash_rust::xxh3::xxh3_64;
@@ -134,6 +134,9 @@ pub struct AuditOptions<'a> {
     /// Prefix to strip from Istanbul source paths before rebasing to `root`.
     pub coverage_root: Option<&'a std::path::Path>,
     pub gate: AuditGate,
+    /// How a worsened complexity finding affects the verdict
+    /// (`--worsened` / `audit.worsened`).
+    pub worsened: AuditWorsened,
     /// Report unused exports in entry files (forwarded to the dead-code sub-pass).
     pub include_entry_exports: bool,
     /// Keep the export and member findings of unused files (`--show-cascade`).
@@ -347,6 +350,7 @@ fn build_base_audit_options<'a>(
         coverage: base_coverage.coverage.as_deref(),
         coverage_root: base_coverage.coverage_root.as_deref(),
         gate: AuditGate::All,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: opts.include_entry_exports,
         show_cascade: opts.show_cascade,
         fail_on_parse_error: false,
@@ -1268,6 +1272,7 @@ pub fn execute_audit_with_type_aware(
         AuditRunInput {
             root: opts.root,
             gate: opts.gate,
+            worsened: opts.worsened,
             base_ref: &base_ref,
             cache_dir: Some(opts.cache_dir),
             changed_files,
@@ -1487,6 +1492,7 @@ fn audit_review_benchmark_options<'a>(
         coverage: None,
         coverage_root: None,
         gate: AuditGate::NewOnly,
+        worsened: fallow_config::AuditWorsened::Warn,
         include_entry_exports: false,
         show_cascade: false,
         fail_on_parse_error: false,
@@ -1692,6 +1698,7 @@ fn attribute_preloaded_run(
         fallow_api::audit_run::AuditAttributionInput {
             root: opts.root,
             gate: opts.gate,
+            worsened: opts.worsened,
             base_ref: "benchmark-base",
             base: fallow_api::audit_run::AuditBase {
                 snapshot: Some(base_snapshot),
@@ -2463,6 +2470,7 @@ fn empty_audit_result(
         },
         attribution: AuditAttribution {
             gate: opts.gate,
+            worsened: opts.worsened,
             ..AuditAttribution::default()
         },
         dupe_demotion_diff_source: None,
