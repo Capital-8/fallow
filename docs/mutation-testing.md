@@ -147,6 +147,34 @@ The counter then takes each integer from the start to the bound, so `i < N` and
 mutant of the test do not change. A `var` counter, a bound that is not a
 literal, and the reversed form `N > i` keep the `!=` mutant.
 
+A zero comparison on the length of a known array gives no equivalent
+`relational-operator` mutant. An array length is a non-negative integer `n`,
+so these mutants are equivalent:
+
+| Comparison | Equivalent mutant |
+| --- | --- |
+| `n > 0` or `0 < n` | the `!=` swap |
+| `n <= 0` or `0 >= n` | the `==` swap |
+| `n < 0` or `0 > n` | the constant `false` |
+| `n >= 0` or `0 <= n` | the constant `true` |
+
+The receiver of `.length` must be an array literal or a name that resolves
+to a known array binding. Scope resolution finds the binding of each
+reference. A binding is a known array when it is one of these:
+
+- a `const` with an array literal, `Array.from(...)` or `Array.of(...)` value;
+- a variable or parameter with the type `T[]`, `readonly T[]`, `Array<T>`,
+  `ReadonlyArray<T>` or a tuple type;
+- a rest parameter (`...items`) with no assignment to it.
+
+A reference to a global, or to a different binding with the same name, keeps
+each mutant. A binding with a redeclaration is not a known array. A `with`
+statement, a direct `eval` call, or a local binding of `Array` or
+`ReadonlyArray` stops each proof in the file. An object with a `length`
+property, an optional chain (`items?.length`) and a computed access
+(`items["length"]`) keep each mutant. A type annotation is a type-level
+proof: a cast such as `as any` can pass another value.
+
 No absolute-value operator (`x` to `-x`) is planned. Without types, it applies
 to each operand of an arithmetic or relational expression. The same corpus has
 114119 mutants, and the operator adds 6473 mutants (5.7 %), 24 % of them on
