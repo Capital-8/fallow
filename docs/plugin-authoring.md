@@ -197,6 +197,30 @@ Glob patterns for framework config files. When the plugin is active, these files
 }
 ```
 
+Under `includeEntryExports`, the `default` export of a file that matches a
+`configPatterns` entry counts as used, because the tool loads the config file
+and reads its default export. Named exports of the file stay reportable. Add
+them to `usedExports` when the tool reads them. Without `includeEntryExports`,
+this rule does not change the output.
+
+Config discovery adds a `**/` prefix to a pattern that has no `/`, does not
+start with a dot and names only source extensions (`.ts`, `.js` and similar).
+The credit uses the same prefix, so `my-framework.config.ts` also matches
+`src/my-framework.config.ts`. A pattern such as `.my-frameworkrc.js` gets no
+prefix and matches only at the project root and at the root of each workspace
+package.
+Keep config patterns specific: a broad pattern such as `config*.ts` also
+gives the credit to source files such as `src/configUtils.ts`.
+
+A built-in plugin can opt a pattern out of this credit with
+`config_default_export_opt_out` (a `define_plugin!` field and a `Plugin`
+trait method). Use it when the tool reads named exports (Gatsby
+`gatsby-node`), or when the pattern also matches ordinary source files
+(GraphQL Codegen `codegen*`, Serverless `serverless.*`, Vercel `vercel.*`).
+Each opt-out entry must be identical to an entry of `config_patterns`.
+External plugins have no opt-out: leave a pattern out of `configPatterns` and
+list it in `alwaysUsed` instead.
+
 ### `alwaysUsed`
 
 Files that should always be considered used when this plugin is active, even if nothing imports them.
