@@ -25,6 +25,7 @@ use std::sync::{Mutex, OnceLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use fallow_types::ANALYSIS_DIAGNOSTIC_LOG_TARGET;
 use fallow_types::path_util::display_relative;
 pub use fallow_types::workspace::{WorkspaceDiagnostic, WorkspaceDiagnosticKind};
 
@@ -244,7 +245,7 @@ pub(super) fn emit_diagnostics(root: &Path, diagnostics: &[WorkspaceDiagnostic])
 
     for plan in plan_warnings(root, diagnostics) {
         if should_emit(plan.dedupe_key) {
-            tracing::warn!("fallow: {}", plan.message);
+            tracing::warn!(target: ANALYSIS_DIAGNOSTIC_LOG_TARGET, "fallow: {}", plan.message);
         }
     }
 }
@@ -553,6 +554,17 @@ pub fn node_modules_missing(root: &Path) -> bool {
     !root.join("node_modules").is_dir() && !super::is_deno_without_node_modules(root)
 }
 
+/// The install state of `root`, by the same rule as [`node_modules_missing`].
+/// A Deno project without `package.json` counts as present.
+#[must_use]
+pub fn node_modules_state(root: &Path) -> fallow_types::workspace::NodeModulesState {
+    if node_modules_missing(root) {
+        fallow_types::workspace::NodeModulesState::Missing
+    } else {
+        fallow_types::workspace::NodeModulesState::Present
+    }
+}
+
 /// Build the missing-`node_modules` diagnostic for `root`, or `None` once the
 /// project has been installed.
 ///
@@ -583,11 +595,17 @@ pub fn missing_node_modules_diagnostic(root: &Path) -> Option<WorkspaceDiagnosti
 /// exact same values as the process registry used by direct core and CLI paths.
 #[must_use]
 pub fn record_source_parse_degradations(
-    root: &Path,
+    config: &crate::ResolvedConfig,
     degradations: &[fallow_types::extract::SourceParseDegradation],
 ) -> Vec<WorkspaceDiagnostic> {
+    let root = config.root.as_path();
     let diagnostics: Vec<WorkspaceDiagnostic> = degradations
         .iter()
+        .filter(|degradation| {
+            !config
+                .ignore_findings
+                .is_ignored_path(root, &degradation.path)
+        })
         .map(|degradation| {
             WorkspaceDiagnostic::new(
                 root,

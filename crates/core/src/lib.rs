@@ -1286,11 +1286,11 @@ fn try_load_analysis_graph_cache(
 
     if let Some(rejection) = store.manifest.classify_resolution_mismatch(&current) {
         // The level is the rejection's own judgement of whether the reader can
-        // do anything about it. Content drift is what a cache is for, so it
-        // stays off stderr and is read from doctor or the performance table
-        // instead; `describe()` already names the reason, so no field repeats it.
+        // act on it. Content drift is what a cache is for, so it stays off
+        // stderr; doctor and the performance table show it.
         if rejection.discarded_existing_work() {
             tracing::warn!(
+                target: fallow_types::ANALYSIS_DIAGNOSTIC_LOG_TARGET,
                 "Graph cache decoded but not reused: {}",
                 rejection.describe()
             );
@@ -1663,10 +1663,8 @@ fn parse_analysis_modules(
         &config.flags.patterns(),
     );
     let _ = fallow_config::record_source_read_failures(&config.root, &parse_result.read_failures);
-    let _ = fallow_config::record_source_parse_degradations(
-        &config.root,
-        &parse_result.parse_degradations,
-    );
+    let _ =
+        fallow_config::record_source_parse_degradations(config, &parse_result.parse_degradations);
     let modules = parse_result.modules;
     let parse_ms = start.elapsed().as_secs_f64() * 1000.0;
     let cache_ms = update_parse_cache_if_enabled(
