@@ -28,6 +28,7 @@ mod audit_diff_risk_tests;
 mod audit_test_file_gate_tests;
 mod audit_test_reach_tests;
 mod audit_tests;
+mod audit_unprovable_base_tests;
 mod audit_worsened_tests;
 mod baseline_growth_tests;
 mod baseline_install_state_tests;
