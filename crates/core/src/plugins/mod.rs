@@ -1,11 +1,9 @@
 //! Plugin system for framework-aware codebase analysis.
 //!
-//! The plugin system reads JS, TS and JSON config files with the Oxc parser and
-//! walks the AST. It never runs JavaScript.
-//!
-//! Each plugin implements the [`Plugin`] trait with:
-//! - **Static defaults**: Entry patterns, config file patterns, used exports
-//! - **Dynamic resolution**: config files add entries, dependencies and setup files
+//! Plugins read JS, TS and JSON config files with the Oxc parser and walk the
+//! AST. They never run JavaScript. Each plugin implements the [`Plugin`] trait
+//! with static defaults (entry patterns, config file patterns, used exports)
+//! and reads config files for entries, dependencies and setup files.
 
 use std::path::{Path, PathBuf};
 
@@ -75,6 +73,7 @@ const RUNTIME_ENTRY_POINT_PLUGINS: &[&str] = &[
     "tsup",
     "vercel",
     "vite",
+    "vite-plus",
     "vitepress",
     "waku",
     "webpack",
@@ -2169,6 +2168,7 @@ mod varlock;
 mod velite;
 mod vercel;
 mod vite;
+pub(crate) mod vite_plus;
 mod vitepress;
 mod vitest;
 mod vscode;
