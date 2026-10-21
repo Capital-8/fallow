@@ -411,13 +411,41 @@ tests detect the mutant.
 | `survived` | `timeout` | `survived` |
 | `timeout` | `timeout` | `timeout` |
 | `timeout` | `killed` | `killed` |
+| `survived` | `killed` by a test that the first run did not execute | `killed` |
 | any | `runtime_error` | `runtime_error` |
 | any | other result | `flaky` |
 
 - A `survived` result with a `timeout` retry stays `survived`. The first
   run finished all tests with the mutant active. Host load alone can make
   the retry time out, so the timeout is no proof that the tests detect the
-  mutant. A `killed` retry of a survivor gives `flaky`.
+  mutant. A `killed` retry of a survivor gives `flaky` when a test of the
+  first run kills it.
+- The retry of a survivor runs each passing test of the files of its
+  covering tests, not only the covering tests (issue #3670). The per-test
+  hits of the dry run name only the tests that execute the mutated code. A
+  test can read a value that an earlier test of its file computed and
+  cached, so the dry run gives that test no hit. The first run stays
+  narrow, because most mutants are killed. A static mutant and a runner
+  without `test_filter` already run whole files, so their retry runs the
+  same tests.
+- A kill in the retry by a test that the first run did not execute is no
+  disagreement with the first run, so the status is `killed`. A test can
+  fail in a run of part of its file because it depends on the order of the
+  tests. Thus the scheduler keeps this kill only when the retry tests pass
+  in a control run with no active mutant (one control run for each test
+  set, the same memo as for a kill with no executed test). When the control
+  run fails, the first run decides: the mutant stays `survived`, and the
+  failed tests are baseline failures.
+- The retry of a survivor stops at the first failing test, and that test
+  decides the status. The companion runs the tests of each file in file
+  order, so a new test can fail before a test of the first run. The result
+  is then `killed`, also when the test of the first run would fail too.
+  Before, such a pair of runs was `flaky`. The control run still guards the
+  kill, and the mutant fails a test in both cases.
+- `covering_tests` of a retried survivor stays the dry-run hits of the
+  first run. It names the tests that reached the mutant and need an
+  assertion. A kill by a test of the retry can thus name a `killed_by` test
+  that is not in `covering_tests`.
 - The retry of a `timeout` waits twice as long. Host load often lasts into
   the retry, and a real infinite loop still times out.
 - A `killed` result gets no retry. In repeated runs under host load, no
@@ -428,8 +456,8 @@ tests detect the mutant.
 - With `--time-budget`, the first pass keeps time free for the retries of
   the survivors and timeouts that it found. Before each new mutant run, it
   adds these parts to the current time: the estimated retry time of each
-  suspect (the measured run time, twice for a timeout, divided by
-  `--concurrency` or by the suspect count when that count is smaller), the
+  suspect (the measured run time, divided by `--concurrency` or by the
+  suspect count when that count is smaller), the
   setup and dry-run time of the retry companions, and
   twice the mean run time. When the sum reaches the deadline, the next
   mutants stay `pending`. Thus a budgeted run confirms its survivors, the
@@ -438,6 +466,11 @@ tests detect the mutant.
   repeat run does it again. The reserve uses measured run times, so the
   first run of each worker starts without a reserve. A budget that is
   shorter than one wave of runs can still end before any retry.
+  For a survivor, the reserve adds to its measured run time the dry-run
+  time that the other tests of its files add to its retry. A timeout
+  reserves twice its run time. The control run that confirms a kill by a
+  new test is not in the reserve. When no time is left for it, the retry
+  gets no result and the mutant keeps its first status.
 - A run that started before the deadline continues until its watchdog
   fires, so the command can end after the deadline. For a mutant run, the
   overrun is at most `timeout_ms` plus the setup time plus 2 seconds. For
@@ -872,7 +905,9 @@ The key hashes these parts:
 - the key format and the Fallow version;
 - the runner name, the runner version and the runtime version;
 - the mutant id, and the content of the mutated source file;
-- the covering test ids;
+- the covering test ids of the first run. The retry of a survivor adds
+  only tests of the same files, so the file digests below also cover the
+  tests of the retry;
 - the content of the covering test files, and of the files that they reach
   through static imports in the module graph (`MutationPlan::test_file_reach`).
   The run computes one digest for each test file and its reach, and each
