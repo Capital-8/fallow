@@ -1,5 +1,6 @@
-import { SyntaxKind } from "typescript/unstable/ast";
-import {
+import { SyntaxKind, ast } from "./backend.mjs";
+
+const {
   isArrayLiteralExpression,
   isBinaryExpression,
   isBindingElement,
@@ -21,7 +22,7 @@ import {
   isSpreadElement,
   isStringLiteralLikeNode,
   isVariableDeclaration,
-} from "typescript/unstable/ast/is";
+} = ast;
 
 // A shorthand name is one identifier with two meanings. The checker resolves
 // it to the local binding, so the property it reads, or the import it
