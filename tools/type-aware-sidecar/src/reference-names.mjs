@@ -30,9 +30,10 @@ const exportNames = ({ exportClause }) => {
   return [exportClause.name];
 };
 
-const moduleBodyNames = (body) => {
-  if (body && isModuleDeclaration(body)) return moduleBodyNames(body.body);
-  return body && isModuleBlock(body) ? body.statements.flatMap(statementAliasNames) : [];
+/** Returns the statements of a `namespace` or `declare module` body, also when nested. */
+export const moduleBodyStatements = (body) => {
+  if (body && isModuleDeclaration(body)) return moduleBodyStatements(body.body);
+  return body && isModuleBlock(body) ? body.statements : [];
 };
 
 const statementAliasNames = (statement) => {
@@ -41,26 +42,32 @@ const statementAliasNames = (statement) => {
     return [statement.name];
   }
   if (isExportDeclaration(statement)) return exportNames(statement);
-  if (isModuleDeclaration(statement)) return moduleBodyNames(statement.body);
+  if (isModuleDeclaration(statement)) {
+    return moduleBodyStatements(statement.body).flatMap(statementAliasNames);
+  }
   return [];
 };
 
 // Default-library and external-library files sit below node_modules. The
 // path check skips them before the source file and its metadata, which each
 // cost a checker round trip.
-const NODE_MODULES_SEGMENT = /[\\/]node_modules[\\/]/u;
+export const NODE_MODULES_SEGMENT = /[\\/]node_modules[\\/]/u;
 
 const isOwnSourceFile = (project, sourceFile) =>
   Boolean(sourceFile) &&
   !project.program.isSourceFileDefaultLibrary(sourceFile) &&
   !project.program.isSourceFileFromExternalLibrary(sourceFile);
 
-const programAliasNames = (project) =>
+/** Returns the program files outside node_modules and the default libraries. */
+export const ownSourceFiles = (project) =>
   project.program
     .getSourceFileNames()
     .filter((fileName) => !NODE_MODULES_SEGMENT.test(fileName))
     .map((fileName) => project.program.getSourceFile(fileName))
-    .filter((sourceFile) => isOwnSourceFile(project, sourceFile))
+    .filter((sourceFile) => isOwnSourceFile(project, sourceFile));
+
+const programAliasNames = (project) =>
+  ownSourceFiles(project)
     .flatMap((sourceFile) => sourceFile.statements.flatMap(statementAliasNames))
     .map((name) => name?.text)
     .filter((text) => typeof text === "string");
