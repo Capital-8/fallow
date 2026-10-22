@@ -75,6 +75,8 @@ mod visit_package_resolution;
 mod visit_pinia;
 #[path = "visit_impl_playwright.rs"]
 mod visit_playwright;
+#[path = "visit_impl_program_facts.rs"]
+mod visit_program_facts;
 #[path = "visit_impl_projections.rs"]
 pub(super) mod visit_projections;
 #[path = "visit_impl_reflection.rs"]
@@ -3752,13 +3754,8 @@ impl<'a> ModuleInfoExtractor {
 
 impl<'a> Visit<'a> for ModuleInfoExtractor {
     fn visit_program(&mut self, program: &Program<'a>) {
-        // Capture file-level string directives (`"use client"`, `"use server"`)
-        // for the security client-server-leak detector. `directive.directive` is
-        // the cooked directive text without surrounding quotes.
-        for directive in &program.directives {
-            self.directives
-                .push(directive.directive.as_str().to_string());
-        }
+        self.record_top_level_runtime_statement(program);
+        self.record_program_directives(program);
         self.is_server_action_module = visit_server_actions::is_server_action_module(program);
         self.is_module_file = program_has_module_syntax(program);
         self.has_global_declarations =
