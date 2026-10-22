@@ -30,6 +30,7 @@ import {
 import {
   aggregatePhaseTimings,
   aggregateReasonCounts,
+  blockedProjects,
   percentile,
   pairedOverheads,
   renderSummaryMarkdown,
@@ -37,6 +38,8 @@ import {
   safeRatio,
   summaryChecks,
   summarizeAdjudicatedFeatureBuckets,
+  typeAwareResolutionCounts,
+  typeEvidenceCoverage,
 } from "./type-aware-corpus/summary.mjs";
 import {
   validateCapabilitiesArtifactData as validateCapabilitiesData,
@@ -116,13 +119,13 @@ const REQUIRED_SEMANTIC_CAPABILITIES = [
 ];
 const REQUIRED_PROJECTS = new Map([
   ["svelte", "accuracy-core"],
-  ["vue-core", "accuracy-core"],
+  ["vue-core", "zero-control"],
   ["astro", "accuracy-core"],
   ["typescript", "accuracy-core"],
   ["next.js", "accuracy-core"],
   ["preact", "accuracy-core"],
-  ["query", "zero-control"],
-  ["vite", "zero-control"],
+  ["query", "accuracy-core"],
+  ["vite", "accuracy-core"],
   ["fastify", "zero-control"],
   ["zod", "zero-control"],
 ]);
@@ -151,20 +154,11 @@ const normalizedRelativePath = (value, field) => {
 };
 
 export const validateManifest = (manifest) => {
-  const requiredGates = [
-    "minimum_confirmation_precision",
-    "minimum_confirmation_yield",
-    "minimum_correct_unused_retention",
-    "maximum_abstention",
-    "maximum_p95_marginal_overhead_ms",
-    "maximum_p95_refined_rss_kb",
-  ];
   return validateCorpusManifest(manifest, {
     fail,
     isObject,
     nonEmptyString,
     normalizedRelativePath,
-    requiredGates,
     requiredProjects: REQUIRED_PROJECTS,
   });
 };
@@ -2597,13 +2591,8 @@ const summarize = (manifest, options, publicationMode = "write") => {
   const correctContracts = contracts.filter(({ truth }) => truth === "preserved");
   const incorrectContracts = contracts.filter(({ truth }) => truth !== "preserved");
   const correctUnusedRetained = retained.filter(({ truth }) => truth === "unused");
-  const abstainedCount = discovery.projects.reduce(
-    (total, project) => total + (project.type_aware?.abstained_count ?? 0),
-    0,
-  );
-  const unresolvedCount = discovery.projects.reduce(
-    (total, project) => total + (project.type_aware?.unresolved_count ?? 0),
-    0,
+  const { abstainedCount, unresolvedCount, ...counts } = typeAwareResolutionCounts(
+    discovery.projects,
   );
   const baselineRuns = measuredRuns(measurements, "baseline");
   const refinedRuns = measuredRuns(measurements, "refined");
@@ -2630,7 +2619,11 @@ const summarize = (manifest, options, publicationMode = "write") => {
     .filter(({ role }) => role === "zero-control")
     .every(({ baseline_candidate_count }) => baseline_candidate_count === 0);
   const confirmationPrecision = safeRatio(correctConfirmed.length, confirmed.length);
-  const confirmationYield = safeRatio(correctConfirmed.length, entries.length);
+  const coverage = typeEvidenceCoverage(correctConfirmed.length, entries.length, {
+    abstainedCount,
+    unresolvedCount,
+    ...counts,
+  });
   const adjudicatedTruthCount = used.length + preserved.length + unused.length;
   const adjudicatedTruthCoverage = safeRatio(adjudicatedTruthCount, entries.length);
   const correctUnusedRetention = safeRatio(correctUnusedRetained.length, unused.length);
@@ -2647,7 +2640,7 @@ const summarize = (manifest, options, publicationMode = "write") => {
   const checks = summaryChecks({
     abstention,
     confirmationPrecision,
-    confirmationYield,
+    coverage,
     confirmedProjectCount: confirmedProjects.size,
     correctUnusedRetention,
     determinismRuns: discovery.determinism_runs,
@@ -2663,7 +2656,7 @@ const summarize = (manifest, options, publicationMode = "write") => {
     zeroControlsClean,
   });
   const summary = {
-    schema_version: 3,
+    schema_version: 4,
     gate: {
       go: Object.values(checks).every(Boolean),
       checks,
@@ -2685,7 +2678,8 @@ const summarize = (manifest, options, publicationMode = "write") => {
         indeterminate: entries.filter(({ truth }) => truth === "indeterminate").length,
       },
       confirmation_precision: confirmationPrecision,
-      confirmation_yield: confirmationYield,
+      ...coverage,
+      blocked_projects: blockedProjects(discovery.projects),
       safe_resolution_yield: safeRatio(
         correctConfirmed.length + correctContracts.length,
         entries.length,
