@@ -10,7 +10,7 @@ use crate::MemberKind;
 /// extraction semantics change, and give the reason in the commit message and
 /// the CHANGELOG. A stale version serves old extraction results from a warm
 /// cache. The `assert_cached_type_size!` guards below catch shape changes.
-pub(super) const CACHE_VERSION: u32 = 377;
+pub(super) const CACHE_VERSION: u32 = 378;
 
 /// Duplication token cache version. Bump it when duplicate tokenization,
 /// normalization, or the on-disk token cache schema changes, and give the
@@ -144,6 +144,8 @@ pub struct CachedModule {
     pub parse_error_count: u32,
     /// Whether the parser abandoned this file instead of recovering.
     pub parse_panicked: bool,
+    /// Whether the file nests too deep to parse, so it was not parsed.
+    pub parse_nesting_too_deep: bool,
     /// Whether this module uses CJS exports.
     pub has_cjs_exports: bool,
     /// Whether this module declares at least one Angular `@Component({
