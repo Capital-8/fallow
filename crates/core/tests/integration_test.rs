@@ -59,6 +59,8 @@ mod dependencies;
 mod deprecated_exports;
 #[path = "integration_test/directory_resolution.rs"]
 mod directory_resolution;
+#[path = "integration_test/dotenv_plugin.rs"]
+mod dotenv_plugin;
 #[path = "integration_test/duplicate_prop_shape.rs"]
 mod duplicate_prop_shape;
 #[path = "integration_test/dynamic_import_glob_excludes.rs"]

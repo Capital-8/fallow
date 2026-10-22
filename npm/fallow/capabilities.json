@@ -8280,7 +8280,7 @@
     ]
   },
   "plugins": {
-    "count": 148,
+    "count": 149,
     "note": "Built-in framework plugins, auto-activated when their enabler dependency is present; run fallow list --plugins for the set active in a specific project",
     "names": [
       "nextjs",
@@ -8421,6 +8421,7 @@
       "nodemon",
       "pm2",
       "dependency-cruiser",
+      "dotenv",
       "wuchale",
       "varlock",
       "pnpm",
