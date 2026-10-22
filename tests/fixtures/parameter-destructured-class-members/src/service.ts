@@ -18,6 +18,18 @@ export class Service {
   viaLeafDefault(): void {}
   viaNestedLiteralPath(): void {}
   viaNestedDefaultPath(): void {}
+  viaForOfLiteral(): void {}
+  viaForOfTyped(): void {}
+  viaForOfAssign(): void {}
+  viaForOfSpread(): void {}
+  viaParamInitializer(): void {}
+  viaNestedParamInitializer(): void {}
+  viaTypeofParam(): void {}
+  viaTypeofNested(): void {}
+  viaTypeofQualified(): void {}
+  viaGetter(): void {}
+  viaSpread(): void {}
+  viaSpreadLiteral(): void {}
   untypedOnly(): void {}
   signatureOnly(): void {}
   dead(): void {}
