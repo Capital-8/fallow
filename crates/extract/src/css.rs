@@ -18,6 +18,9 @@ use std::sync::LazyLock;
 use oxc_span::Span;
 use rustc_hash::FxHashSet;
 
+use crate::css_mask::{
+    mask_sass_module_members, mask_view_transition_arguments, mask_with_whitespace,
+};
 use crate::css_module_classes::lightningcss_class_set;
 use crate::{ExportInfo, ExportName, ImportInfo, ImportedName, ModuleInfo, VisibilityTag};
 use fallow_types::discover::FileId;
@@ -719,29 +722,6 @@ pub fn scan_stylesheet_tokens(source: &str) -> StylesheetTokens {
     }
 }
 
-/// Mask every regex match in `src` with ASCII spaces (`0x20`) of equal byte
-/// length, so byte offsets in the returned string correspond 1:1 to byte
-/// offsets in the original.
-///
-/// Used to neutralise CSS comments, quoted strings, `url(...)`, and at-rule
-/// preludes before scanning for `.class` selectors, while preserving the
-/// original-source positions that callers need to populate `ExportInfo.span`
-/// (issue #549). The `regex` crate guarantees match boundaries respect UTF-8
-/// char boundaries, so the masked buffer is always valid UTF-8.
-fn mask_with_whitespace(src: &str, re: &regex::Regex) -> String {
-    let mut out = String::with_capacity(src.len());
-    let mut cursor = 0;
-    for m in re.find_iter(src) {
-        out.push_str(&src[cursor..m.start()]);
-        for _ in m.start()..m.end() {
-            out.push(' ');
-        }
-        cursor = m.end();
-    }
-    out.push_str(&src[cursor..]);
-    out
-}
-
 /// Extract class names from a CSS module file as named exports.
 ///
 /// For standard CSS, lightningcss parses the source into an AST and supplies the
@@ -792,8 +772,10 @@ fn scan_css_module_exports(
 
 fn mask_css_module_class_candidates(comment_masked: &str, has_class_filter: bool) -> String {
     let mut masked = mask_with_whitespace(comment_masked, &CSS_NON_SELECTOR_RE);
+    masked = mask_view_transition_arguments(&masked);
     if !has_class_filter {
         masked = mask_with_whitespace(&masked, &CSS_AT_RULE_PRELUDE_RE);
+        masked = mask_sass_module_members(&masked);
     }
     mask_css_module_global_scopes(masked)
 }
@@ -1090,7 +1072,7 @@ pub(crate) fn parse_css_to_module(
         .and_then(|e| e.to_str())
         .is_some_and(|ext| matches!(ext, "scss" | "sass" | "less"));
 
-    let stripped = mask_css_comments(source, is_scss);
+    let stripped = crate::css_mask::mask_sass_shorthand(mask_css_comments(source, is_scss), path);
     let imports = build_css_imports(&stripped, is_scss);
 
     let exports = if is_css_module_file(path) {
@@ -1899,23 +1881,6 @@ mod tests {
         let body = r#"@use "./src/styles/global.scss";"#;
         let imports = extract_css_imports(body, true);
         assert_eq!(imports, vec!["./src/styles/global.scss"]);
-    }
-
-    #[test]
-    fn mask_with_whitespace_preserves_byte_length() {
-        let src = "/* hello */ .foo { }";
-        let masked = mask_with_whitespace(src, &CSS_COMMENT_RE);
-        assert_eq!(masked.len(), src.len());
-        assert!(masked.is_char_boundary(src.len()));
-    }
-
-    #[test]
-    fn mask_with_whitespace_preserves_offsets_around_multibyte() {
-        let src = "/* \u{2713} */ .foo { }";
-        let foo_offset = src.find(".foo").expect("`.foo` present");
-        let masked = mask_with_whitespace(src, &CSS_COMMENT_RE);
-        assert_eq!(masked.len(), src.len());
-        assert_eq!(masked.find(".foo"), Some(foo_offset));
     }
 
     /// Resolve a span's start to (line, col) using the same primitives the
