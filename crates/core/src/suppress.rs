@@ -210,6 +210,16 @@ impl<'a> SuppressionContext<'a> {
             .count()
     }
 
+    /// [`Self::find_stale_except`] with no suppression kept out.
+    #[cfg(test)]
+    pub(crate) fn find_stale(
+        &self,
+        graph: &ModuleGraph,
+        config: &ResolvedConfig,
+    ) -> Vec<StaleSuppression> {
+        self.find_stale_except(graph, config, |_, _| false)
+    }
+
     /// Collect all suppressions that were never consumed by any detector.
     ///
     /// Skips suppression kinds that are checked in the CLI layer
@@ -220,10 +230,15 @@ impl<'a> SuppressionContext<'a> {
     /// detector never ran, so the suppression appears unconsumed, but is
     /// not actually stale (it documents intentional dormancy and becomes
     /// valid again the moment the rule is re-enabled). See issue #482.
-    pub(crate) fn find_stale(
+    ///
+    /// Also skips an unconsumed suppression when
+    /// `is_needed(file_id, suppression)` returns `true`. The caller uses this
+    /// for a suppression that another analysis mode needs (issue #3825).
+    pub(crate) fn find_stale_except(
         &self,
         graph: &ModuleGraph,
         config: &ResolvedConfig,
+        is_needed: impl Fn(FileId, &Suppression) -> bool,
     ) -> Vec<StaleSuppression> {
         let mut stale = Vec::new();
         let mut warned_unknown_policy_targets: FxHashSet<(String, String)> = FxHashSet::default();
@@ -234,7 +249,7 @@ impl<'a> SuppressionContext<'a> {
             let file_rules = config.resolve_rules_for_path(path);
 
             for (i, s) in supps.iter().enumerate() {
-                if used[i].load(Ordering::Relaxed) {
+                if used[i].load(Ordering::Relaxed) || is_needed(file_id, s) {
                     continue;
                 }
                 if let Some(entry) = stale_entry_for_suppression(
@@ -327,7 +342,7 @@ impl<'a> SuppressionContext<'a> {
     /// impact records which suppressions are in play each run and looks for ones
     /// that newly appeared covering a disappeared finding's kind.
     ///
-    /// Unlike [`Self::find_stale`], this returns ALL present suppressions
+    /// Unlike [`Self::find_stale_except`], this returns ALL present suppressions
     /// regardless of whether a core detector consumed them, and across every
     /// kind (dead-code, complexity, code-duplication, ...). Impact only needs to
     /// know a suppression for `(file, kind)` exists; a present-but-stale entry is
