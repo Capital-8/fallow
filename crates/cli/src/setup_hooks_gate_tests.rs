@@ -19,6 +19,7 @@ const STUB_FALLOW: &str = "#!/bin/sh\n\
 if [ \"$1\" = \"--version\" ]; then echo 'fallow 9.0.0'; exit 0; fi\n\
 pwd -P >> \"$FALLOW_STUB_LOG\"\n\
 if [ -f .stub-error ]; then echo '{\"error\":true,\"message\":\"stub\"}'; exit 2; fi\n\
+if [ -f .stub-report ]; then cat .stub-report; exit 1; fi\n\
 if [ -f .stub-fail ]; then echo '{\"verdict\":\"fail\"}'; else echo '{\"verdict\":\"pass\"}'; fi\n";
 
 /// A file that makes the stub return a fail verdict in its directory.
@@ -26,6 +27,9 @@ const STUB_FAIL_MARKER: &str = ".stub-fail";
 
 /// A file that makes the stub report a runtime error in its directory.
 const STUB_ERROR_MARKER: &str = ".stub-error";
+
+/// A file whose content the stub prints as the audit report, with exit 1.
+const STUB_REPORT_FILE: &str = ".stub-report";
 
 /// Environment variables that point git at a different repository. A git
 /// hook that runs the test suite sets some of them.
@@ -130,6 +134,22 @@ fn run_gate_with_debug(
     payload: &serde_json::Value,
     debug: bool,
 ) -> GateRun {
+    let env: &[(&str, &str)] = if debug {
+        &[("FALLOW_GATE_DEBUG", "1")]
+    } else {
+        &[]
+    };
+    run_gate_with_env(script, process_dir, home, payload, env)
+}
+
+/// Same as `run_gate`, with extra environment variables for the gate.
+fn run_gate_with_env(
+    script: &Path,
+    process_dir: &Path,
+    home: &Path,
+    payload: &serde_json::Value,
+    env: &[(&str, &str)],
+) -> GateRun {
     use std::os::unix::fs::PermissionsExt;
 
     let stub = tempdir().unwrap();
@@ -155,15 +175,15 @@ fn run_gate_with_debug(
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env_remove("FALLOW_GATE_DEBUG")
+        .env_remove("FALLOW_GATE_OUTPUT")
+        .env_remove("FALLOW_GATE_REPORT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for var in GIT_LOCATION_VARS {
         cmd.env_remove(var);
     }
-    if debug {
-        cmd.env("FALLOW_GATE_DEBUG", "1");
-    }
+    cmd.envs(env.iter().copied());
     let mut child = cmd.spawn().expect("spawn bash");
     child
         .stdin
@@ -292,6 +312,425 @@ fn gate_audits_an_install_root_below_the_git_root() {
 
     let run = run_gate(&gate, &repo, &root.join("home"), &commit_payload(&session));
     assert_audited_in(&run, &app, "install root below the git root");
+}
+
+/// A fail report in the shape of `fallow audit --format json` with
+/// `gate = "new-only"`: introduced and inherited findings in several sections.
+fn new_only_fail_report() -> serde_json::Value {
+    let actions = serde_json::json!([{ "type": "suppress-line", "auto_fixable": false }]);
+    serde_json::json!({
+        "kind": "audit",
+        "verdict": "fail",
+        "attribution": { "gate": "new-only" },
+        "dead_code": {
+            "unused_exports": [
+                {
+                    "path": "src/a.ts", "export_name": "oldUnused", "line": 1, "col": 36,
+                    "finding_id": "dc1:unused-export:08ede472ae8845da", "actions": actions,
+                    "introduced": false, "effective_severity": "error"
+                },
+                {
+                    "path": "src/a.ts", "export_name": "newUnused", "line": 2, "col": 13,
+                    "finding_id": "dc1:unused-export:99e35a691173c407", "actions": actions,
+                    "introduced": true, "effective_severity": "error"
+                }
+            ],
+            "circular_dependencies": [{
+                "files": ["src/b.ts", "src/c.ts"], "length": 2, "line": 3, "col": 0,
+                "finding_id": "dc1:circular-dependency:1", "actions": actions,
+                "introduced": true, "effective_severity": "error"
+            }]
+        },
+        "complexity": {
+            "findings": [{
+                "path": "src/d.ts", "name": "parse", "line": 40, "col": 2,
+                "severity": "high", "effective_severity": "error", "actions": actions,
+                "introduced": true
+            }],
+            "styling_findings": [{
+                "code": "css-token-drift", "path": "src/e.css", "line": 9,
+                "value": "font-size: 1em", "effective_severity": "warn", "actions": actions,
+                "introduced": true
+            }]
+        },
+        "duplication": {
+            "clone_groups": [{
+                "instances": [
+                    { "file": "src/f.ts", "start_line": 10, "end_line": 30 },
+                    { "file": "src/g.ts", "start_line": 5, "end_line": 25 }
+                ],
+                "token_count": 120, "line_count": 20, "actions": actions, "introduced": true
+            }]
+        }
+    })
+}
+
+/// A block lists only the findings that caused it, one line each, and the
+/// path of the full report. It does not print the JSON report on stderr.
+#[test]
+fn gate_block_message_lists_the_introduced_findings() {
+    if skip_without_tools() {
+        return;
+    }
+    let (_tmp, root) = spaced_root();
+    let repo = root.join("repo");
+    init_repo(&repo);
+    let gate = install_gate(&repo, ".claude");
+    let report = new_only_fail_report();
+    std::fs::write(repo.join(STUB_REPORT_FILE), report.to_string()).unwrap();
+
+    let run = run_gate(&gate, &repo, &root.join("home"), &commit_payload(&repo));
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert_eq!(run.output.status.code(), Some(2), "stderr={stderr}");
+    let report_path = repo.join(".fallow/gate-report.json");
+    assert_eq!(
+        stderr,
+        format!(
+            "fallow-gate: blocked by fallow 9.0.0 at {bin}\n\
+             fallow-gate: verdict fail, 4 finding(s) caused the block:\n  \
+             unused-export src/a.ts:2 newUnused\n  \
+             circular-dependency src/b.ts:3\n  \
+             complexity src/d.ts:40 parse\n  \
+             duplication src/f.ts:10\n\
+             fallow-gate: full report: {report}\n",
+            bin = stderr
+                .lines()
+                .next()
+                .and_then(|line| line.rsplit_once(" at "))
+                .map_or("", |(_, bin)| bin),
+            report = report_path.display(),
+        ),
+    );
+    let written: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&report_path).unwrap()).unwrap();
+    assert_eq!(written, report, "the report file must hold the full report");
+    assert_eq!(
+        std::fs::read_to_string(repo.join(".fallow/.gitignore")).unwrap(),
+        "*\n",
+        "the report directory must ignore itself"
+    );
+}
+
+/// FALLOW_GATE_REPORT moves the report. FALLOW_GATE_OUTPUT=json prints the
+/// full report on stderr, as the gate did before the compact message.
+#[test]
+fn gate_block_message_honors_the_report_and_output_settings() {
+    if skip_without_tools() {
+        return;
+    }
+    let (_tmp, root) = spaced_root();
+    let repo = root.join("repo");
+    init_repo(&repo);
+    let gate = install_gate(&repo, ".claude");
+    let report = new_only_fail_report();
+    std::fs::write(repo.join(STUB_REPORT_FILE), report.to_string()).unwrap();
+    let home = root.join("home");
+
+    let run = run_gate_with_env(
+        &gate,
+        &repo,
+        &home,
+        &commit_payload(&repo),
+        &[("FALLOW_GATE_REPORT", "reports/gate.json")],
+    );
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert_eq!(run.output.status.code(), Some(2), "stderr={stderr}");
+    let moved = repo.join("reports/gate.json");
+    assert!(
+        stderr.ends_with(&format!("fallow-gate: full report: {}\n", moved.display())),
+        "stderr={stderr}"
+    );
+    assert!(
+        moved.is_file(),
+        "the report must move to FALLOW_GATE_REPORT"
+    );
+    assert!(!repo.join(".fallow/gate-report.json").exists());
+
+    let run = run_gate_with_env(
+        &gate,
+        &repo,
+        &home,
+        &commit_payload(&repo),
+        &[("FALLOW_GATE_OUTPUT", "json")],
+    );
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert_eq!(run.output.status.code(), Some(2), "stderr={stderr}");
+    let (head, json) = stderr.split_once('\n').unwrap();
+    assert!(head.starts_with("fallow-gate: blocked by fallow 9.0.0 at "));
+    let printed: serde_json::Value = serde_json::from_str(json).unwrap();
+    assert_eq!(printed, report);
+    assert!(!repo.join(".fallow/gate-report.json").exists());
+}
+
+/// Returns the report path that the block message names.
+fn named_report_path(stderr: &str) -> PathBuf {
+    stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("fallow-gate: full report: "))
+        .map_or_else(
+            || panic!("no report path in stderr={stderr}"),
+            PathBuf::from,
+        )
+}
+
+/// A symbolic link in the audited tree must not make the gate write outside
+/// the tree. The gate refuses a link at `.fallow`, at the report file, or at a
+/// directory of a relative FALLOW_GATE_REPORT, and names a temporary copy of
+/// the report. It does not write a `.fallow/.gitignore` that is a link.
+#[test]
+fn gate_block_message_does_not_write_through_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    if skip_without_tools() {
+        return;
+    }
+    let report = new_only_fail_report();
+    let cases: [(&str, &[(&str, &str)]); 3] = [
+        (".fallow", &[]),
+        (".fallow/gate-report.json", &[]),
+        ("reports", &[("FALLOW_GATE_REPORT", "reports/gate.json")]),
+    ];
+    for (link, env) in cases {
+        let (_tmp, root) = spaced_root();
+        let repo = root.join("repo");
+        init_repo(&repo);
+        let gate = install_gate(&repo, ".claude");
+        std::fs::write(repo.join(STUB_REPORT_FILE), report.to_string()).unwrap();
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("victim");
+        std::fs::write(&victim, "keep\n").unwrap();
+        std::fs::create_dir_all(repo.join(link).parent().unwrap()).unwrap();
+        let target = if link == ".fallow/gate-report.json" {
+            &victim
+        } else {
+            &outside
+        };
+        symlink(target, repo.join(link)).unwrap();
+
+        let run = run_gate_with_env(
+            &gate,
+            &repo,
+            &root.join("home"),
+            &commit_payload(&repo),
+            env,
+        );
+        let stderr = String::from_utf8_lossy(&run.output.stderr);
+        assert_eq!(run.output.status.code(), Some(2), "{link}: stderr={stderr}");
+        let named = named_report_path(&stderr);
+        assert!(
+            !named.starts_with(&root),
+            "{link}: the message must name the temporary report; stderr={stderr}"
+        );
+        let kept: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&named).unwrap()).unwrap();
+        assert_eq!(kept, report, "{link}: the temporary report must stay");
+        std::fs::remove_file(&named).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "keep\n",
+            "{link}"
+        );
+        let written: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            written,
+            ["victim"],
+            "{link}: nothing may land outside the tree"
+        );
+        assert!(repo.join(link).is_symlink(), "{link}: the link must stay");
+    }
+
+    let (_tmp, root) = spaced_root();
+    let repo = root.join("repo");
+    init_repo(&repo);
+    let gate = install_gate(&repo, ".claude");
+    std::fs::write(repo.join(STUB_REPORT_FILE), report.to_string()).unwrap();
+    std::fs::create_dir_all(repo.join(".fallow")).unwrap();
+    let dangling = root.join("outside-gitignore");
+    symlink(&dangling, repo.join(".fallow/.gitignore")).unwrap();
+
+    let run = run_gate(&gate, &repo, &root.join("home"), &commit_payload(&repo));
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert_eq!(run.output.status.code(), Some(2), "stderr={stderr}");
+    assert_eq!(
+        named_report_path(&stderr),
+        repo.join(".fallow/gate-report.json")
+    );
+    assert!(
+        !dangling.exists(),
+        "the gate must not create the target of a .gitignore link"
+    );
+    assert!(repo.join(".fallow/.gitignore").is_symlink());
+}
+
+/// Names and paths in the report come from the audited tree. Each control
+/// character (C0, DEL, C1) and each Unicode line or paragraph separator in a
+/// listed field becomes a space, so one finding stays on one line and no
+/// terminal escape sequence reaches the block message.
+#[test]
+fn gate_block_message_removes_control_characters() {
+    if skip_without_tools() {
+        return;
+    }
+    let (_tmp, root) = spaced_root();
+    let repo = root.join("repo");
+    init_repo(&repo);
+    let gate = install_gate(&repo, ".claude");
+    let report = serde_json::json!({
+        "verdict": "fail",
+        "attribution": { "gate": "new-only" },
+        "dead_code": { "unused_exports": [{
+            "code": "rule\u{9b}31m",
+            "path": "src/\u{1b}]0;title\u{7}a.ts",
+            "line": "7\u{0}\u{7f}",
+            "export_name": "x\r\ny\u{85}z\u{2028}w\u{2029}v\u{1b}[2J",
+            "actions": [], "introduced": true, "effective_severity": "error"
+        }] }
+    });
+    std::fs::write(repo.join(STUB_REPORT_FILE), report.to_string()).unwrap();
+
+    let run = run_gate(&gate, &repo, &root.join("home"), &commit_payload(&repo));
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert_eq!(run.output.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains(
+            "verdict fail, 1 finding(s) caused the block:\n  \
+             rule 31m src/ ]0;title a.ts:7  x y z w v [2J\n"
+        ),
+        "stderr={stderr:?}"
+    );
+    assert!(
+        !stderr
+            .chars()
+            .any(|c| c != '\n' && (c.is_control() || c == '\u{2028}' || c == '\u{2029}')),
+        "stderr={stderr:?}"
+    );
+}
+
+/// Some finding types have no `path` key. The shapes below come from real
+/// `fallow audit --format json` output. The message lists each of them with
+/// the location of its first site, under both gate modes.
+#[test]
+fn gate_block_message_lists_findings_without_a_path_key() {
+    if skip_without_tools() {
+        return;
+    }
+    let (_tmp, root) = spaced_root();
+    let repo = root.join("repo");
+    init_repo(&repo);
+    let gate = install_gate(&repo, ".claude");
+    let findings = serde_json::json!({
+        "unresolved_imports": [{
+            "finding_id": "dc1:unresolved-import:1", "path": "src/index.ts",
+            "specifier": "./nope", "line": 2, "col": 14
+        }],
+        "unlisted_dependencies": [{
+            "finding_id": "dc1:unlisted-dependency:1", "package_name": "missing-pkg",
+            "imported_from": [{ "path": "src/index.ts", "line": 1, "col": 0 }]
+        }],
+        "boundary_violations": [{
+            "finding_id": "dc1:boundary-violation:1",
+            "from_path": "src/ui/w.ts", "to_path": "src/db/q.ts", "from_zone": "ui",
+            "to_zone": "db", "import_specifier": "src/db/q.ts", "line": 1, "col": 9
+        }],
+        "duplicate_exports": [{
+            "finding_id": "dc1:duplicate-export:1", "export_name": "dup",
+            "locations": [
+                { "path": "src/a.ts", "line": 3, "col": 0 },
+                { "path": "src/b.ts", "line": 4, "col": 0 }
+            ]
+        }],
+        "prop_drilling_chains": [{
+            "finding_id": "dc1:prop-drilling:1", "prop": "user", "depth": 3,
+            "hops": [{ "file": "src/App.tsx", "line": 5, "component": "App" }]
+        }],
+        "thin_wrappers": [{
+            "finding_id": "dc1:thin-wrapper:1", "component": "Wrap", "file": "src/Wrap.tsx", "line": 8 }]
+    });
+    let expected = "verdict fail, 6 finding(s) caused the block:\n  \
+                    unresolved-import src/index.ts:2 ./nope\n  \
+                    unlisted-dependency src/index.ts:1 missing-pkg\n  \
+                    boundary-violation src/ui/w.ts:1 src/db/q.ts\n  \
+                    duplicate-export src/a.ts:3 dup\n  \
+                    prop-drilling src/App.tsx:5\n  \
+                    thin-wrapper src/Wrap.tsx:8\n";
+    for gate_mode in ["new-only", "all"] {
+        let mut dead_code = findings.clone();
+        for list in dead_code.as_object_mut().unwrap().values_mut() {
+            for finding in list.as_array_mut().unwrap() {
+                let finding = finding.as_object_mut().unwrap();
+                finding.insert("actions".into(), serde_json::json!([]));
+                finding.insert("effective_severity".into(), "error".into());
+                if gate_mode == "new-only" {
+                    finding.insert("introduced".into(), true.into());
+                }
+            }
+        }
+        let report = serde_json::json!({
+            "verdict": "fail",
+            "attribution": { "gate": gate_mode },
+            "dead_code": dead_code
+        });
+        std::fs::write(repo.join(STUB_REPORT_FILE), report.to_string()).unwrap();
+
+        let run = run_gate(&gate, &repo, &root.join("home"), &commit_payload(&repo));
+        let stderr = String::from_utf8_lossy(&run.output.stderr);
+        assert_eq!(run.output.status.code(), Some(2), "stderr={stderr}");
+        assert!(
+            stderr.contains(expected),
+            "gate={gate_mode} stderr={stderr}"
+        );
+    }
+}
+
+/// Under `gate = "all"` no finding carries `introduced`, so the message lists
+/// every finding that is not a warning. A long list stops at 50 lines.
+#[test]
+fn gate_block_message_lists_every_finding_under_gate_all() {
+    if skip_without_tools() {
+        return;
+    }
+    let (_tmp, root) = spaced_root();
+    let repo = root.join("repo");
+    init_repo(&repo);
+    let gate = install_gate(&repo, ".claude");
+    let exports: Vec<serde_json::Value> = (1..=55)
+        .map(|line| {
+            serde_json::json!({
+                "path": "src/a.ts", "export_name": format!("e{line}"), "line": line,
+                "finding_id": format!("dc1:unused-export:{line}"),
+                "actions": [], "effective_severity": "error"
+            })
+        })
+        .collect();
+    let report = serde_json::json!({
+        "verdict": "fail",
+        "attribution": { "gate": "all" },
+        "dead_code": { "unused_exports": exports },
+        "complexity": { "styling_findings": [{
+            "code": "css-token-drift", "path": "src/e.css", "line": 9,
+            "effective_severity": "warn", "actions": []
+        }] }
+    });
+    std::fs::write(repo.join(STUB_REPORT_FILE), report.to_string()).unwrap();
+
+    let run = run_gate(&gate, &repo, &root.join("home"), &commit_payload(&repo));
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert_eq!(run.output.status.code(), Some(2), "stderr={stderr}");
+    assert!(
+        stderr.contains(
+            "verdict fail, 55 finding(s) caused the block:\n  unused-export src/a.ts:1 e1\n"
+        ),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("  unused-export src/a.ts:50 e50\n  ... and 5 more in the full report\n")
+    );
+    assert!(!stderr.contains("e51"));
+    assert!(!stderr.contains("css-token-drift"));
 }
 
 /// Without a usable `cwd`, the audit runs in the directory of the hook
