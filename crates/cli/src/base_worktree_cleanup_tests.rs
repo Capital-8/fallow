@@ -191,7 +191,7 @@ fn legacy_orphan_cleanup_preserves_unrelated_unavailable_registration() {
     std::fs::rename(&unrelated, &parked).unwrap();
     assert_unavailable_registration_preserved(&repo, &unrelated, &unrelated_admin);
 
-    sweep_orphan_audit_worktrees_in(&repo, temp.path());
+    sweep_orphan_audit_worktrees_in(&repo, temp.path(), std::time::Duration::ZERO);
 
     assert!(
         !candidate.exists() && !owned_admin.exists(),
@@ -236,7 +236,7 @@ fn deregistration_rejects_admin_entry_from_another_repository() {
     );
     assert_eq!(
         std::fs::read_to_string(candidate.join(".git")).unwrap(),
-        UNREGISTERED_GITDIR_STUB
+        unregistered_gitdir_stub(&candidate)
     );
 }
 

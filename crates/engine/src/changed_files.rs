@@ -1,7 +1,7 @@
 //! Changed-file helpers owned by the engine boundary.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::sync::OnceLock;
 
 use fallow_types::{
@@ -16,7 +16,9 @@ use rustc_hash::FxHashSet;
 
 use crate::duplicates::{self, DuplicationReport};
 
-pub use crate::git_env::{AMBIENT_GIT_ENV_VARS, clear_ambient_git_env};
+pub use crate::git_env::{
+    AMBIENT_GIT_ENV_VARS, clear_ambient_git_env, git_command as git_command_in,
+};
 
 /// Function pointer signature used to intercept short-running git
 /// subprocesses spawned by changed-file helpers.
@@ -642,15 +644,9 @@ pub(crate) fn git_path_from_bytes(path: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(path).replace('/', "\\"))
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "canonical engine-owned git spawn wrapper for changed-file orchestration"
-)]
 fn git_command(cwd: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new("git");
-    clear_ambient_git_env(&mut command);
-    // Changed-file probes are non-interactive and must not inherit protocol stdin.
-    command.stdin(Stdio::null()).args(args).current_dir(cwd);
+    let mut command = crate::git_env::git_command(cwd);
+    command.args(args);
     command
 }
 
@@ -1635,6 +1631,8 @@ mod tests {
         let repo = tempfile::tempdir().expect("tempdir");
         run_git(repo.path(), &["init", "--quiet", "--bare"]);
         assert!(resolve_git_common_dir_and_toplevel(repo.path()).is_err());
-        assert!(resolve_git_common_dir(repo.path()).is_ok());
+        // Fallow Git commands pass safe.bareRepository=explicit, so the single
+        // probe also refuses a bare repository that Git finds on its own.
+        assert!(resolve_git_common_dir(repo.path()).is_err());
     }
 }
