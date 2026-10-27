@@ -983,7 +983,7 @@ pub(crate) struct ModuleInfoExtractor {
     child_process_namespace_bindings: FxHashSet<String>,
     node_path_namespace_bindings: FxHashSet<String>,
     node_url_file_url_to_path_bindings: FxHashSet<String>,
-    current_module_file_path_bindings: FxHashSet<String>,
+    current_module_path_bindings: FxHashMap<String, declarations::ModulePathBinding>,
     child_process_fork_target_bindings: FxHashMap<String, Vec<String>>,
     static_string_bindings: FxHashMap<String, Vec<String>>,
     static_string_arrays: FxHashMap<String, Vec<String>>,
