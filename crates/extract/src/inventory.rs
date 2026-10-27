@@ -15,12 +15,15 @@
 //! starts at 0 and increments in pre-order AST traversal each time a function
 //! is entered without a resolvable explicit name. Name resolution precedence:
 //!
-//! 1. Parent-provided `pending_name`: from a `MethodDefinition` (accessors
+//! 1. The function's own `id` (named `function foo() {}`, named function
+//!    expression `const x = function named() {}` -> "named",
+//!    `{ k: function own() {} }` -> "own"). This matches the instrumenter and
+//!    `Function.prototype.name`.
+//! 2. Parent-provided `pending_name`: from a `MethodDefinition` (accessors
 //!    carry the instrumenter's `get ` / `set ` label), an `ObjectProperty` key
 //!    (shorthand methods, accessors, and function-valued data properties), a
-//!    `VariableDeclarator` binding, a plain `=` assignment target for a
-//!    function with no own name (`o.foo = () => {}` -> "foo",
-//!    `x = () => {}` -> "x"), or an anonymous `export default`
+//!    `VariableDeclarator` binding, a plain `=` assignment target
+//!    (`o.foo = () => {}` -> "foo", `x = () => {}` -> "x"), or an anonymous `export default`
 //!    (-> "default"), OR from the callee of the call / `new` expression a
 //!    function is passed to as an argument (`arr.map(cb)` -> "map",
 //!    `foo(cb)` -> "foo", `new Promise(cb)` -> "Promise"). The callee case
@@ -28,16 +31,17 @@
 //!    (which `@fallow-cli/beacon` enables), so a callback's static name
 //!    lines up with its runtime-instrumented name instead of both sides drifting
 //!    to different anonymous placeholders.
-//! 2. The function's own `id` (named `function foo() {}`, named function
-//!    expression `const x = function named() {}`).
+//!    A binding, key or assignment name is given only to a function or arrow
+//!    value, through parentheses; a class value takes none. The callee name
+//!    ranks below every other parent name.
 //! 3. `(anonymous_N)` with the current counter value; counter then increments.
 //!    Only genuinely unnamed functions reach this: an immediately-invoked
 //!    function expression, an arrow returned from another function, or a
 //!    computed non-string-key call.
 //!
 //! Counter scope is per-file. Reference implementation:
-//! `oxc-coverage-instrument/src/transform.rs` (`resolve_function_name` +
-//! `callback_argument_name`).
+//! `oxc-coverage-instrument` `src/transform/names.rs` (`resolve_function_name`,
+//! `infer_name_for_value` and `callback_argument_name`).
 
 use std::path::Path;
 
@@ -191,16 +195,20 @@ impl<'a> InventoryVisitor<'a> {
     /// instrumented function (named or not). We collapse both into one call.
     ///
     /// Name precedence, matching the instrumenter's `resolve_function_name`:
-    /// parent `pending_name` (method key / variable binding) → function's own
-    /// `id` → call/`new` callee (`pending_callee_name`) → counter.
+    /// function's own `id` → parent `pending_name` (method key, variable
+    /// binding, property key, assignment target) → call/`new` callee
+    /// (`pending_callee_name`) → counter. The own name comes first, as for
+    /// `Function.prototype.name`: `const f = function g() {}` gives `g`. The
+    /// parent name is taken in all cases, so it never reaches a nested function.
     fn resolve_name(&mut self, explicit: Option<&str>) -> ResolvedName {
         let n = self.anonymous_counter;
         self.anonymous_counter += 1;
-        if let Some(pending) = self.pending_name.take() {
-            return ResolvedName::named(pending);
-        }
+        let pending = self.pending_name.take();
         if let Some(name) = explicit {
             return ResolvedName::named(name.to_owned());
+        }
+        if let Some(pending) = pending {
+            return ResolvedName::named(pending);
         }
         if let Some(callee) = self.pending_callee_name.take() {
             return ResolvedName {
@@ -337,12 +345,7 @@ impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
 
     fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'ast>) {
         if let Some(id) = decl.id.get_binding_identifier()
-            && decl.init.as_ref().is_some_and(|init| {
-                matches!(
-                    init,
-                    Expression::ArrowFunctionExpression(_) | Expression::FunctionExpression(_)
-                )
-            })
+            && decl.init.as_ref().is_some_and(is_function_value)
         {
             self.pending_name = Some(id.name.to_string());
         }
@@ -359,10 +362,7 @@ impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
     fn visit_object_property(&mut self, prop: &ObjectProperty<'ast>) {
         let is_method_like =
             prop.method || matches!(prop.kind, PropertyKind::Get | PropertyKind::Set);
-        let is_function_valued = matches!(
-            prop.value,
-            Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
-        );
+        let is_function_valued = is_function_value(&prop.value);
         self.pending_name = if is_method_like || is_function_valued {
             prop.key.static_name().map(|name| {
                 accessor_label(
@@ -392,9 +392,7 @@ impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
     /// visitor does not use.
     fn visit_assignment_expression(&mut self, expr: &AssignmentExpression<'ast>) {
         self.visit_assignment_target(&expr.left);
-        if matches!(expr.operator, AssignmentOperator::Assign)
-            && is_anonymous_function_value(&expr.right)
-        {
+        if matches!(expr.operator, AssignmentOperator::Assign) && is_function_value(&expr.right) {
             self.pending_name = assignment_target_name(&expr.left);
         }
         self.visit_expression(&expr.right);
@@ -459,16 +457,16 @@ fn accessor_label(is_getter: bool, is_setter: bool, name: &str) -> String {
     name.to_owned()
 }
 
-/// Whether an assigned value is a function or arrow with no own name, with
-/// the parentheses around it removed. Only such a value takes the name of an
-/// assignment target, as in the instrumenter's `infer_name_for_value` and
-/// `resolve_function_name` (an own name comes first).
-fn is_anonymous_function_value(value: &Expression<'_>) -> bool {
-    match value.without_parentheses() {
-        Expression::FunctionExpression(func) => func.id.is_none(),
-        Expression::ArrowFunctionExpression(_) => true,
-        _ => false,
-    }
+/// Whether a value is a function or arrow, with the parentheses around it
+/// removed. Only such a value takes the name of a binding, a property key or
+/// an assignment target, as in the instrumenter's `infer_name_for_value`. A
+/// class value takes no name. A function with its own name keeps it, because
+/// `resolve_name` ranks the own name first.
+fn is_function_value(value: &Expression<'_>) -> bool {
+    matches!(
+        value.without_parentheses(),
+        Expression::FunctionExpression(_) | Expression::ArrowFunctionExpression(_)
+    )
 }
 
 /// Extract a name from an assignment target, matching the instrumenter's
@@ -642,10 +640,71 @@ mod tests {
     }
 
     #[test]
-    fn const_function_expression_captures_binding_name_not_fn_id() {
+    fn const_function_expression_keeps_its_own_name() {
+        // An own name comes first, as in the instrumenter's
+        // `resolve_function_name` and `Function.prototype.name`.
         let entries = walk("const outer = function inner() { return 1; };");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "outer");
+        assert_eq!(entries[0].name, "inner");
+    }
+
+    #[test]
+    fn object_property_function_keeps_its_own_name() {
+        let entries = walk(
+            r"
+            const o = {
+              k: function own() {},
+              j: function () {},
+              m() {},
+              get g() { return 1; },
+            };
+            ",
+        );
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["own", "j", "m", "get g"]);
+    }
+
+    #[test]
+    fn own_name_beats_binding_and_does_not_leak_inward() {
+        // The binding name is dropped when the function has its own name, so a
+        // function inside the body does not take it.
+        let entries = walk("const f = function g() { return [1].map(() => 2); };");
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["g", "map"]);
+    }
+
+    #[test]
+    fn parenthesized_declarator_and_property_values_take_the_binding_name() {
+        // The instrumenter removes the parentheses around the value before it
+        // names the function.
+        let entries = walk(
+            r"
+            const a = (() => 1);
+            const b = (function () {});
+            const c = (function own() {});
+            const o = { k: (() => 2) };
+            ",
+        );
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "own", "k"]);
+    }
+
+    #[test]
+    fn declared_class_gives_no_name_to_its_members() {
+        // A class value takes no binding name, with or without an own name. Its
+        // constructor and methods keep their keys and a field arrow stays
+        // anonymous.
+        let entries = walk(
+            r"
+            const C = class D { constructor() {} m() {} p = () => 1; };
+            const E = class { q = () => 2; };
+            ",
+        );
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["constructor", "m", "(anonymous_2)", "(anonymous_3)"]
+        );
     }
 
     #[test]
