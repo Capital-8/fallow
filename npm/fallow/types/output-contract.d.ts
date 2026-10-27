@@ -19922,6 +19922,10 @@ runner?: (MutationRunnerOutput | null)
  * started.
  */
 cache?: (MutationCacheOutput | null)
+/**
+ * The resume facts. Absent without `--resume`.
+ */
+resume?: (MutationResumeOutput | null)
 summary: MutationSummary
 /**
  * Each mutant, ranked mutants first.
@@ -20057,6 +20061,36 @@ stored: number
 not_keyed: string[]
 }
 /**
+ * The resume facts of a `--resume` run.
+ */
+export interface MutationResumeOutput {
+/**
+ * The path of the outcome journal, relative to the project root. When
+ * the cache directory is outside the root, the path is absolute: the
+ * report has no other cache path, so no other rule applies. The file
+ * stays only when the run did not complete. A run with
+ * `completion.status: complete` removes it.
+ */
+journal: string
+/**
+ * The mutants whose status came from the journal. They did not run.
+ */
+reused: number
+/**
+ * The journal results whose key does not match this run, because an
+ * input of the mutant changed. These results were not reused from the
+ * journal. The mutant ran again, or its status came from the result
+ * cache.
+ */
+rejected: number
+/**
+ * Why the run did not read a journal and started from the beginning,
+ * for example because no journal exists. Absent when the run read the
+ * journal.
+ */
+note?: (string | null)
+}
+/**
  * The totals of a run.
  */
 export interface MutationSummary {
@@ -20181,6 +20215,11 @@ attempts?: MutantAttempt[]
  * The mutant did not run in this run. `--no-cache` runs each mutant.
  */
 cached?: boolean
+/**
+ * True when the status comes from the journal of an interrupted run
+ * (`--resume`). The mutant did not run in this run.
+ */
+resumed?: boolean
 /**
  * The TypeScript diagnostic codes of the new errors of a
  * `compile_error` mutant, sorted, at most 8.
@@ -20363,7 +20402,8 @@ changed_paths: string[]
  */
 export interface MutationRunIssue {
 /**
- * A stable kebab-case code: `runtime-error`, `static-map-miss`,
+ * A stable kebab-case code: `cache-write-failed`,
+ * `journal-write-failed`, `runtime-error`, `static-map-miss`,
  * `test-files-not-discovered`, `typecheck-failed`, `worktree-changed`
  * or `worktree-check-failed`.
  */
