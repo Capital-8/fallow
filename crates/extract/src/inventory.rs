@@ -18,8 +18,9 @@
 //! 1. Parent-provided `pending_name`: from a `MethodDefinition` (accessors
 //!    carry the instrumenter's `get ` / `set ` label), an `ObjectProperty` key
 //!    (shorthand methods, accessors, and function-valued data properties), a
-//!    `VariableDeclarator` binding, a member-assignment target
-//!    (`o.foo = () => {}` -> "foo"), or an anonymous `export default`
+//!    `VariableDeclarator` binding, a plain `=` assignment target for a
+//!    function with no own name (`o.foo = () => {}` -> "foo",
+//!    `x = () => {}` -> "x"), or an anonymous `export default`
 //!    (-> "default"), OR from the callee of the call / `new` expression a
 //!    function is passed to as an argument (`arr.map(cb)` -> "map",
 //!    `foo(cb)` -> "foo", `new Promise(cb)` -> "Promise"). The callee case
@@ -377,22 +378,26 @@ impl<'ast> Visit<'ast> for InventoryVisitor<'_> {
         self.pending_name = None;
     }
 
-    /// Carry a member-assignment target into the function assigned to it
-    /// (`client.execute = () => {}` -> "execute"), matching the instrumenter's
-    /// `assignment_target_name`. A plain identifier target takes its name from
-    /// the binding instead, so it is left alone.
+    /// Carry an assignment target into the function assigned to it
+    /// (`client.execute = () => {}` -> "execute", `startLoad = () => {}` ->
+    /// "startLoad"), matching the instrumenter's `assignment_target_name` and
+    /// `infer_name_for_value`. Only a plain `=` gives a name. A compound or
+    /// logical operator (`+=`, `||=`, `??=`) gives none. The value can have
+    /// parentheses around it. Only a function or arrow takes the name: a class
+    /// value does not, and a function with its own name keeps that name.
+    ///
+    /// The target is visited before the name is set, so a function inside the
+    /// target (`f(() => 1).x = ...`) does not take the name. The default walk
+    /// only adds `enter_node`, `visit_span` and `leave_node`, which this
+    /// visitor does not use.
     fn visit_assignment_expression(&mut self, expr: &AssignmentExpression<'ast>) {
+        self.visit_assignment_target(&expr.left);
         if matches!(expr.operator, AssignmentOperator::Assign)
-            && matches!(
-                expr.right,
-                Expression::FunctionExpression(_)
-                    | Expression::ArrowFunctionExpression(_)
-                    | Expression::ClassExpression(_)
-            )
+            && is_anonymous_function_value(&expr.right)
         {
             self.pending_name = assignment_target_name(&expr.left);
         }
-        walk::walk_assignment_expression(self, expr);
+        self.visit_expression(&expr.right);
         self.pending_name = None;
     }
 
@@ -454,11 +459,25 @@ fn accessor_label(is_getter: bool, is_setter: bool, name: &str) -> String {
     name.to_owned()
 }
 
-/// Extract a name from a member-assignment target, matching the instrumenter's
-/// `assignment_target_name`: a static member uses the property, a computed
-/// member uses a string-literal key, and anything else yields no name.
+/// Whether an assigned value is a function or arrow with no own name, with
+/// the parentheses around it removed. Only such a value takes the name of an
+/// assignment target, as in the instrumenter's `infer_name_for_value` and
+/// `resolve_function_name` (an own name comes first).
+fn is_anonymous_function_value(value: &Expression<'_>) -> bool {
+    match value.without_parentheses() {
+        Expression::FunctionExpression(func) => func.id.is_none(),
+        Expression::ArrowFunctionExpression(_) => true,
+        _ => false,
+    }
+}
+
+/// Extract a name from an assignment target, matching the instrumenter's
+/// `assignment_target_name`: an identifier uses its name, a static member uses
+/// the property, a computed member uses a string-literal key, and anything else
+/// yields no name.
 fn assignment_target_name(target: &AssignmentTarget<'_>) -> Option<String> {
     match target {
+        AssignmentTarget::AssignmentTargetIdentifier(ident) => Some(ident.name.to_string()),
         AssignmentTarget::StaticMemberExpression(member) => Some(member.property.name.to_string()),
         AssignmentTarget::ComputedMemberExpression(member) => match &member.expression {
             Expression::StringLiteral(lit) => Some(lit.value.text().into_owned()),
@@ -889,6 +908,102 @@ mod tests {
         );
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["execute", "rollback"]);
+    }
+
+    #[test]
+    fn identifier_assignment_target_names_the_assigned_function() {
+        // An assignment to a variable declared earlier names the function after
+        // the variable, as the instrumenter and `Function.prototype.name` do.
+        let entries = walk(
+            r"
+            let startLoad;
+            startLoad = () => {};
+            let handler;
+            handler = function () { return 1; };
+            ",
+        );
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["startLoad", "handler"]);
+    }
+
+    #[test]
+    fn parenthesized_assigned_function_takes_the_target_name() {
+        // The instrumenter removes the parentheses around the assigned value.
+        let entries = walk(
+            r"
+            let x;
+            x = (() => 1);
+            o.m = (function () { return 2; });
+            ",
+        );
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["x", "m"]);
+    }
+
+    #[test]
+    fn assigned_function_keeps_its_own_name() {
+        // An own name comes first, as in the instrumenter and
+        // `Function.prototype.name`.
+        let entries = walk(
+            r"
+            let n;
+            n = function own() {};
+            o.z = function inner() {};
+            ",
+        );
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["own", "inner"]);
+    }
+
+    #[test]
+    fn assigned_class_gives_no_name_to_its_members() {
+        // The instrumenter names only an assigned function or arrow. A class
+        // value must not pass the target name to its first field arrow.
+        let entries = walk(
+            r"
+            let X;
+            X = class { p = () => 1; };
+            o.Y = class { r = () => 2; };
+            ",
+        );
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["(anonymous_0)", "(anonymous_1)"]);
+    }
+
+    #[test]
+    fn assignment_target_name_does_not_reach_the_left_side() {
+        // A function inside the target expression is not the assigned value.
+        let entries = walk("f(() => 1).x = () => 2;");
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["f", "x"]);
+    }
+
+    #[test]
+    fn compound_and_logical_assignments_give_no_name() {
+        // The instrumenter names a function only for a plain `=`. V8 also names
+        // `||=`, `&&=` and `??=`, but the instrumenter is the join partner.
+        let entries = walk(
+            r"
+            let a;
+            a ||= () => 1;
+            let b;
+            b &&= () => 2;
+            let c;
+            c ??= () => 3;
+            let d = '';
+            d += function () { return 4; };
+            ",
+        );
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "(anonymous_0)",
+                "(anonymous_1)",
+                "(anonymous_2)",
+                "(anonymous_3)"
+            ]
+        );
     }
 
     #[test]
