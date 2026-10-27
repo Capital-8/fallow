@@ -241,6 +241,30 @@ proof. A call from the value of `obj` to a hoisted function that holds the
 conditional can read `obj` before its declaration runs. The rule accepts these
 risks.
 
+A `console.*` or `debug(...)` call gives no mutant, also for each expression
+in its arguments. An `if` statement whose only effect is such a call gives no
+mutant either: a changed test can only change which message is logged. The
+rule needs all of these conditions:
+
+- the test is pure: names, `this`, literals, templates, member reads, and
+  unary, binary, logical and `? :` operators. A call, an optional call, `new`,
+  an assignment, an update, `delete`, `await`, `yield`, a tagged template, a
+  comma expression or a function keeps each mutant;
+- the consequent is a logging call statement, or a non-empty block of them;
+- the alternate is absent, a logging call statement, a non-empty block of
+  them, or an `else if` that meets the same conditions;
+- each argument of each logging call is pure, with no spread;
+- the callee is the global `console` or `debug`. A computed key, as in
+  `console[name]`, must be pure. A file that declares or imports a binding
+  named `console` or `debug` keeps each condition that calls that name.
+
+A branch with another statement, a `return` or a `throw`, an empty branch
+and a nested `if` keep each mutant. The rule reads only `if` statements, so a
+logging call in a `? :` expression or after `&&` keeps the mutants of its
+test. A test can still have an effect through a getter, a `valueOf` method,
+a Proxy trap that `in` reaches, or a `Symbol.hasInstance` method that
+`instanceof` calls. The rule accepts this risk.
+
 No absolute-value operator (`x` to `-x`) is planned. Without types, it applies
 to each operand of an arithmetic or relational expression. The same corpus has
 114119 mutants, and the operator adds 6473 mutants (5.7 %), 24 % of them on
