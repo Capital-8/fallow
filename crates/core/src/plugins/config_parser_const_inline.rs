@@ -11,23 +11,24 @@ use oxc_allocator::{Allocator, CloneIn};
 #[allow(clippy::wildcard_imports, reason = "many AST types used")]
 use oxc_ast::ast::*;
 use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
-use oxc_span::GetSpan;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::top_level_variable_declarations;
 
 /// The maximum number of constants that one inlined value can pass through,
 /// as in `const A = {...}; const B = [A]; export default { x: B }`.
-const MAX_INLINE_NESTING: usize = 4;
+pub(super) const MAX_INLINE_NESTING: usize = 4;
 
 /// Replace each identifier in a property value or an array element that names
-/// a stable top-level constant with a literal value.
+/// a stable top-level constant with a literal value, and replace each object
+/// spread of such a constant with the properties of the constant.
 ///
 /// A constant qualifies when one top-level `const` or `let` is the only
 /// binding of its name, no expression writes to it, and its value is an
 /// object, array or string literal.
-/// The copied source bytes stay at or below `source_len`, so the AST grows at
-/// most to two times the size of the parsed source.
+/// The copied AST nodes stay at or below `source_len`, and each node of the
+/// parsed source spans at least one byte, so the AST grows at most to two
+/// times its parsed size.
 pub(super) fn inline_value_constants<'a>(
     allocator: &'a Allocator,
     program: &mut Program<'a>,
@@ -37,17 +38,11 @@ pub(super) fn inline_value_constants<'a>(
     if values.is_empty() {
         return;
     }
-    let mut inliner = Inliner {
-        allocator,
-        values: &values,
-        nesting: 0,
-        budget: source_len,
-    };
-    inliner.visit_program(program);
+    Inliner::new(allocator, &values, source_len).visit_program(program);
 }
 
 /// A copy of the literal value of each stable top-level constant, by name.
-fn constant_values<'a>(
+pub(super) fn constant_values<'a>(
     allocator: &'a Allocator,
     program: &Program<'a>,
 ) -> FxHashMap<String, Expression<'a>> {
@@ -64,7 +59,12 @@ fn constant_values<'a>(
     if candidates.is_empty() {
         return FxHashMap::default();
     }
-    let stable = stable_bindings(program, candidates.iter().map(|(name, _)| *name), false);
+    let stable = stable_bindings(
+        program,
+        candidates.iter().map(|(name, _)| *name),
+        false,
+        true,
+    );
     candidates
         .into_iter()
         .filter(|(name, _)| stable.contains(name))
@@ -78,7 +78,7 @@ fn constant_values<'a>(
 /// The value can hold functions and writes. A copy of one adds a binding or a
 /// write only for a name that the source already binds or writes inside it, so
 /// a later stable-binding check of the same program gives the same answer.
-fn literal_value<'e, 'a>(init: &'e Expression<'a>) -> Option<&'e Expression<'a>> {
+pub(super) fn literal_value<'e, 'a>(init: &'e Expression<'a>) -> Option<&'e Expression<'a>> {
     match init {
         Expression::ParenthesizedExpression(paren) => literal_value(&paren.expression),
         Expression::TSAsExpression(ts_as) => literal_value(&ts_as.expression),
@@ -91,14 +91,74 @@ fn literal_value<'e, 'a>(init: &'e Expression<'a>) -> Option<&'e Expression<'a>>
     }
 }
 
-struct Inliner<'a, 'v> {
+/// Copies literal values into the positions that name them. Each copy charges
+/// its number of AST nodes to `budget`, and a copy inside a copy adds one to
+/// `nesting`. A value can hold copies from an earlier pass, so its source span
+/// can be much smaller than the copy.
+pub(super) struct Inliner<'a, 'v> {
     allocator: &'a Allocator,
     values: &'v FxHashMap<String, Expression<'a>>,
     nesting: usize,
     budget: usize,
+    /// The node count of each value or object that was copied, by address.
+    /// The values do not change during a pass, so each count is computed once.
+    node_counts: FxHashMap<usize, usize>,
 }
 
-impl<'a> Inliner<'a, '_> {
+impl<'a, 'v> Inliner<'a, 'v> {
+    pub(super) fn new(
+        allocator: &'a Allocator,
+        values: &'v FxHashMap<String, Expression<'a>>,
+        budget: usize,
+    ) -> Self {
+        Self {
+            allocator,
+            values,
+            nesting: 0,
+            budget,
+            node_counts: FxHashMap::default(),
+        }
+    }
+
+    /// Charge the node count of a value to the budget. Returns `None` when
+    /// the budget is too small.
+    fn charge_value(&mut self, value: &Expression<'a>) -> Option<()> {
+        let key = std::ptr::from_ref(value) as usize;
+        let count = *self.node_counts.entry(key).or_insert_with(|| {
+            let mut counter = NodeCounter::default();
+            counter.visit_expression(value);
+            counter.count
+        });
+        self.budget = self.budget.checked_sub(count)?;
+        Some(())
+    }
+
+    /// Charge the node count of an object literal to the budget. Returns
+    /// `None` when the budget is too small.
+    fn charge_object(&mut self, object: &ObjectExpression<'a>) -> Option<()> {
+        let key = std::ptr::from_ref(object) as usize;
+        let count = *self.node_counts.entry(key).or_insert_with(|| {
+            let mut counter = NodeCounter::default();
+            counter.visit_object_expression(object);
+            counter.count
+        });
+        self.budget = self.budget.checked_sub(count)?;
+        Some(())
+    }
+
+    /// Replace `expr` with a copy of the value it names, then inline inside it.
+    /// This is for a whole value position, such as a `return` argument.
+    pub(super) fn inline_value(&mut self, expr: &mut Expression<'a>) {
+        let Some(value) = self.copy_for(expr) else {
+            self.visit_expression(expr);
+            return;
+        };
+        *expr = value;
+        self.nesting += 1;
+        self.visit_expression(expr);
+        self.nesting -= 1;
+    }
+
     /// A copy of the constant value that `expr` names, when the nesting and
     /// size limits allow one more copy.
     fn copy_for(&mut self, expr: &Expression<'a>) -> Option<Expression<'a>> {
@@ -109,13 +169,187 @@ impl<'a> Inliner<'a, '_> {
             return None;
         };
         let value = self.values.get(id.name.as_str())?;
-        let size = value.span().size() as usize;
-        self.budget = self.budget.checked_sub(size)?;
+        self.charge_value(value)?;
         Some(value.clone_in(self.allocator))
+    }
+
+    /// The object literal that a spread argument names: a constant, or a static
+    /// member chain such as `common.resolve` whose root is a constant. The node
+    /// count of the object is charged to the budget.
+    fn spread_source(&mut self, argument: &Expression<'a>) -> Option<&'v ObjectExpression<'a>> {
+        if self.nesting >= MAX_INLINE_NESTING {
+            return None;
+        }
+        let object = static_object(self.values, argument, MAX_INLINE_NESTING)?;
+        self.charge_object(object)?;
+        Some(object)
+    }
+
+    /// Replace each spread of a known object literal with copies of its
+    /// properties. Returns, for each resulting property, whether it is a copy.
+    /// Returns `None` when no spread resolves, and leaves `obj` unchanged.
+    fn splice_spreads(&mut self, obj: &mut ObjectExpression<'a>) -> Option<Vec<bool>> {
+        let sources: Vec<_> = obj
+            .properties
+            .iter()
+            .map(|prop| match prop {
+                ObjectPropertyKind::SpreadProperty(spread) => self.spread_source(&spread.argument),
+                ObjectPropertyKind::ObjectProperty(_) => None,
+            })
+            .collect();
+        if sources.iter().all(Option::is_none) {
+            return None;
+        }
+        let old = std::mem::replace(
+            &mut obj.properties,
+            oxc_allocator::Vec::new_in(&self.allocator),
+        );
+        let mut copied = Vec::with_capacity(old.len());
+        for (prop, source) in old.into_iter().zip(sources) {
+            let Some(source) = source else {
+                obj.properties.push(prop);
+                copied.push(false);
+                continue;
+            };
+            for source_prop in &source.properties {
+                obj.properties.push(source_prop.clone_in(self.allocator));
+                copied.push(true);
+            }
+        }
+        drop_overridden_properties(obj, &mut copied);
+        Some(copied)
     }
 }
 
+/// Counts the AST nodes of a value.
+#[derive(Default)]
+struct NodeCounter {
+    count: usize,
+}
+
+impl<'a> Visit<'a> for NodeCounter {
+    fn enter_node(&mut self, _kind: oxc_ast::AstKind<'a>) {
+        self.count += 1;
+    }
+}
+
+/// The object literal that `expr` names through the constants in `values`:
+/// an identifier, or a static member chain whose root resolves. A member takes
+/// the last property with that key, and declines when a spread or a computed
+/// key follows it, because that one can override the key.
+fn static_object<'v, 'a>(
+    values: &'v FxHashMap<String, Expression<'a>>,
+    expr: &Expression<'a>,
+    hops: usize,
+) -> Option<&'v ObjectExpression<'a>> {
+    match static_value(values, expr, hops)?.get_inner_expression() {
+        Expression::ObjectExpression(object) => Some(object),
+        _ => None,
+    }
+}
+
+fn static_value<'v, 'a>(
+    values: &'v FxHashMap<String, Expression<'a>>,
+    expr: &Expression<'a>,
+    hops: usize,
+) -> Option<&'v Expression<'a>> {
+    let hops = hops.checked_sub(1)?;
+    match expr.get_inner_expression() {
+        Expression::Identifier(id) => values.get(id.name.as_str()),
+        Expression::StaticMemberExpression(member) => {
+            let object = static_object(values, &member.object, hops)?;
+            let value = last_static_property(object, member.property.name.as_str())?;
+            match value.get_inner_expression() {
+                Expression::Identifier(_) => static_value(values, value, hops),
+                _ => Some(value),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The value of the last plain property `key` of `object`, when no spread or
+/// computed key follows it.
+fn last_static_property<'v, 'a>(
+    object: &'v ObjectExpression<'a>,
+    key: &str,
+) -> Option<&'v Expression<'a>> {
+    let index = object
+        .properties
+        .iter()
+        .rposition(|prop| static_key(prop) == Some(key))?;
+    let overridable = object.properties[index + 1..]
+        .iter()
+        .any(|prop| match prop {
+            ObjectPropertyKind::SpreadProperty(_) => true,
+            ObjectPropertyKind::ObjectProperty(prop) => prop.computed,
+        });
+    if overridable {
+        return None;
+    }
+    match &object.properties[index] {
+        ObjectPropertyKind::ObjectProperty(prop) => Some(&prop.value),
+        ObjectPropertyKind::SpreadProperty(_) => None,
+    }
+}
+
+/// The key of a plain `key: value` property that is not computed.
+fn static_key<'p>(prop: &'p ObjectPropertyKind<'_>) -> Option<&'p str> {
+    let ObjectPropertyKind::ObjectProperty(prop) = prop else {
+        return None;
+    };
+    if prop.computed || prop.kind != PropertyKind::Init {
+        return None;
+    }
+    match &prop.key {
+        PropertyKey::StaticIdentifier(id) => Some(id.name.as_str()),
+        PropertyKey::StringLiteral(literal) => literal.value.as_str(),
+        _ => None,
+    }
+}
+
+/// Remove each plain property that a later plain property with the same key
+/// overrides. JavaScript keeps the last value of a key, but the config readers
+/// take the first match. A property that only a later unresolved spread can
+/// override stays.
+fn drop_overridden_properties(obj: &mut ObjectExpression<'_>, copied: &mut Vec<bool>) {
+    let mut later_keys = FxHashSet::default();
+    let keep: Vec<bool> = obj
+        .properties
+        .iter()
+        .rev()
+        .map(|prop| static_key(prop).is_none_or(|key| later_keys.insert(key.to_string())))
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if keep.iter().all(|kept| *kept) {
+        return;
+    }
+    let mut keep_iter = keep.iter();
+    obj.properties
+        .retain(|_| *keep_iter.next().unwrap_or(&true));
+    let mut keep_iter = keep.iter();
+    copied.retain(|_| *keep_iter.next().unwrap_or(&true));
+}
+
 impl<'a> VisitMut<'a> for Inliner<'a, '_> {
+    fn visit_object_expression(&mut self, obj: &mut ObjectExpression<'a>) {
+        let Some(copied) = self.splice_spreads(obj) else {
+            walk_mut::walk_object_expression(self, obj);
+            return;
+        };
+        for (prop, is_copy) in obj.properties.iter_mut().zip(copied) {
+            if is_copy {
+                self.nesting += 1;
+                self.visit_object_property_kind(prop);
+                self.nesting -= 1;
+            } else {
+                self.visit_object_property_kind(prop);
+            }
+        }
+    }
+
     fn visit_object_property(&mut self, prop: &mut ObjectProperty<'a>) {
         let Some(value) = self.copy_for(&prop.value) else {
             walk_mut::walk_object_property(self, prop);
@@ -143,31 +377,38 @@ impl<'a> VisitMut<'a> for Inliner<'a, '_> {
 
 /// Whether one top-level `const` or `let` is the only binding of `name` in the
 /// program, and no expression writes to it or to one of its members. A
-/// mutating method call counts as a write unless `allow_mutating_calls` is set.
+/// mutating method call, an `Object.assign` call and an alias such as
+/// `const { resolve } = name` count as a write unless `allow_mutating_calls`
+/// is set.
 pub(super) fn holds_one_stable_object(
     program: &Program<'_>,
     name: &str,
     allow_mutating_calls: bool,
 ) -> bool {
-    !stable_bindings(program, [name], allow_mutating_calls).is_empty()
+    !stable_bindings(program, [name], allow_mutating_calls, true).is_empty()
 }
 
 /// The subset of `names` that [`holds_one_stable_object`] accepts, from one
-/// walk of the program.
-fn stable_bindings<'n>(
+/// walk of the program. With `require_top_level` unset, the caller checks
+/// where the one binding of each name is.
+pub(super) fn stable_bindings<'n>(
     program: &Program<'_>,
     names: impl IntoIterator<Item = &'n str>,
     allow_mutating_calls: bool,
+    require_top_level: bool,
 ) -> FxHashSet<&'n str> {
     let mut usage = NameUsage::new(
         names
             .into_iter()
-            .filter(|name| declares_top_level_const_or_let(program, name)),
+            .filter(|name| !require_top_level || declares_top_level_const_or_let(program, name)),
     );
     if usage.counts.is_empty() {
         return FxHashSet::default();
     }
     usage.visit_program(program);
+    for name in changed_alias_names(program) {
+        usage.count_mutation(&name);
+    }
     usage
         .counts
         .into_iter()
@@ -193,13 +434,130 @@ fn declares_top_level_const_or_let(program: &Program<'_>, name: &str) -> bool {
     })
 }
 
+/// The maximum number of aliases that [`changed_alias_names`] follows. Above
+/// it, every name in an alias counts as changed, so no value is inlined past
+/// an alias that was not checked.
+const MAX_ALIASES: usize = 4096;
+
+/// The names that the program changes through an alias. An alias is a
+/// binding or an identifier assignment that holds a name or a member chain of
+/// it, such as `const r = common.resolve` or `const { resolve } = common`. A
+/// write or a mutating call through the alias, or through an alias of the
+/// alias, changes the root name. An alias that is only read changes nothing.
+fn changed_alias_names(program: &Program<'_>) -> Vec<String> {
+    let mut collector = AliasCollector::default();
+    collector.visit_program(program);
+    if collector.aliases.is_empty() {
+        return Vec::new();
+    }
+    if collector.aliases.len() > MAX_ALIASES {
+        // Too many aliases to follow: every name in them counts as changed.
+        return collector
+            .aliases
+            .into_iter()
+            .flat_map(|alias| [alias.name, alias.root])
+            .collect();
+    }
+    let mut usage = NameUsage::new(collector.aliases.iter().map(|alias| alias.name.as_str()));
+    usage.visit_program(program);
+    let mut roots: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
+    for alias in &collector.aliases {
+        roots
+            .entry(alias.name.as_str())
+            .or_default()
+            .push(alias.root.as_str());
+    }
+    let mut pending: Vec<&str> = collector
+        .aliases
+        .iter()
+        .filter(|alias| {
+            usage
+                .counts
+                .get(alias.name.as_str())
+                .is_some_and(|count| count.writes > count.rebinds || count.mutating_calls > 0)
+        })
+        .map(|alias| alias.name.as_str())
+        .collect();
+    // An alias of a changed alias changes its root as well. Each name enters
+    // the worklist at most once.
+    let mut changed: FxHashSet<&str> = pending.iter().copied().collect();
+    while let Some(name) = pending.pop() {
+        for &root in roots.get(name).into_iter().flatten() {
+            if changed.insert(root) {
+                pending.push(root);
+            }
+        }
+    }
+    changed.into_iter().map(str::to_owned).collect()
+}
+
+/// A name that holds the value of another name or of one of its members.
+struct Alias {
+    name: String,
+    root: String,
+}
+
+#[derive(Default)]
+struct AliasCollector {
+    aliases: Vec<Alias>,
+}
+
+impl AliasCollector {
+    fn push(&mut self, name: &str, value: &Expression<'_>) {
+        for root in alias_roots(value) {
+            self.aliases.push(Alias {
+                name: name.to_owned(),
+                root: root.to_owned(),
+            });
+        }
+    }
+}
+
+impl<'a> Visit<'a> for AliasCollector {
+    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
+        if let Some(init) = &declarator.init {
+            for identifier in declarator.id.get_binding_identifiers() {
+                self.push(identifier.name.as_str(), init);
+            }
+        }
+        walk::walk_variable_declarator(self, declarator);
+    }
+
+    fn visit_assignment_expression(&mut self, assign: &AssignmentExpression<'a>) {
+        if let AssignmentTarget::AssignmentTargetIdentifier(target) = &assign.left {
+            self.push(target.name.as_str(), &assign.right);
+        }
+        walk::walk_assignment_expression(self, assign);
+    }
+}
+
+/// The root names that a value can hold: the root of a member chain, or the
+/// roots of each branch of `a || b`, `a ?? b` or `cond ? a : b`.
+fn alias_roots<'e>(value: &'e Expression<'_>) -> Vec<&'e str> {
+    match value.without_parentheses().get_inner_expression() {
+        Expression::LogicalExpression(logical) => {
+            let mut roots = alias_roots(&logical.left);
+            roots.extend(alias_roots(&logical.right));
+            roots
+        }
+        Expression::ConditionalExpression(conditional) => {
+            let mut roots = alias_roots(&conditional.consequent);
+            roots.extend(alias_roots(&conditional.alternate));
+            roots
+        }
+        other => member_root(other).into_iter().collect(),
+    }
+}
+
 /// What one program does with one name: the number of bindings that declare it,
-/// the number of expressions that write to it or to one of its members, and the
+/// the number of expressions that write to it or to one of its members, the
+/// number of those writes that assign a new value to the name itself, and the
 /// number of calls such as `name.push(...)` that change it.
 #[derive(Default)]
 struct NameCount {
     bindings: usize,
     writes: usize,
+    rebinds: usize,
     mutating_calls: usize,
 }
 
@@ -217,6 +575,14 @@ impl<'n> NameUsage<'n> {
                 .map(|name| (name, NameCount::default()))
                 .collect(),
             write_depth: 0,
+        }
+    }
+}
+
+impl NameUsage<'_> {
+    fn count_mutation(&mut self, name: &str) {
+        if let Some(count) = self.counts.get_mut(name) {
+            count.mutating_calls += 1;
         }
     }
 }
@@ -242,6 +608,15 @@ impl<'a> Visit<'a> for NameUsage<'_> {
         self.write_depth -= 1;
     }
 
+    fn visit_assignment_expression(&mut self, assign: &AssignmentExpression<'a>) {
+        if let AssignmentTarget::AssignmentTargetIdentifier(target) = &assign.left
+            && let Some(count) = self.counts.get_mut(target.name.as_str())
+        {
+            count.rebinds += 1;
+        }
+        walk::walk_assignment_expression(self, assign);
+    }
+
     fn visit_update_expression(&mut self, expression: &UpdateExpression<'a>) {
         self.write_depth += 1;
         walk::walk_update_expression(self, expression);
@@ -249,10 +624,8 @@ impl<'a> Visit<'a> for NameUsage<'_> {
     }
 
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
-        if let Some(name) = mutated_receiver(&call.callee)
-            && let Some(count) = self.counts.get_mut(name)
-        {
-            count.mutating_calls += 1;
+        if let Some(name) = mutated_receiver(call) {
+            self.count_mutation(name);
         }
         walk::walk_call_expression(self, call);
     }
@@ -285,18 +658,68 @@ const MUTATING_METHODS: &[&str] = &[
     "clear",
 ];
 
-/// The receiver name of a call such as `name.push(...)` or `name!.push(...)`
-/// whose method changes the receiver.
-fn mutated_receiver<'e>(callee: &'e Expression<'_>) -> Option<&'e str> {
-    let Expression::StaticMemberExpression(member) = callee.without_parentheses() else {
+/// The root name of the value that a call changes: the receiver of a call
+/// such as `name.push(...)`, `name!.push(...)` or `name.plugins.push(...)`
+/// whose method changes the receiver, or the target of a call such as
+/// `Object.assign(name.resolve, ...)` or `Reflect.set(name, ...)`. A change to a
+/// member changes the value of the root name too.
+fn mutated_receiver<'e>(call: &'e CallExpression<'_>) -> Option<&'e str> {
+    let Expression::StaticMemberExpression(member) = call.callee.without_parentheses() else {
         return None;
     };
+    if changes_first_argument(member) {
+        return call
+            .arguments
+            .first()
+            .and_then(Argument::as_expression)
+            .and_then(member_root);
+    }
     if !MUTATING_METHODS.contains(&member.property.name.as_str()) {
         return None;
     }
-    match member.object.without_parentheses().get_inner_expression() {
-        Expression::Identifier(identifier) => Some(identifier.name.as_str()),
-        _ => None,
+    member_root(&member.object)
+}
+
+/// Static methods that change the object in their first argument.
+const FIRST_ARGUMENT_MUTATORS: &[(&str, &str)] = &[
+    ("Object", "assign"),
+    ("Object", "defineProperty"),
+    ("Object", "defineProperties"),
+    ("Object", "setPrototypeOf"),
+    ("Reflect", "set"),
+    ("Reflect", "defineProperty"),
+    ("Reflect", "deleteProperty"),
+    ("Reflect", "setPrototypeOf"),
+];
+
+fn changes_first_argument(member: &StaticMemberExpression<'_>) -> bool {
+    let Expression::Identifier(object) = member.object.without_parentheses() else {
+        return false;
+    };
+    FIRST_ARGUMENT_MUTATORS
+        .iter()
+        .any(|(owner, method)| object.name == *owner && member.property.name == *method)
+}
+
+/// The root name of an identifier or of a member chain such as
+/// `name.resolve.alias`. A binding or an assignment that holds such a value
+/// is an alias, and a write through the alias changes the root name.
+fn member_root<'e>(expr: &'e Expression<'_>) -> Option<&'e str> {
+    let mut current = expr.without_parentheses().get_inner_expression();
+    loop {
+        current = match current {
+            Expression::Identifier(identifier) => return Some(identifier.name.as_str()),
+            Expression::StaticMemberExpression(inner) => &inner.object,
+            Expression::ComputedMemberExpression(inner) => &inner.object,
+            Expression::ChainExpression(chain) => match &chain.expression {
+                ChainElement::StaticMemberExpression(inner) => &inner.object,
+                ChainElement::ComputedMemberExpression(inner) => &inner.object,
+                _ => return None,
+            },
+            _ => return None,
+        }
+        .without_parentheses()
+        .get_inner_expression();
     }
 }
 
@@ -315,6 +738,54 @@ mod tests {
 
     fn js_path() -> &'static Path {
         Path::new("config.js")
+    }
+
+    #[test]
+    fn constant_that_a_binding_only_reads_still_resolves() {
+        let path = Path::new("vitest.config.ts");
+        let cases = [
+            r#"const BASE = ["./a.ts"]; const first = BASE[0]; export default { setupFiles: BASE };"#,
+            r#"const S = "./a.ts"; const T = S; export default { setupFiles: S };"#,
+            r#"const BASE = ["./a.ts"]; const n = BASE.length; export default { setupFiles: BASE };"#,
+        ];
+        for source in cases {
+            assert_eq!(
+                extract_config_string_or_array(source, path, &["setupFiles"]),
+                vec!["./a.ts"],
+                "{source}"
+            );
+        }
+        let source = r#"const OPTS = { files: ["./a.ts"] }; const f = OPTS.files; export default { x: OPTS };"#;
+        assert_eq!(
+            extract_config_string_or_array(source, path, &["x", "files"]),
+            vec!["./a.ts"]
+        );
+    }
+
+    #[test]
+    fn constant_that_an_alias_changes_does_not_resolve() {
+        let path = Path::new("vitest.config.ts");
+        let cases = [
+            r#"const OPTS = { files: ["./a.ts"] }; const f = OPTS.files; f.push("./b.ts"); export default { x: OPTS };"#,
+            r#"const OPTS = { files: ["./a.ts"] }; const f = OPTS.files || []; f.push("./b.ts"); export default { x: OPTS };"#,
+            r#"const OPTS = { files: ["./a.ts"] }; const f = flag ? [] : OPTS.files; f.push("./b.ts"); export default { x: OPTS };"#,
+        ];
+        for source in cases {
+            assert!(
+                extract_config_string_or_array(source, path, &["x", "files"]).is_empty(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_whose_alias_only_gets_a_new_value_still_resolves() {
+        let path = Path::new("vitest.config.ts");
+        let source = r#"const OPTS = { files: ["./a.ts"] }; let f = OPTS.files; f = []; export default { x: OPTS };"#;
+        assert_eq!(
+            extract_config_string_or_array(source, path, &["x", "files"]),
+            vec!["./a.ts"]
+        );
     }
 
     #[test]
