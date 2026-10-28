@@ -6,6 +6,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 #[path = "audit_keys_collection.rs"]
 mod collection;
+#[path = "audit_keys_styling.rs"]
+mod styling;
+
+pub use styling::{
+    styling_finding_key, styling_keys, styling_ledger_keys, styling_ledger_keys_with_diff,
+};
 
 use collection::AuditCollection;
 
@@ -1686,6 +1692,8 @@ pub fn annotate_stale_suppressions_json(
 /// A complexity finding keeps the typed `introduced` flag that the audit
 /// comparison set, because that flag compares metric values. Only a finding
 /// without the typed flag falls back to identity-key membership in `base`.
+/// A styling finding also keeps its typed flag, because the audit can use the
+/// run's diff to tell equal findings apart.
 #[expect(
     clippy::implicit_hasher,
     reason = "fallow standardizes on FxHashSet across audit attribution keys"
@@ -1711,22 +1719,7 @@ pub fn annotate_health_json(
             }
         }
     }
-    if let Some(items) = json
-        .get_mut("styling_findings")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        for (item, finding) in items.iter_mut().zip(&report.styling_findings) {
-            if let serde_json::Value::Object(map) = item {
-                map.insert(
-                    "introduced".to_string(),
-                    serde_json::json!(issue_was_introduced(
-                        &styling_finding_key(finding, root),
-                        base
-                    )),
-                );
-            }
-        }
-    }
+    styling::annotate_styling_json(json, &report.styling_findings, root, base);
 }
 
 /// Insert `"introduced": bool` into each `clone_groups` object in serialized
@@ -1809,28 +1802,6 @@ pub fn health_finding_key(finding: &fallow_output::ComplexityViolation, root: &P
         "complexity:{}:{}",
         relative_key_path(Path::new(&finding.path), root),
         finding.name,
-    )
-}
-
-/// Attribution key set for every styling finding in a health report.
-pub fn styling_keys(report: &fallow_output::HealthReport, root: &Path) -> FxHashSet<String> {
-    report
-        .styling_findings
-        .iter()
-        .map(|finding| styling_finding_key(finding, root))
-        .collect()
-}
-
-/// Attribution key for one styling finding:
-/// `styling:<code>:<sub kind>:<path>:<line>:<value>`.
-pub fn styling_finding_key(finding: &fallow_output::StylingFinding, root: &Path) -> String {
-    format!(
-        "styling:{}:{}:{}:{}:{}",
-        finding.code,
-        finding.sub_kind,
-        relative_key_path(Path::new(&finding.path), root),
-        finding.line,
-        finding.value
     )
 }
 

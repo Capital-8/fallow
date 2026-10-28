@@ -3362,15 +3362,15 @@ mod health_markdown_tests {
         );
     }
 
-    #[test]
-    fn health_markdown_includes_styling_findings() {
-        let report = HealthReport {
+    fn broken_reference_report(value: &str) -> HealthReport {
+        HealthReport {
             styling_findings: vec![StylingFinding {
+                internal: fallow_output::StylingFindingInternal::default(),
                 code: "css-broken-reference".to_string(),
                 sub_kind: "unresolved-class-reference".to_string(),
                 path: "src/app.css".to_string(),
                 line: 9,
-                value: "btn-prmary | btn-primary".to_string(),
+                value: value.to_string(),
                 effective_severity: StylingFindingSeverity::Warn,
                 blast_radius: None,
                 confidence: None,
@@ -3380,7 +3380,12 @@ mod health_markdown_tests {
                 actions: Vec::new(),
             }],
             ..HealthReport::default()
-        };
+        }
+    }
+
+    #[test]
+    fn health_markdown_includes_styling_findings() {
+        let report = broken_reference_report("btn-prmary | btn-primary");
 
         let output = build_health_markdown(&report, Path::new("/project"));
 
@@ -3391,23 +3396,7 @@ mod health_markdown_tests {
 
     #[test]
     fn health_markdown_fences_untrusted_styling_values() {
-        let report = HealthReport {
-            styling_findings: vec![StylingFinding {
-                code: "css-broken-reference".to_string(),
-                sub_kind: "unresolved-class-reference".to_string(),
-                path: "src/app.css".to_string(),
-                line: 9,
-                value: "btn` **injected** | btn``primary".to_string(),
-                effective_severity: StylingFindingSeverity::Warn,
-                blast_radius: None,
-                confidence: None,
-                agent_disposition: None,
-                nearest_token: None,
-                fix_hint: None,
-                actions: Vec::new(),
-            }],
-            ..HealthReport::default()
-        };
+        let report = broken_reference_report("btn` **injected** | btn``primary");
 
         let output = build_health_markdown(&report, Path::new("/project"));
 

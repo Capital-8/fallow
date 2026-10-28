@@ -438,6 +438,7 @@ impl From<SavedStylingFinding> for StylingFinding {
             nearest_token: None,
             fix_hint: None,
             actions: Vec::new(),
+            internal: crate::StylingFindingInternal::default(),
         }
     }
 }
