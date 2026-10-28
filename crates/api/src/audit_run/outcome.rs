@@ -9,6 +9,7 @@ use crate::audit_keys::{
     AuditComparison, AuditDomainLedger, DeadCodeAuditLedger,
     classify_complexity_attribution_against_all, complexity_ledger_keys, dead_code_audit_ledger,
     dupe_group_key, preexisting_dupe_group_keys, styling_ledger_keys,
+    styling_ledger_keys_with_diff,
 };
 use crate::{AuditAttribution, AuditSummary, AuditVerdict};
 
@@ -173,6 +174,43 @@ pub fn demote_preexisting_dupe_introductions(
     );
     comparison.dupes.demote_introductions(&demote);
     Some(source)
+}
+
+/// Compare the styling findings again with the run's diff, so the finding
+/// that the change wrote is the introduced one.
+///
+/// Equal styling findings share one identity key, and their occurrence
+/// suffix follows source order. A new equal finding above an unchanged one
+/// would take the occurrence of the unchanged finding. With the diff, the
+/// findings on added lines get the last occurrences (issue #3956). The step
+/// runs only when a styling finding is introduced, and it changes no count.
+pub fn realign_styling_introductions(
+    comparison: &mut AuditComparison,
+    view: &AuditAnalysesView<'_>,
+    base: Option<&AuditKeySnapshot>,
+    root: &Path,
+    base_ref: &str,
+    shared: Option<SharedDiff<'_>>,
+) {
+    let (Some(base), Some(health)) = (base, view.health.as_ref()) else {
+        return;
+    };
+    if comparison.styling.introduced_count() == 0 {
+        return;
+    }
+    let worktree_index;
+    let index = if let Some(shared) = shared {
+        shared.index
+    } else if let Ok(diff) = fallow_engine::changed_files::try_get_changed_diff(root, base_ref) {
+        worktree_index = fallow_output::DiffIndex::from_unified_diff(&diff);
+        &worktree_index
+    } else {
+        return;
+    };
+    comparison.styling = AuditDomainLedger::compare(
+        styling_ledger_keys_with_diff(&health.report.styling_findings, health.root, Some(index)),
+        Some(&base.styling),
+    );
 }
 
 /// The severity of the rule that owns a styling finding `code`. Styling is

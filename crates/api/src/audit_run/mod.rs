@@ -42,7 +42,7 @@ pub use base_ref::{
 };
 pub use outcome::{
     DupeDemotionDiffSource, SharedDiff, compare, demote_preexisting_dupe_introductions, outcome,
-    styling_finding_gates, styling_rule_severity,
+    realign_styling_introductions, styling_finding_gates, styling_rule_severity,
 };
 pub use scope::{
     BaseCoverageInputs, base_coverage_inputs, base_focus_files, remap_focus_files, renamed_files,
@@ -440,8 +440,29 @@ pub fn run<B: AuditBackend>(
     }))
 }
 
+/// Copy the comparison result onto the complexity and styling findings.
+fn annotate_health_report(report: &mut HealthReport, comparison: &AuditComparison) {
+    for ((finding, introduced), class) in report
+        .findings
+        .iter_mut()
+        .zip(comparison.health.introduced())
+        .zip(&comparison.health_classes)
+    {
+        finding.introduced = Some(introduced);
+        finding.attribution = Some(class.attribution());
+        finding.worsened_metrics.clone_from(&class.worsened_metrics);
+    }
+    for (finding, introduced) in report
+        .styling_findings
+        .iter_mut()
+        .zip(comparison.styling.introduced())
+    {
+        finding.introduced = Some(introduced);
+    }
+}
+
 /// Compare head analyses with a base snapshot, decide the verdict, and set
-/// the introduced flags on the dead-code and health findings.
+/// the introduced flags on the dead-code, complexity and styling findings.
 ///
 /// Under the `new-only` gate, a complexity finding that exceeds only CRAP from
 /// estimated coverage gets the gate severity `warn` first, so it does not fail
@@ -510,6 +531,14 @@ pub fn attribute<A: AuditAnalyses>(
             base_ref,
             shared_diff,
         );
+        realign_styling_introductions(
+            &mut comparison,
+            &view,
+            base_snapshot.as_ref(),
+            root,
+            base_ref,
+            shared_diff,
+        );
         let result = outcome(gate, worsened, &view, &comparison, base_snapshot.is_some());
         (comparison, source, result)
     };
@@ -519,16 +548,7 @@ pub fn attribute<A: AuditAnalyses>(
             comparison.dead_code.annotate_results(results);
         }
         if let Some(report) = analyses.health_report_mut() {
-            for ((finding, introduced), class) in report
-                .findings
-                .iter_mut()
-                .zip(comparison.health.introduced())
-                .zip(&comparison.health_classes)
-            {
-                finding.introduced = Some(introduced);
-                finding.attribution = Some(class.attribution());
-                finding.worsened_metrics.clone_from(&class.worsened_metrics);
-            }
+            annotate_health_report(report, &comparison);
         }
     }
 

@@ -1376,6 +1376,101 @@ fn audit_css_styling_finding_survives_line_shift() {
     assert_eq!(json["attribution"]["styling_inherited"], 2);
 }
 
+/// Issue #3956: a new rule with the same styling value above an unchanged
+/// rule is the introduced finding. The unchanged rule stays inherited.
+#[test]
+fn audit_css_new_equal_value_rule_above_marks_the_new_rule_introduced() {
+    let dir = TempDir::new().expect("create temp dir");
+    let root = dir.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("package.json"),
+        r#"{"name":"audit-css-equal-value"}"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join(".fallowrc.json"),
+        r#"{"rules":{"css-selector-complexity":"error"}}"#,
+    )
+    .unwrap();
+    fs::write(root.join("src/index.ts"), "import './styles.css';\n").unwrap();
+    let base = ".a { color: blue; }\n.b { color: blue; }\n.c { color: blue; }\n#app .legacy .title { color: red; }\n";
+    fs::write(root.join("src/styles.css"), base).unwrap();
+    git(root, &["init", "-b", "main"]);
+    commit_all(root, "initial");
+
+    fs::write(
+        root.join("src/styles.css"),
+        format!("#nav .menu .item {{ color: green; }}\n{base}"),
+    )
+    .unwrap();
+    let audit = |extra: &[&str]| {
+        let mut args = vec![
+            "audit",
+            "--root",
+            root.to_str().unwrap(),
+            "--base",
+            "HEAD",
+            "--no-cache",
+            "--quiet",
+        ];
+        args.extend_from_slice(extra);
+        run_fallow_raw(&args)
+    };
+    let output = audit(&["--format", "json"]);
+    let json = parse_json(&output);
+    assert_eq!(json["attribution"]["styling_introduced"], 1);
+    assert_eq!(json["attribution"]["styling_inherited"], 1);
+    let findings = json["complexity"]["styling_findings"]
+        .as_array()
+        .expect("styling findings should be present");
+    let introduced_at = |line: u64| {
+        findings
+            .iter()
+            .find(|finding| finding["line"] == line)
+            .map(|finding| finding["introduced"].clone())
+    };
+    assert_eq!(
+        introduced_at(1),
+        Some(serde_json::json!(true)),
+        "{findings:#?}"
+    );
+    assert_eq!(
+        introduced_at(5),
+        Some(serde_json::json!(false)),
+        "{findings:#?}"
+    );
+
+    let human = audit(&[]);
+    let line_of = |needle: &str| {
+        human
+            .stdout
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no line with {needle}: {}", human.stdout))
+    };
+    let label_after = |needle: &str| {
+        let start = line_of(needle);
+        human
+            .stdout
+            .lines()
+            .skip(start)
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        label_after("styles.css:1").contains("introduced design-system drift"),
+        "line 1 should be labeled introduced: {}",
+        human.stdout
+    );
+    assert!(
+        label_after("styles.css:5").contains("inherited styling debt"),
+        "line 5 should be labeled inherited: {}",
+        human.stdout
+    );
+}
+
 /// Issue #3956 reproduction: a comment line above an unchanged `:where()`
 /// rule keeps its default-severity styling finding inherited.
 #[test]

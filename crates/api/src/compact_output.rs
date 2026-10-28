@@ -1712,6 +1712,7 @@ mod tests {
         let root = PathBuf::from("/project");
         let report = fallow_output::HealthReport {
             styling_findings: vec![fallow_output::StylingFinding {
+                introduced: None,
                 code: "css-token-drift".to_string(),
                 sub_kind: "tailwind-arbitrary-value".to_string(),
                 path: "/project/src/app.css".to_string(),

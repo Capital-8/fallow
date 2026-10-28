@@ -629,6 +629,11 @@ pub struct StylingFinding {
     pub fix_hint: Option<String>,
     /// Suggested next steps (verify / suppress; never an auto-fix).
     pub actions: Vec<CssCandidateAction>,
+    /// Audit-mode result of the comparison with the base snapshot. The audit
+    /// sets it, and the audit JSON writes it as `introduced`. It is not part
+    /// of the serialized finding.
+    #[serde(skip)]
+    pub introduced: Option<bool>,
 }
 
 /// Effective configured severity for a styling finding.

@@ -9,7 +9,9 @@ mod collection;
 #[path = "audit_keys_styling.rs"]
 mod styling;
 
-pub use styling::{styling_finding_key, styling_keys, styling_ledger_keys};
+pub use styling::{
+    styling_finding_key, styling_keys, styling_ledger_keys, styling_ledger_keys_with_diff,
+};
 
 use collection::AuditCollection;
 
@@ -1690,6 +1692,8 @@ pub fn annotate_stale_suppressions_json(
 /// A complexity finding keeps the typed `introduced` flag that the audit
 /// comparison set, because that flag compares metric values. Only a finding
 /// without the typed flag falls back to identity-key membership in `base`.
+/// A styling finding also keeps its typed flag, because the audit can use the
+/// run's diff to tell equal findings apart.
 #[expect(
     clippy::implicit_hasher,
     reason = "fallow standardizes on FxHashSet across audit attribution keys"
@@ -1715,20 +1719,7 @@ pub fn annotate_health_json(
             }
         }
     }
-    if let Some(items) = json
-        .get_mut("styling_findings")
-        .and_then(serde_json::Value::as_array_mut)
-    {
-        let keys = styling_ledger_keys(&report.styling_findings, root);
-        for (item, key) in items.iter_mut().zip(&keys) {
-            if let serde_json::Value::Object(map) = item {
-                map.insert(
-                    "introduced".to_string(),
-                    serde_json::json!(issue_was_introduced(key, base)),
-                );
-            }
-        }
-    }
+    styling::annotate_styling_json(json, &report.styling_findings, root, base);
 }
 
 /// Insert `"introduced": bool` into each `clone_groups` object in serialized
