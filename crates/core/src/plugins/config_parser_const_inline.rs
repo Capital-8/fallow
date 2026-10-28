@@ -7,6 +7,9 @@
 //! identifier in a property value or an array element with a copy of the
 //! constant's literal value, so that every walker reads it without change.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use oxc_allocator::{Allocator, CloneIn};
 #[allow(clippy::wildcard_imports, reason = "many AST types used")]
 use oxc_ast::ast::*;
@@ -14,6 +17,8 @@ use oxc_ast_visit::{Visit, VisitMut, walk, walk_mut};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::top_level_variable_declarations;
+#[path = "config_parser_value_changes.rs"]
+mod value_changes;
 
 /// The maximum number of constants that one inlined value can pass through,
 /// as in `const A = {...}; const B = [A]; export default { x: B }`.
@@ -59,12 +64,7 @@ pub(super) fn constant_values<'a>(
     if candidates.is_empty() {
         return FxHashMap::default();
     }
-    let stable = stable_bindings(
-        program,
-        candidates.iter().map(|(name, _)| *name),
-        false,
-        true,
-    );
+    let stable = stable_values(program, candidates.iter().copied(), true);
     candidates
         .into_iter()
         .filter(|(name, _)| stable.contains(name))
@@ -397,28 +397,105 @@ pub(super) fn stable_bindings<'n>(
     allow_mutating_calls: bool,
     require_top_level: bool,
 ) -> FxHashSet<&'n str> {
+    binding_counts(program, names, require_top_level)
+        .into_iter()
+        .filter(|(_, count)| count.is_stable(allow_mutating_calls))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The subset of the named literal values that [`stable_bindings`] accepts
+/// with no mutating calls.
+pub(super) fn stable_values<'n, 'e, 'a: 'e>(
+    program: &Program<'_>,
+    candidates: impl IntoIterator<Item = (&'n str, &'e Expression<'a>)>,
+    require_top_level: bool,
+) -> FxHashSet<&'n str> {
+    stable_bindings(
+        program,
+        candidates.into_iter().map(|(name, _)| name),
+        false,
+        require_top_level,
+    )
+}
+
+/// The [`NameCount`] of each name, with the changes through aliases and
+/// through calls to local functions added as mutating calls.
+fn binding_counts<'n>(
+    program: &Program<'_>,
+    names: impl IntoIterator<Item = &'n str>,
+    require_top_level: bool,
+) -> FxHashMap<&'n str, NameCount> {
     let mut usage = NameUsage::new(
         names
             .into_iter()
             .filter(|name| !require_top_level || declares_top_level_const_or_let(program, name)),
     );
     if usage.counts.is_empty() {
-        return FxHashSet::default();
+        return FxHashMap::default();
     }
     usage.visit_program(program);
-    for name in changed_alias_names(program) {
-        usage.count_mutation(&name);
+    for name in changed_names(program).iter() {
+        usage.count_mutation(name);
     }
-    usage
-        .counts
-        .into_iter()
-        .filter(|(_, count)| {
-            count.bindings == 1
-                && count.writes == 0
-                && (allow_mutating_calls || count.mutating_calls == 0)
-        })
-        .map(|(name, _)| name)
-        .collect()
+    usage.counts
+}
+
+/// The identity of one parsed program: its address, its source text and its
+/// number of statements.
+type ProgramKey = (usize, usize, usize, usize);
+
+thread_local! {
+    /// The changed names of the last program that [`changed_names`] read.
+    /// [`with_inlined_program`] clears it each time the program changes.
+    static CHANGED_NAMES: RefCell<Option<(ProgramKey, Rc<FxHashSet<String>>)>> =
+        const { RefCell::new(None) };
+}
+
+fn program_key(program: &Program<'_>) -> ProgramKey {
+    (
+        std::ptr::from_ref(program) as usize,
+        program.source_text.as_ptr() as usize,
+        program.source_text.len(),
+        program.body.len(),
+    )
+}
+
+/// The names that the program changes through an alias or a local call,
+/// computed once for each state of the program. A config parse asks for each
+/// stable binding, so one analysis serves all of them.
+fn changed_names(program: &Program<'_>) -> Rc<FxHashSet<String>> {
+    let key = program_key(program);
+    if let Some(names) = CHANGED_NAMES.with_borrow(|cached| {
+        cached
+            .as_ref()
+            .filter(|(cached_key, _)| *cached_key == key)
+            .map(|(_, names)| Rc::clone(names))
+    }) {
+        return names;
+    }
+    let names = Rc::new(value_changes::changed_names(program));
+    CHANGED_NAMES.set(Some((key, Rc::clone(&names))));
+    names
+}
+
+/// Run both inline passes on `program`, then `read` it. The cache of
+/// [`changed_names`] is cleared before and after each step, because each
+/// inline pass changes the program.
+pub(super) fn with_inlined_program<'a, R>(
+    allocator: &'a Allocator,
+    program: &mut Program<'a>,
+    source_len: usize,
+    read: impl FnOnce(&Program<'a>) -> R,
+) -> R {
+    CHANGED_NAMES.set(None);
+    inline_value_constants(allocator, program, source_len);
+    CHANGED_NAMES.set(None);
+    super::local_inline::inline_callback_locals(allocator, program, source_len);
+    CHANGED_NAMES.set(None);
+    let result = read(program);
+    CHANGED_NAMES.set(None);
+    result
 }
 
 /// Whether a top-level `const` or `let` statement declares `name`. A `var` is
@@ -434,121 +511,6 @@ fn declares_top_level_const_or_let(program: &Program<'_>, name: &str) -> bool {
     })
 }
 
-/// The maximum number of aliases that [`changed_alias_names`] follows. Above
-/// it, every name in an alias counts as changed, so no value is inlined past
-/// an alias that was not checked.
-const MAX_ALIASES: usize = 4096;
-
-/// The names that the program changes through an alias. An alias is a
-/// binding or an identifier assignment that holds a name or a member chain of
-/// it, such as `const r = common.resolve` or `const { resolve } = common`. A
-/// write or a mutating call through the alias, or through an alias of the
-/// alias, changes the root name. An alias that is only read changes nothing.
-fn changed_alias_names(program: &Program<'_>) -> Vec<String> {
-    let mut collector = AliasCollector::default();
-    collector.visit_program(program);
-    if collector.aliases.is_empty() {
-        return Vec::new();
-    }
-    if collector.aliases.len() > MAX_ALIASES {
-        // Too many aliases to follow: every name in them counts as changed.
-        return collector
-            .aliases
-            .into_iter()
-            .flat_map(|alias| [alias.name, alias.root])
-            .collect();
-    }
-    let mut usage = NameUsage::new(collector.aliases.iter().map(|alias| alias.name.as_str()));
-    usage.visit_program(program);
-    let mut roots: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
-    for alias in &collector.aliases {
-        roots
-            .entry(alias.name.as_str())
-            .or_default()
-            .push(alias.root.as_str());
-    }
-    let mut pending: Vec<&str> = collector
-        .aliases
-        .iter()
-        .filter(|alias| {
-            usage
-                .counts
-                .get(alias.name.as_str())
-                .is_some_and(|count| count.writes > count.rebinds || count.mutating_calls > 0)
-        })
-        .map(|alias| alias.name.as_str())
-        .collect();
-    // An alias of a changed alias changes its root as well. Each name enters
-    // the worklist at most once.
-    let mut changed: FxHashSet<&str> = pending.iter().copied().collect();
-    while let Some(name) = pending.pop() {
-        for &root in roots.get(name).into_iter().flatten() {
-            if changed.insert(root) {
-                pending.push(root);
-            }
-        }
-    }
-    changed.into_iter().map(str::to_owned).collect()
-}
-
-/// A name that holds the value of another name or of one of its members.
-struct Alias {
-    name: String,
-    root: String,
-}
-
-#[derive(Default)]
-struct AliasCollector {
-    aliases: Vec<Alias>,
-}
-
-impl AliasCollector {
-    fn push(&mut self, name: &str, value: &Expression<'_>) {
-        for root in alias_roots(value) {
-            self.aliases.push(Alias {
-                name: name.to_owned(),
-                root: root.to_owned(),
-            });
-        }
-    }
-}
-
-impl<'a> Visit<'a> for AliasCollector {
-    fn visit_variable_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
-        if let Some(init) = &declarator.init {
-            for identifier in declarator.id.get_binding_identifiers() {
-                self.push(identifier.name.as_str(), init);
-            }
-        }
-        walk::walk_variable_declarator(self, declarator);
-    }
-
-    fn visit_assignment_expression(&mut self, assign: &AssignmentExpression<'a>) {
-        if let AssignmentTarget::AssignmentTargetIdentifier(target) = &assign.left {
-            self.push(target.name.as_str(), &assign.right);
-        }
-        walk::walk_assignment_expression(self, assign);
-    }
-}
-
-/// The root names that a value can hold: the root of a member chain, or the
-/// roots of each branch of `a || b`, `a ?? b` or `cond ? a : b`.
-fn alias_roots<'e>(value: &'e Expression<'_>) -> Vec<&'e str> {
-    match value.without_parentheses().get_inner_expression() {
-        Expression::LogicalExpression(logical) => {
-            let mut roots = alias_roots(&logical.left);
-            roots.extend(alias_roots(&logical.right));
-            roots
-        }
-        Expression::ConditionalExpression(conditional) => {
-            let mut roots = alias_roots(&conditional.consequent);
-            roots.extend(alias_roots(&conditional.alternate));
-            roots
-        }
-        other => member_root(other).into_iter().collect(),
-    }
-}
-
 /// What one program does with one name: the number of bindings that declare it,
 /// the number of expressions that write to it or to one of its members, the
 /// number of those writes that assign a new value to the name itself, and the
@@ -559,6 +521,13 @@ struct NameCount {
     writes: usize,
     rebinds: usize,
     mutating_calls: usize,
+}
+
+impl NameCount {
+    /// One binding, no writes, and no mutating calls unless they are allowed.
+    fn is_stable(&self, allow_mutating_calls: bool) -> bool {
+        self.bindings == 1 && self.writes == 0 && (allow_mutating_calls || self.mutating_calls == 0)
+    }
 }
 
 /// The [`NameCount`] of each name in a set, from one walk of a program.
@@ -664,20 +633,22 @@ const MUTATING_METHODS: &[&str] = &[
 /// `Object.assign(name.resolve, ...)` or `Reflect.set(name, ...)`. A change to a
 /// member changes the value of the root name too.
 fn mutated_receiver<'e>(call: &'e CallExpression<'_>) -> Option<&'e str> {
+    mutated_target(call).and_then(member_root)
+}
+
+/// The value that a call changes: the receiver of a mutating method, or the
+/// first argument of a mutator such as `Object.assign`.
+fn mutated_target<'e, 'a>(call: &'e CallExpression<'a>) -> Option<&'e Expression<'a>> {
     let Expression::StaticMemberExpression(member) = call.callee.without_parentheses() else {
         return None;
     };
     if changes_first_argument(member) {
-        return call
-            .arguments
-            .first()
-            .and_then(Argument::as_expression)
-            .and_then(member_root);
+        return call.arguments.first().and_then(Argument::as_expression);
     }
     if !MUTATING_METHODS.contains(&member.property.name.as_str()) {
         return None;
     }
-    member_root(&member.object)
+    Some(&member.object)
 }
 
 /// Static methods that change the object in their first argument.
@@ -693,12 +664,29 @@ const FIRST_ARGUMENT_MUTATORS: &[(&str, &str)] = &[
 ];
 
 fn changes_first_argument(member: &StaticMemberExpression<'_>) -> bool {
-    let Expression::Identifier(object) = member.object.without_parentheses() else {
+    let Some(owner) = global_name(&member.object) else {
         return false;
     };
     FIRST_ARGUMENT_MUTATORS
         .iter()
-        .any(|(owner, method)| object.name == *owner && member.property.name == *method)
+        .any(|(name, method)| owner == *name && member.property.name == *method)
+}
+
+/// Objects that hold the globals, as in `globalThis.Object`.
+const GLOBAL_OBJECTS: &[&str] = &["globalThis", "global", "window", "self"];
+
+/// The name of a global such as `Object` in `Object` or `globalThis.Object`.
+fn global_name<'e>(expr: &'e Expression<'_>) -> Option<&'e str> {
+    match expr.without_parentheses() {
+        Expression::Identifier(id) => Some(id.name.as_str()),
+        Expression::StaticMemberExpression(member) => match member.object.without_parentheses() {
+            Expression::Identifier(owner) if GLOBAL_OBJECTS.contains(&owner.name.as_str()) => {
+                Some(member.property.name.as_str())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The root name of an identifier or of a member chain such as

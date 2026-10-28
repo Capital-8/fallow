@@ -278,9 +278,14 @@ pub(super) struct ConfigFile<'a> {
 /// Webpack and rspack name the base directory `context`, and rsbuild names it
 /// `root`. A relative entry resolves against it, not against the config file.
 /// In a multi-config export, each config resolves its entries against its own
-/// base directory. Returns the project-relative base directory of the first
-/// config, so the Module Federation reader can resolve `exposes` targets the
-/// same way.
+/// base directory.
+///
+/// Returns the project-relative base directory that all configs share, so the
+/// Module Federation reader can resolve `exposes` targets the same way. The
+/// Federation reader reads the plugin calls of the whole file and does not
+/// know which config holds a call. When the configs declare different base
+/// directories, this returns `None`, and the reader resolves `exposes`
+/// against the config directory.
 pub(super) fn apply_entries(
     result: &mut PluginResult,
     source: &str,
@@ -289,11 +294,9 @@ pub(super) fn apply_entries(
     base_key: &str,
 ) -> Option<PathBuf> {
     let ConfigFile { path, root } = config;
-    let mut first_base = None;
-    for (index, (entries, raw_base)) in
+    let mut bases = Vec::new();
+    for (entries, raw_base) in
         config_parser::extract_each_config_entries(source, path, entry_key, base_key)
-            .into_iter()
-            .enumerate()
     {
         let base = raw_base
             .and_then(|raw| config_parser::normalize_filesystem_config_path_buf(&raw, path, root));
@@ -302,11 +305,19 @@ pub(super) fn apply_entries(
                 .map(|base| normalize_context_entry(&entry, base, path, root))
                 .unwrap_or(entry)
         });
-        if index == 0 {
-            first_base = base;
-        }
+        bases.push(base);
     }
-    first_base
+    shared_base(bases)
+}
+
+/// The one base directory of all configs, or `None` when the configs declare
+/// different base directories.
+fn shared_base(bases: Vec<Option<PathBuf>>) -> Option<PathBuf> {
+    let mut bases = bases.into_iter();
+    let first = bases.next()??;
+    bases
+        .all(|base| base.as_ref() == Some(&first))
+        .then_some(first)
 }
 
 /// The project-relative package directory of a config that sits in a config
@@ -964,6 +975,487 @@ mod tests {
         );
 
         assert_eq!(result.entry_patterns, vec!["app/src/B.tsx"]);
+    }
+
+    /// A config whose inlined values nest much deeper than the source does.
+    /// Two top-level constants name each other at the leaf, so the first pass
+    /// stacks their copies. Two callback locals do the same and also name the
+    /// constants, so the second pass stacks copies of values that already
+    /// hold copies of the first pass.
+    fn deep_inline_source(open: &str, close: &str, depth: usize) -> String {
+        let deep = |leaf: &str| format!("{}{leaf}{}", open.repeat(depth), close.repeat(depth));
+        format!(
+            "const A = {a};\nconst B = {b};\nmodule.exports = () => {{\n\
+             const l1 = {l1};\nconst l2 = {l2};\n\
+             return {{ entry: \"./src/a.ts\", resolve: {{ alias: l1 }}, plugins: [l1, l2],\n\
+             externals: l2, module: {{ rules: [l1] }}, other: [l1, l2, A, B] }};\n}};\n",
+            a = deep("B"),
+            b = deep("A"),
+            l1 = deep("[l2, A]"),
+            l2 = deep("[l1, B]"),
+        )
+    }
+
+    /// The shape of [`deep_inline_source`] with one constant and one local
+    /// that each name themselves, which gives the deepest AST per source byte.
+    fn self_inline_source(open: &str, close: &str, depth: usize) -> String {
+        let deep = |leaf: &str| format!("{}{leaf}{}", open.repeat(depth), close.repeat(depth));
+        format!(
+            "const A = {a};\nmodule.exports = () => {{\nconst l = {l};\n\
+             return {{ entry: \"./src/a.ts\", resolve: {{ alias: l }}, plugins: [l],\n\
+             externals: l, module: {{ rules: [l] }}, other: [l, A] }};\n}};\n",
+            a = deep("A"),
+            l = deep("[l, A]"),
+        )
+    }
+
+    #[test]
+    fn deep_inlined_values_stay_within_the_parse_stack() {
+        // Each parse runs on a stack that `parse_bounded` sizes from the source
+        // length and the source bracket depth. The inline passes can make the
+        // AST deeper than the source. This test fails with a stack overflow
+        // when the walks over the inlined AST need more stack than that.
+        // A probe measured about 1.1 AST levels per source byte for the
+        // self-naming array shape, against about 0.12 levels per byte for the
+        // source alone.
+        for (open, close) in [("[", "]"), ("{a:", "}"), ("{a:[", "]}")] {
+            for source in [
+                deep_inline_source(open, close, 480),
+                self_inline_source(open, close, 480),
+            ] {
+                let result = WebpackPlugin.resolve_config(
+                    std::path::Path::new("/project/webpack.config.js"),
+                    &source,
+                    std::path::Path::new("/project"),
+                );
+                assert!(
+                    result
+                        .entry_patterns
+                        .iter()
+                        .any(|rule| rule.pattern == "src/a.ts"),
+                    "{source}"
+                );
+            }
+        }
+    }
+
+    fn credits_admin_entry(source: &str) -> bool {
+        WebpackPlugin
+            .resolve_config(
+                std::path::Path::new("/project/webpack.config.js"),
+                source,
+                std::path::Path::new("/project"),
+            )
+            .entry_patterns
+            .iter()
+            .any(|rule| rule.pattern == "src/admin.ts")
+    }
+
+    #[test]
+    fn entry_constant_that_a_read_only_or_exported_call_gets_still_resolves() {
+        let cases = [
+            // A `webpack-merge` call only reads its arguments.
+            r#"const { merge } = require("webpack-merge"); const common = require("./webpack.common.js");
+               const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               module.exports = merge(common, { mode: "production", entry });"#,
+            r#"import { merge } from "webpack-merge"; import common from "./webpack.common.js";
+               const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               export default merge(common, { entry });"#,
+            // A named import of the `path` module only reads its arguments.
+            r#"const { resolve } = require("path"); const HtmlWebpackPlugin = require("html-webpack-plugin");
+               const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               module.exports = { entry, plugins: [new HtmlWebpackPlugin({ template: resolve(__dirname, entry.main) })] };"#,
+            r#"import { join } from "node:path";
+               const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               export default { entry, output: { path: join(__dirname, entry.main) } };"#,
+            // The exported config call gives the config to webpack.
+            r#"const SpeedMeasurePlugin = require("speed-measure-webpack-plugin"); const smp = new SpeedMeasurePlugin();
+               const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               module.exports = smp.wrap({ entry });"#,
+            r#"module.exports = (env) => {
+                 const config = { entry: { main: "./src/main.ts", admin: "./src/admin.ts" } };
+                 if (env.analyze) return withAnalyzer(config);
+                 return config;
+               };"#,
+            // The local pass: the returned `merge` call.
+            r#"const { merge } = require("webpack-merge"); const common = require("./webpack.common.js");
+               module.exports = (env) => {
+                 const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+                 return merge(common, { mode: env.production ? "production" : "development", entry });
+               };"#,
+        ];
+        for source in cases {
+            assert!(credits_admin_entry(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn entry_constant_that_a_local_function_changes_does_not_resolve() {
+        let cases = [
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               function configure(e) { e.admin = "./src/other.ts"; }
+               configure(entry);
+               module.exports = { entry };"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry };
+               function retarget(cfg) { cfg.entry.admin = "./src/other.ts"; }
+               retarget(config);
+               module.exports = config;"#,
+        ];
+        for source in cases {
+            assert!(!credits_admin_entry(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn entry_constant_that_an_imported_or_unknown_call_gets_still_resolves() {
+        let cases = [
+            // An imported helper (fixture u9).
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const addAnalyzer = require("./analyzer.js");
+               const config = { mode: "production", entry, plugins: [] };
+               if (process.env.ANALYZE) addAnalyzer(config);
+               module.exports = config;"#,
+            r#"const { merge } = require("lodash");
+               const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               merge(entry, { admin: "./src/other.ts" });
+               module.exports = { entry };"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const configure = (e) => addPages(e);
+               configure(entry);
+               module.exports = { entry };"#,
+        ];
+        for source in cases {
+            assert!(credits_admin_entry(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn entry_constant_that_an_alias_or_a_local_function_changes_under_another_key_still_resolves() {
+        let cases = [
+            // fixture u4
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry, plugins: [] };
+               const plugins = config.plugins;
+               if (process.env.X) plugins.push(1);
+               module.exports = config;"#,
+            // fixture u5
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry, plugins: [] };
+               const { plugins } = config;
+               if (process.env.X) plugins.push(1);
+               module.exports = config;"#,
+            // fixture u6
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry };
+               const c2 = config;
+               c2.devtool = "source-map";
+               module.exports = config;"#,
+            // fixture u8
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry, plugins: [] };
+               function addAnalyzer(cfg) { cfg.plugins.push(1); }
+               if (process.env.ANALYZE) addAnalyzer(config);
+               module.exports = config;"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const holder = { a: { entry, list: [] } };
+               holder.a.list.push(1);
+               holder.a.mode = "x";
+               holder.b = 1;
+               module.exports = { entry };"#,
+        ];
+        for source in cases {
+            assert!(credits_admin_entry(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn entry_constant_in_a_config_that_changes_other_keys_still_resolves() {
+        let cases = [
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry, plugins: [] };
+               if (process.env.ANALYZE) { config.devtool = "source-map"; }
+               module.exports = config;"#,
+            r#"const webpack = require("webpack");
+               const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry, plugins: [] };
+               if (process.env.NODE_ENV === "production") { config.plugins.push(new webpack.ProgressPlugin()); }
+               module.exports = config;"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry: entry, output: { path: "dist" } };
+               config.output.filename = "[name].js";
+               delete config.mode;
+               module.exports = config;"#,
+        ];
+        for source in cases {
+            assert!(credits_admin_entry(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn entry_constant_that_a_holder_changes_through_its_key_does_not_resolve() {
+        let cases = [
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry };
+               config.entry.admin = "./src/other.ts";
+               module.exports = config;"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry };
+               config[key].admin = "./src/other.ts";
+               module.exports = config;"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry };
+               Object.assign(config.entry, { admin: "./src/other.ts" });
+               module.exports = config;"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry };
+               const c2 = config;
+               c2.entry.admin = "./src/other.ts";
+               module.exports = config;"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry };
+               const { entry: e } = config;
+               e.admin = "./src/other.ts";
+               module.exports = config;"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const holder = { a: { entry } };
+               holder.a.entry.admin = "./src/other.ts";
+               module.exports = { entry };"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const list = [entry];
+               list[0].admin = "./src/other.ts";
+               module.exports = { entry };"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { ...{ entry } };
+               config.entry.admin = "./src/other.ts";
+               module.exports = { entry };"#,
+        ];
+        for source in cases {
+            assert!(!credits_admin_entry(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn local_function_whose_parameter_shares_a_name_still_reads_its_argument() {
+        // The parameter `config` of `htmlPages` is not the top-level `config`.
+        let source = r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+            function htmlPages(config) { return Object.keys(config).map(() => null); }
+            const config = { mode: "production", entry, plugins: htmlPages(entry) };
+            if (process.env.ANALYZE) { config.devtool = "source-map"; }
+            module.exports = config;"#;
+        assert!(credits_admin_entry(source));
+    }
+
+    #[test]
+    fn local_function_that_changes_its_parameter_through_a_call_counts_as_a_change() {
+        let cases = [
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               function outer(x) { inner(x); }
+               function inner(y) { y.admin = "./src/other.ts"; }
+               outer(entry);
+               module.exports = { entry };"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const walk = function (e, n) { if (n > 0) return walk(e, n - 1); e.admin = "./src/other.ts"; };
+               walk(entry, 2);
+               module.exports = { entry };"#,
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               function configure(e) { const alias = e; alias.admin = "./src/other.ts"; }
+               configure(entry);
+               module.exports = { entry };"#,
+        ];
+        for source in cases {
+            assert!(!credits_admin_entry(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn entry_that_a_spread_copy_recursion_or_destructuring_default_does_not_change_still_resolves()
+    {
+        let cases = [
+            // fixture s2: the copy sets its own `plugins`.
+            r#"const common = { entry: { main: "./src/main.ts", admin: "./src/admin.ts" } };
+               const prod = { ...common, mode: "production", plugins: [] };
+               if (process.env.ANALYZE) prod.plugins.push(1);
+               module.exports = prod;"#,
+            // fixture r1
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry, optimization: { next: null } };
+               function mark(o) { o.seen = true; if (o.next) mark(o.next); }
+               mark(config.optimization);
+               module.exports = config;"#,
+            // fixture r2
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry, next: null };
+               function mark(o) { o.seen = true; if (o.next) mark(o.next); }
+               mark(config);
+               module.exports = config;"#,
+            // fixture d1: a default value is only read.
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry };
+               let mode;
+               ({ mode = config.mode } = {});
+               module.exports = config;"#,
+        ];
+        for source in cases {
+            assert!(credits_admin_entry(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn entry_that_a_spread_copy_or_a_destructuring_target_changes_does_not_resolve() {
+        let cases = [
+            // The copy shares `entry` with `common`.
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const common = { entry };
+               const prod = { ...common, plugins: [] };
+               prod.entry.admin = "./src/other.ts";
+               module.exports = { entry };"#,
+            // A member target of a destructuring assignment is a write.
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry };
+               ({ admin: config.entry.admin } = { admin: "./src/other.ts" });
+               module.exports = config;"#,
+        ];
+        for source in cases {
+            assert!(!credits_admin_entry(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn recursive_helpers_over_more_than_one_key_end_fast() {
+        let shared: String = (0..20)
+            .map(|i| format!("const S{i} = {{ singleton: true }};\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let shared_keys = (0..20)
+            .map(|i| format!("p{i}: S{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cases = [
+            // fixture b6: the ejected webpack or craco rules helper.
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = {
+                 mode: "production",
+                 entry,
+                 module: { rules: [{ oneOf: [{ test: /\.css$/, use: ["style-loader", "css-loader"] }] }] },
+               };
+               function excludeNodeModules(rules) {
+                 for (const rule of rules) {
+                   if (rule.oneOf) excludeNodeModules(rule.oneOf);
+                   if (rule.rules) excludeNodeModules(rule.rules);
+                   rule.exclude = /node_modules/;
+                 }
+               }
+               excludeNodeModules(config.module.rules);
+               module.exports = config;"#
+                .to_string(),
+            // fixture b1: a recursion over three keys.
+            r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+               const config = { mode: "production", entry, tree: {} };
+               function mark(o) { o.seen = true; if (o.l) mark(o.l); if (o.r) mark(o.r); if (o.m) mark(o.m); }
+               mark(config.tree);
+               module.exports = config;"#
+                .to_string(),
+            // fixture b5: the same recursion, with many stable lookups.
+            format!(
+                "const entry = {{ main: \"./src/main.ts\", admin: \"./src/admin.ts\" }};\n\
+                 const config = {{ mode: \"production\", entry, tree: {{}} }};\n\
+                 function mark(o) {{ o.seen = true; if (o.l) mark(o.l); if (o.r) mark(o.r); if (o.m) mark(o.m); }}\n\
+                 mark(config.tree);\n{shared}\
+                 const {{ ModuleFederationPlugin }} = require('webpack').container;\n\
+                 config.plugins = [new ModuleFederationPlugin({{ name: 'a', exposes: {{ './A': './src/main.ts' }}, shared: {{ {shared_keys} }} }})];\n\
+                 module.exports = config;\n"
+            ),
+        ];
+        for source in cases {
+            let start = std::time::Instant::now();
+            assert!(credits_admin_entry(&source), "{source}");
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_millis(500),
+                "took {elapsed:?}: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn change_through_two_holders_past_the_chain_cut_reads_the_old_value() {
+        // A known limit of the chain cut in `config_parser_value_changes.rs`:
+        // the write goes through `holder` (keys `a.b.c`) and then `x` (keys
+        // `d.e.f`). The cut keeps five keys, so `x` does not find `f` and
+        // fallow reads the old value of `entry`. This can hide an unused file
+        // (`src/admin.ts` is credited), which `main` does as well.
+        let source = r#"const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+            const x = { d: { e: { f: entry } } };
+            const holder = { a: { b: { c: x } } };
+            holder.a.b.c.d.e.f.admin = "./src/other.ts";
+            module.exports = { entry };"#;
+        assert!(credits_admin_entry(source));
+    }
+
+    #[test]
+    fn local_binding_that_shadows_a_top_level_function_does_not_use_its_body() {
+        // The top-level `setEntry` changes its parameter, but the call names
+        // the local binding from `require`, which fallow cannot see.
+        let source = r#"function setEntry(e) { e.admin = "./src/other.ts"; }
+            module.exports = () => {
+              const { setEntry } = require("./helpers.js");
+              const entry = { main: "./src/main.ts", admin: "./src/admin.ts" };
+              setEntry(entry);
+              return { entry };
+            };"#;
+        assert!(credits_admin_entry(source));
+    }
+
+    #[test]
+    fn entry_constant_that_a_local_function_only_reads_still_resolves() {
+        let source = r#"const entries = { main: "./src/main.ts", admin: "./src/admin.ts" };
+            function htmlPages(e) { return Object.keys(e).map(() => null); }
+            module.exports = { entry: entries, plugins: htmlPages(entries) };"#;
+        assert!(credits_admin_entry(source));
+    }
+
+    fn federation_exposes_of(source: &str) -> Vec<String> {
+        let result = WebpackPlugin.resolve_config(
+            std::path::Path::new("/project/webpack.config.js"),
+            source,
+            std::path::Path::new("/project"),
+        );
+        result
+            .entry_patterns
+            .into_iter()
+            .map(|rule| rule.pattern)
+            .filter(|pattern| pattern.contains("x.ts"))
+            .collect()
+    }
+
+    #[test]
+    fn multi_config_with_different_contexts_roots_exposes_at_the_config_directory() {
+        // The plugin call sits in the second config, which sets no `context`.
+        // The `context` of the first config must not move the exposed file.
+        let source = r#"
+            const path = require("path");
+            const { ModuleFederationPlugin } = require("webpack").container;
+            module.exports = [
+                { context: path.resolve(__dirname, "client"), entry: "./main.ts" },
+                { entry: "./src/server.ts",
+                  plugins: [new ModuleFederationPlugin({ name: "app", exposes: { "./X": "./src/x.ts" } })] },
+            ];
+        "#;
+        assert_eq!(federation_exposes_of(source), vec!["src/x.ts"]);
+    }
+
+    #[test]
+    fn multi_config_with_one_shared_context_roots_exposes_at_that_context() {
+        let source = r#"
+            const path = require("path");
+            module.exports = [
+                { context: path.resolve(__dirname, "app"), entry: "./main.ts" },
+                { context: path.resolve(__dirname, "app"), entry: "./server.ts",
+                  plugins: [new ModuleFederationPlugin({ name: "app", exposes: { "./X": "./src/x.ts" } })] },
+            ];
+        "#;
+        assert_eq!(federation_exposes_of(source), vec!["app/src/x.ts"]);
     }
 
     #[test]
