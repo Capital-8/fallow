@@ -8,7 +8,7 @@ use super::{AuditAnalysesView, AuditKeySnapshot};
 use crate::audit_keys::{
     AuditComparison, AuditDomainLedger, DeadCodeAuditLedger,
     classify_complexity_attribution_against_all, complexity_ledger_keys, dead_code_audit_ledger,
-    dupe_group_key, preexisting_dupe_group_keys, styling_finding_key,
+    dupe_group_key, preexisting_dupe_group_keys, styling_ledger_keys,
 };
 use crate::{AuditAttribution, AuditSummary, AuditVerdict};
 
@@ -121,13 +121,9 @@ pub fn compare(
         base.map(|snapshot| &snapshot.dupes),
     );
     let styling = AuditDomainLedger::compare(
-        view.health.iter().flat_map(|health| {
-            health
-                .report
-                .styling_findings
-                .iter()
-                .map(|finding| styling_finding_key(finding, health.root))
-        }),
+        view.health
+            .iter()
+            .flat_map(|health| styling_ledger_keys(&health.report.styling_findings, health.root)),
         base.map(|snapshot| &snapshot.styling),
     );
     AuditComparison {

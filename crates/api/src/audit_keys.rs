@@ -6,6 +6,10 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 #[path = "audit_keys_collection.rs"]
 mod collection;
+#[path = "audit_keys_styling.rs"]
+mod styling;
+
+pub use styling::{styling_finding_key, styling_keys, styling_ledger_keys};
 
 use collection::AuditCollection;
 
@@ -1715,14 +1719,12 @@ pub fn annotate_health_json(
         .get_mut("styling_findings")
         .and_then(serde_json::Value::as_array_mut)
     {
-        for (item, finding) in items.iter_mut().zip(&report.styling_findings) {
+        let keys = styling_ledger_keys(&report.styling_findings, root);
+        for (item, key) in items.iter_mut().zip(&keys) {
             if let serde_json::Value::Object(map) = item {
                 map.insert(
                     "introduced".to_string(),
-                    serde_json::json!(issue_was_introduced(
-                        &styling_finding_key(finding, root),
-                        base
-                    )),
+                    serde_json::json!(issue_was_introduced(key, base)),
                 );
             }
         }
@@ -1809,28 +1811,6 @@ pub fn health_finding_key(finding: &fallow_output::ComplexityViolation, root: &P
         "complexity:{}:{}",
         relative_key_path(Path::new(&finding.path), root),
         finding.name,
-    )
-}
-
-/// Attribution key set for every styling finding in a health report.
-pub fn styling_keys(report: &fallow_output::HealthReport, root: &Path) -> FxHashSet<String> {
-    report
-        .styling_findings
-        .iter()
-        .map(|finding| styling_finding_key(finding, root))
-        .collect()
-}
-
-/// Attribution key for one styling finding:
-/// `styling:<code>:<sub kind>:<path>:<line>:<value>`.
-pub fn styling_finding_key(finding: &fallow_output::StylingFinding, root: &Path) -> String {
-    format!(
-        "styling:{}:{}:{}:{}:{}",
-        finding.code,
-        finding.sub_kind,
-        relative_key_path(Path::new(&finding.path), root),
-        finding.line,
-        finding.value
     )
 }
 

@@ -1,0 +1,3 @@
+### Fixed
+
+- **`fallow audit --base` keeps an unchanged styling finding inherited after a line shift.** Before, a line added above an existing CSS rule marked its `css-*` finding as introduced, and the new-only gate could fail on it. The audit now matches a styling finding by its code, sub-kind, file and value, not by its line. When a file has two equal findings, each one keeps its own identity in source order. The base snapshot cache version changes, so the next audit computes a new base snapshot. Thanks [@cheetahbyte](https://github.com/cheetahbyte) for the report. (Closes [#3956](https://github.com/fallow-rs/fallow/issues/3956))
