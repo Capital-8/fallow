@@ -1779,3 +1779,136 @@ fn mutation_kill_matrix_human_report_distinguishes_candidates_and_evidence_limit
     assert!(normal.contains("kill-matrix-disabled:"), "{normal}");
     assert!(normal.contains("Use --kill-matrix."), "{normal}");
 }
+
+#[test]
+fn mutation_human_matrix_bounds_rows_and_ids_without_truncating_json() {
+    let mut measured = report(Vec::new(), Vec::new());
+    measured.kill_matrix = kill_matrix_fixture();
+    let templates = measured.kill_matrix.tests.clone();
+    measured.kill_matrix.tests.clear();
+    measured.kill_matrix.candidates.clear();
+    measured.kill_matrix.coverage_without_kills.clear();
+    let long_name = "long-test-name-".repeat(12);
+    for (group, template) in templates.into_iter().enumerate() {
+        for index in 0..11 {
+            let mut row = template.clone();
+            row.test_id = format!("test/group-{group}/{index:02}::{long_name}");
+            if !row.kills.is_empty() {
+                row.kills = (0..5).map(|id| format!("mutant-{id:02}")).collect();
+                row.unique_kills = (0..4).map(|id| format!("unique-{id:02}")).collect();
+                row.subsuming_tests = (0..5)
+                    .map(|id| format!("test/index.spec.ts::case-{id:02}::{long_name}"))
+                    .collect();
+            }
+            match group {
+                0 => measured.kill_matrix.candidates.push(row.test_id.clone()),
+                2 => measured
+                    .kill_matrix
+                    .coverage_without_kills
+                    .push(row.test_id.clone()),
+                _ => {}
+            }
+            measured.kill_matrix.tests.push(row);
+        }
+    }
+    let text = run_text(&measured, &OPTIONS);
+    assert!(
+        text.contains("Kills: mutant-00, mutant-01, mutant-02"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Unique kills: unique-00, unique-01, unique-02"),
+        "{text}"
+    );
+    assert!(
+        text.contains("      test/index.spec.ts::case-00::")
+            && text.contains("      test/index.spec.ts::case-01::"),
+        "{text}"
+    );
+    assert!(
+        text.contains("and 1 more test (see the saved JSON report)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("and 2 more mutants (see the saved JSON report)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("and 1 more mutant (see the saved JSON report)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("and 2 more tests (see the saved JSON report)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("See the saved JSON report for complete evidence."),
+        "{text}"
+    );
+    for group in 0..3 {
+        let prefix = format!("  test/group-{group}/00::");
+        let first = text
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .expect("visible first row");
+        assert!(first.ends_with("..."), "{first}");
+        assert!(first.chars().count() <= 62, "{first}");
+        assert!(
+            !text.contains(&format!("test/group-{group}/10::")),
+            "{text}"
+        );
+    }
+    for line in text
+        .lines()
+        .filter(|line| line.contains("Individual subsumers:"))
+    {
+        assert!(line.chars().count() <= 100, "{line}");
+    }
+    assert!(!text.contains("mutant-04"), "{text}");
+    assert!(!text.contains("unique-03"), "{text}");
+    assert!(!text.contains("case-04"), "{text}");
+
+    let json = serialize_mutation_json_output(measured).unwrap();
+    let rows = json["kill_matrix"]["tests"].as_array().unwrap();
+    assert_eq!(rows.len(), 33);
+    assert_eq!(rows[10]["test_id"], format!("test/group-0/10::{long_name}"));
+    assert_eq!(rows[0]["kills"][4], "mutant-04");
+    assert_eq!(rows[0]["unique_kills"][3], "unique-03");
+    assert_eq!(
+        rows[0]["subsuming_tests"][4],
+        format!("test/index.spec.ts::case-04::{long_name}")
+    );
+}
+
+#[test]
+fn mutation_human_inspect_bounds_killers_without_truncating_json() {
+    let mut packet = inspect_packet(fallow_output::MutationInspectStatus::Fresh, None);
+    let long_name = "long-killing-test-name-".repeat(10);
+    packet.kill_matrix_complete = true;
+    packet.killing_tests = (0..11)
+        .map(|id| format!("test/killers/{id:02}::{long_name}"))
+        .collect();
+    let text = plain(&render_inspect(&packet));
+    assert!(text.contains("Killing tests (complete matrix)"), "{text}");
+    assert!(
+        text.contains("and 1 more test (see the saved JSON report)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("See the saved JSON report for complete evidence."),
+        "{text}"
+    );
+    let first = text
+        .lines()
+        .find(|line| line.starts_with("  test/killers/00::"))
+        .expect("first killer stays visible");
+    assert!(first.ends_with("..."), "{first}");
+    assert!(first.chars().count() <= 62, "{first}");
+    assert!(!text.contains("test/killers/10::"), "{text}");
+    let json = serialize_mutation_inspect_json_output(packet).unwrap();
+    assert_eq!(json["killing_tests"].as_array().unwrap().len(), 11);
+    assert_eq!(
+        json["killing_tests"][10],
+        format!("test/killers/10::{long_name}")
+    );
+}

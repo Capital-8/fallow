@@ -43,6 +43,12 @@ const MAX_INSPECT_ITEMS_SHOWN: usize = 10;
 /// The most survivors that the run report lists. The grouped sections of
 /// the other commands use the same cap.
 const MAX_SURVIVORS_SHOWN: usize = 10;
+/// The most tests shown in each kill-matrix evidence group.
+const MAX_MATRIX_TESTS_SHOWN: usize = 10;
+/// The most ids shown on each kill-matrix detail line.
+const MAX_MATRIX_IDS_SHOWN: usize = 3;
+/// The longest id in an inline kill-matrix list.
+const MAX_MATRIX_ID_CHARS: usize = 20;
 /// The runner note for a type-check pass that the run did not execute.
 const TYPECHECK_NOT_RUN_NOTE: &str = "typecheck-not-run";
 
@@ -112,8 +118,12 @@ fn no_data_line(scope: &MutationScopeOutput) -> String {
 /// The line under a capped list: the count of hidden items and where the
 /// full list is.
 fn more_line(hidden: usize, one: &str, many: &str) -> String {
+    more_line_in(hidden, one, many, "--format json")
+}
+
+fn more_line_in(hidden: usize, one: &str, many: &str, source: &str) -> String {
     format!(
-        "  and {hidden} more {} (see --format json)",
+        "  and {hidden} more {} (see {source})",
         plural(hidden, one, many)
     )
 }
@@ -746,11 +756,48 @@ fn kill_matrix_note(note: &str) -> &str {
     }
 }
 
-fn kill_id_list(ids: &[String]) -> String {
-    if ids.is_empty() {
+fn render_kill_id_list(out: &mut String, label: &str, ids: &[String], one: &str, many: &str) {
+    let shown: Vec<_> = ids
+        .iter()
+        .take(MAX_MATRIX_IDS_SHOWN)
+        .map(|id| shorten(id, MAX_MATRIX_ID_CHARS))
+        .collect();
+    let value = if shown.is_empty() {
         "none".to_owned()
     } else {
-        ids.join(", ")
+        shown.join(", ")
+    };
+    let _ = writeln!(out, "    {label}: {value}");
+    let hidden = ids.len().saturating_sub(MAX_MATRIX_IDS_SHOWN);
+    if hidden > 0 {
+        let _ = writeln!(
+            out,
+            "    {}",
+            more_line_in(hidden, one, many, "the saved JSON report")
+        );
+    }
+}
+
+fn render_subsuming_tests(out: &mut String, tests: &[String]) {
+    if tests
+        .iter()
+        .take(MAX_MATRIX_IDS_SHOWN)
+        .all(|test| test.chars().count() <= MAX_MATRIX_ID_CHARS)
+    {
+        render_kill_id_list(out, "Individual subsumers", tests, "test", "tests");
+        return;
+    }
+    out.push_str("    Individual subsumers:\n");
+    for test in tests.iter().take(MAX_MATRIX_IDS_SHOWN) {
+        let _ = writeln!(out, "      {}", shorten(test, MAX_TEST_NAME_CHARS));
+    }
+    let hidden = tests.len().saturating_sub(MAX_MATRIX_IDS_SHOWN);
+    if hidden > 0 {
+        let _ = writeln!(
+            out,
+            "    {}",
+            more_line_in(hidden, "test", "tests", "the saved JSON report")
+        );
     }
 }
 
@@ -763,19 +810,27 @@ fn render_test_kill_rows(out: &mut String, title: &str, rows: &[&MutationTestKil
         "\n{}",
         build_section_header(title, rows.len(), Level::Info)
     );
-    for row in rows {
-        let _ = writeln!(out, "  {}", row.test_id);
-        let _ = writeln!(out, "    File: {}", format_path(&row.file));
-        let _ = writeln!(out, "    Kills: {}", kill_id_list(&row.kills));
-        let _ = writeln!(out, "    Unique kills: {}", kill_id_list(&row.unique_kills));
+    for row in rows.iter().take(MAX_MATRIX_TESTS_SHOWN) {
+        let _ = writeln!(out, "  {}", shorten(&row.test_id, MAX_TEST_NAME_CHARS));
         let _ = writeln!(
             out,
-            "    Individual subsumers: {}",
-            kill_id_list(&row.subsuming_tests)
+            "    File: {}",
+            format_path(&shorten(&row.file, MAX_TEST_NAME_CHARS))
         );
+        render_kill_id_list(out, "Kills", &row.kills, "mutant", "mutants");
+        render_kill_id_list(out, "Unique kills", &row.unique_kills, "mutant", "mutants");
+        render_subsuming_tests(out, &row.subsuming_tests);
         for note in &row.notes {
             let _ = writeln!(out, "    Note: {}", kill_matrix_note(note));
         }
+    }
+    let hidden = rows.len().saturating_sub(MAX_MATRIX_TESTS_SHOWN);
+    if hidden > 0 {
+        let _ = writeln!(
+            out,
+            "{}",
+            more_line_in(hidden, "test", "tests", "the saved JSON report")
+        );
     }
 }
 
@@ -799,6 +854,7 @@ fn render_kill_matrix(out: &mut String, matrix: &MutationKillMatrix) {
     } else {
         out.push_str("  Review each candidate individually. Removing candidates together can remove all tests for a mutant.\n");
     }
+    out.push_str("  See the saved JSON report for complete evidence.\n");
     let candidates: FxHashSet<&str> = matrix.candidates.iter().map(String::as_str).collect();
     let without_kills: FxHashSet<&str> = matrix
         .coverage_without_kills
@@ -1062,8 +1118,22 @@ pub fn render_inspect(packet: &MutationInspectOutput) -> String {
         if packet.killing_tests.is_empty() {
             out.push_str("  No test killed this mutant.\n");
         }
-        for test in &packet.killing_tests {
-            let _ = writeln!(out, "  {test}");
+        for test in packet.killing_tests.iter().take(MAX_INSPECT_ITEMS_SHOWN) {
+            let _ = writeln!(out, "  {}", shorten(test, MAX_TEST_NAME_CHARS));
+        }
+        let hidden = packet
+            .killing_tests
+            .len()
+            .saturating_sub(MAX_INSPECT_ITEMS_SHOWN);
+        if hidden > 0 {
+            let _ = writeln!(
+                out,
+                "{}",
+                more_line_in(hidden, "test", "tests", "the saved JSON report")
+            );
+        }
+        if !packet.killing_tests.is_empty() {
+            out.push_str("  See the saved JSON report for complete evidence.\n");
         }
     } else if let Some(killed_by) = &packet.killed_by {
         let _ = writeln!(out, "\nKilled by: {killed_by}");
