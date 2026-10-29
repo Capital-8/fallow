@@ -68,6 +68,26 @@
       ]
     },
     {
+      "name": "--lean",
+      "type": "bool",
+      "required": false,
+      "description": "Trim JSON for agent context: leave out empty arrays and zero dead-code summary counts, group workspace diagnostics, cap health tables, and move repeated action text to `_meta.actions`. Requires JSON output. Applies to dead-code, health and the combined report; other commands reject it. Run without `--lean` for the full diagnostic list and the complete tables",
+      "possible_values": [
+        "true",
+        "false"
+      ]
+    },
+    {
+      "name": "--full-tables",
+      "type": "bool",
+      "required": false,
+      "description": "With `--lean`, keep every row of the health tables (`hotspots`, `file_scores`, `large_functions`)",
+      "possible_values": [
+        "true",
+        "false"
+      ]
+    },
+    {
       "name": "--quiet",
       "type": "bool",
       "required": false,
