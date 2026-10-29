@@ -479,7 +479,7 @@ fallow mutation --all --kill-matrix --format json --quiet
 The report separates matrix evidence from mutation completion. Normal mode reports unavailable evidence with the reason `kill-matrix-disabled`.
 Incomplete matrix evidence produces no redundant test candidates. Check its status and reasons before you review tests.
 
-Each test entry identifies its test and file. Its kills and unique kills are arrays of mutant IDs.
+`kills` and `unique_kills` are arrays of mutant IDs.
 A unique kill belongs to one test only. Individual subsumers kill every mutant that the candidate kills.
 A candidate can also have collective coverage: other tests together kill all its mutants without one individual subsumer.
 

@@ -99,7 +99,7 @@ fn stored_outcome(
     covering_tests.sort_unstable();
     MutantOutcome {
         status: hit.status,
-        killing_tests: hit.killing_tests.clone(),
+        killing_tests: hit.killing_tests,
         kill_matrix_complete: hit.kill_matrix_complete,
         killed_by: hit.killed_by,
         covering_tests,

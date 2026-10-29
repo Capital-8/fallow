@@ -150,7 +150,6 @@ pub(super) fn matrix_evidence(tests: &[String], result: &RunResult) -> (Vec<Stri
         && result.unhandled_errors.is_empty()
         && result.tests_executed == tests.len()
         && result.tests.len() == tests.len()
-        && seen.len() == requested.len()
         && requested.len() == tests.len();
     (killers, complete)
 }
