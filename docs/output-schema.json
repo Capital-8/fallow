@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Fallow JSON Output Schemas",
-  "description": "Schemas for the JSON output of fallow commands. Object-shaped envelopes covered by the `FallowOutput` contract carry a top-level `kind` discriminator. Current kind values: `audit`, `explain`, `inspect_target`, `trace`, `trace-error`, `review-envelope`, `review-reconcile`, `coverage-setup`, `coverage-analyze`, `list-boundaries`, `list-workspaces`, `health`, `dupes`, `dead-code-grouped`, `architecture-grouped`, `impact`, `impact-cross-repo`, `security`, `security-survivors`, `security-blind-spots`, `dead-code`, `architecture`, `combined`, `feature-flags`, `audit-brief`, `decision-surface`, `review-walkthrough-guide`, `review-walkthrough-validation`, `suppression-inventory`, `doctor`, `type-aware-status`, `similar-code`, `similar-code-inspect`, `similar-code-review`, `similar-code-status`, `similar-code-cache-clear`, `mutation`, `mutation-plan`, `mutation-inspect`. Consumers should branch on `kind` instead of probing for unique field presence. `CodeClimateOutput` is a bare JSON array (per the Code Climate / GitLab Code Quality spec) and stays a sibling root branch discriminated by checking whether the document root is an array. `ErrorOutput` is the `--format json` failure document, emitted on stdout with a non-zero exit; it carries no `kind` and is discriminated by the `error: true` field.",
+  "description": "Schemas for the JSON output of fallow commands. Object-shaped envelopes covered by the `FallowOutput` contract carry a top-level `kind` discriminator. Current kind values: `audit`, `explain`, `inspect_target`, `trace`, `trace-error`, `review-envelope`, `review-reconcile`, `coverage-setup`, `coverage-analyze`, `list-boundaries`, `list-workspaces`, `health`, `dupes`, `dead-code-grouped`, `architecture-grouped`, `impact`, `impact-cross-repo`, `security`, `security-survivors`, `security-blind-spots`, `dead-code`, `architecture`, `combined`, `feature-flags`, `audit-brief`, `decision-surface`, `review-walkthrough-guide`, `review-walkthrough-validation`, `suppression-inventory`, `doctor`, `type-aware-status`, `similar-code`, `similar-code-inspect`, `similar-code-review`, `similar-code-status`, `similar-code-cache-clear`, `mutation`, `mutation-plan`, `mutation-inspect`. Consumers should branch on `kind` instead of probing for unique field presence. `CodeClimateOutput` is a bare JSON array (per the Code Climate / GitLab Code Quality spec) and stays a sibling root branch discriminated by checking whether the document root is an array. `ErrorOutput` is the `--format json` failure document, emitted on stdout with a non-zero exit; it carries no `kind` and is discriminated by the `error: true` field. A `--lean` document is not a root branch: it validates against `LeanOutput`.",
   "oneOf": [
     {
       "$ref": "#/definitions/FallowOutput"
@@ -9833,7 +9833,12 @@
               },
               "required": [
                 "kind"
-              ]
+              ],
+              "not": {
+                "required": [
+                  "profile"
+                ]
+              }
             }
           ]
         },
@@ -9873,7 +9878,12 @@
               },
               "required": [
                 "kind"
-              ]
+              ],
+              "not": {
+                "required": [
+                  "profile"
+                ]
+              }
             }
           ]
         },
@@ -10027,7 +10037,12 @@
               },
               "required": [
                 "kind"
-              ]
+              ],
+              "not": {
+                "required": [
+                  "profile"
+                ]
+              }
             }
           ]
         },
@@ -10067,7 +10082,12 @@
               },
               "required": [
                 "kind"
-              ]
+              ],
+              "not": {
+                "required": [
+                  "profile"
+                ]
+              }
             }
           ]
         },
@@ -34981,6 +35001,157 @@
         }
       ],
       "description": "Outcome of `fallow coverage setup --cloud --wait`."
+    },
+    "LeanOutput": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "Kind of the full envelope that this document trims.",
+          "$ref": "#/definitions/LeanOutputKind"
+        },
+        "profile": {
+          "description": "Always `lean`. A full document has no `profile` field.",
+          "$ref": "#/definitions/LeanProfile"
+        },
+        "schema_version": {
+          "type": "integer",
+          "description": "Schema version of the full envelope of the same `kind`."
+        },
+        "workspace_diagnostics": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/LeanDiagnosticGroup"
+          },
+          "description": "Workspace diagnostics, one entry per `kind`."
+        },
+        "_meta": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LeanMeta"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The `_meta` object of the full envelope plus `actions`."
+        }
+      },
+      "required": [
+        "kind",
+        "profile",
+        "schema_version"
+      ],
+      "title": "fallow --format json --lean",
+      "description": "Root of a `--format json --lean` document.\n\nThe body is the envelope of the same `kind`, with these changes:\n\n- Arrays that are empty are left out: at the root, in each `groups[]`\n  entry, and in each combined section (`check`, `dupes`, `health`).\n- Dead-code `summary` counts that are zero are left out (the dead-code\n  root and the combined `check` section).\n- `workspace_diagnostics` holds one entry per `kind`: the first\n  diagnostic of the kind plus `count` when the kind has more than one.\n- The health tables `hotspots`, `file_scores` and `large_functions` keep\n  their first rows (10 by default, the `--top` value when given, all rows\n  with `--full-tables`). `<table>_omitted` counts the rows left out. With\n  `fallow health --top`, the analysis cuts the tables first, so a table\n  that `--top` cut has no `<table>_omitted` count.\n- Repeated action text is in `_meta.actions`. An action without a text\n  field reads it from `_meta.actions[<type>].<field>`.\n\n`schema_version` is the version of the full envelope of the same `kind`."
+    },
+    "LeanOutputKind": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "dead-code",
+          "description": "`fallow dead-code --format json --lean`."
+        },
+        {
+          "type": "string",
+          "const": "dead-code-grouped",
+          "description": "`fallow dead-code --group-by ... --format json --lean`."
+        },
+        {
+          "type": "string",
+          "const": "health",
+          "description": "`fallow health --format json --lean`."
+        },
+        {
+          "type": "string",
+          "const": "combined",
+          "description": "Bare `fallow --format json --lean`."
+        }
+      ],
+      "description": "Envelope kinds that have a lean profile."
+    },
+    "LeanProfile": {
+      "oneOf": [
+        {
+          "type": "string",
+          "const": "lean",
+          "description": "The `--lean` profile."
+        }
+      ],
+      "description": "Marker of a lean document."
+    },
+    "LeanDiagnosticGroup": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "description": "Diagnostic kind."
+        },
+        "path": {
+          "type": "string",
+          "description": "Path of the first diagnostic of the kind."
+        },
+        "message": {
+          "type": "string",
+          "description": "Message of the first diagnostic of the kind."
+        },
+        "degrades_analysis": {
+          "type": "boolean",
+          "description": "`true` when any diagnostic of the kind degrades the analysis."
+        },
+        "count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "Number of diagnostics of the kind, when more than 1. An absent count\nmeans 1. Run without `--lean` for each diagnostic."
+        }
+      },
+      "required": [
+        "kind",
+        "path",
+        "message"
+      ],
+      "description": "One workspace diagnostic kind in a lean document. The entry also carries\nthe kind-specific fields of the first diagnostic of the kind."
+    },
+    "LeanMeta": {
+      "type": "object",
+      "properties": {
+        "actions": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/definitions/LeanSharedActionText"
+          },
+          "description": "Shared action text, keyed by action `type`. An action without\n`description`, `note` or `comment` reads the value here."
+        }
+      },
+      "description": "The `_meta` keys that the lean profile adds. The keys of the full envelope\n`_meta` stay."
+    },
+    "LeanSharedActionText": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Shared `description`."
+        },
+        "note": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Shared `note`."
+        },
+        "comment": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Shared `comment`."
+        }
+      },
+      "description": "The most common text of one action type. Actions with other text keep\ntheir own field."
     }
   }
 }

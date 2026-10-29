@@ -64,6 +64,8 @@ mod impact;
 mod inspect_envelopes;
 mod issue_contract;
 mod json_paths;
+mod lean_pass;
+mod lean_profile;
 mod list_envelopes;
 mod mutation;
 mod next_steps;
@@ -311,9 +313,14 @@ pub use issue_contract::{
     ACTIONS_AUTO_FIXABLE_FIELD_DEFINITION, ACTIONS_FIELD_DEFINITION, ARCHITECTURE_DOCS,
     ARCHITECTURE_RESULT_KEYS, CHECK_DOCS, CODECLIMATE_RESULT_CODES, IssueOutputContract,
     TsAliasMeta, architecture_meta, check_meta, issue_output_contract_by_code,
-    issue_output_contracts, rule_docs_url,
+    issue_output_contracts, retain_reported_rules, rule_docs_url,
 };
 pub use json_paths::{normalize_uri, strip_root_prefix};
+pub use lean_pass::{LEAN_TABLE_CAP, apply_lean_profile};
+pub use lean_profile::{
+    LEAN_PROFILE, LEAN_PROFILE_KINDS, LeanDiagnosticGroup, LeanMeta, LeanOutput, LeanOutputKind,
+    LeanProfile, LeanSharedActionText,
+};
 pub use list_envelopes::{
     BoundariesListLogicalGroup, BoundariesListRule, BoundariesListZone, BoundariesListing,
     ListBoundariesOutput, ListEntryPointOutput, ListOutput, ListPluginOutput, WorkspaceInfo,
