@@ -683,7 +683,7 @@ fn wait_for_activation(
     let Some(sha) = cloud.git_sha.as_deref() else {
         return wait_error("--wait needs a commit SHA. Pass --git-sha <sha>.");
     };
-    let api_key = match resolve_api_key(args.api_key.as_deref(), args.api_endpoint.as_deref()) {
+    let api_key = match resolve_api_key(args.api_key.as_deref()) {
         Ok(key) => key,
         Err(message) => return wait_error(message),
     };

@@ -35169,7 +35169,14 @@
         },
         "state": {
           "type": "string",
-          "description": "Tracking state: `called`, `never_called` or `untracked`."
+          "description": "Tracking state in the current deployment: `called`, `never_called` or\n`untracked`."
+        },
+        "period_state": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Tracking state over the whole period, earlier deployments included.\n`called` with `state` `never_called` means that the function did not\nrun in this deployment, but ran in an earlier one. `None` when the\ncloud does not say."
         },
         "calls": {
           "type": [

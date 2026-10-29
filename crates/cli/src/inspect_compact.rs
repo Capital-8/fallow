@@ -298,6 +298,9 @@ fn prod_text(function: &InspectCloudFunction, period: u16) -> String {
     let mut parts = Vec::new();
     match (function.state.as_str(), function.calls) {
         ("called", Some(calls)) => parts.push(format!("called {calls} {}", plural(calls, "call"))),
+        ("never_called", _) if function.period_state.as_deref() == Some("called") => parts.push(
+            format!("not called in this deployment, called earlier in {period} days"),
+        ),
         ("never_called", _) => parts.push(format!("never_called in {period} days")),
         ("untracked", _) => parts.push("untracked (no runtime data)".to_owned()),
         (state, _) => parts.push(state.to_owned()),
@@ -346,7 +349,28 @@ fn cloud_status_line(cloud: &InspectCloudEvidence) -> Option<String> {
         .next()
         .unwrap_or_default()
         .trim();
-    Some(format!("cloud {}: {message}", cloud.status.as_str()))
+    Some(format!(
+        "cloud {}: {}",
+        cloud.status.as_str(),
+        cut_text(message, STATUS_MESSAGE_MAX_BYTES)
+    ))
+}
+
+/// Longest status message in the compact text. A cloud error body can be
+/// long, and the status line always stays in the output.
+const STATUS_MESSAGE_MAX_BYTES: usize = 200;
+
+/// `text` cut to at most `max` bytes on a character boundary, with `...`
+/// at the end when cut.
+fn cut_text(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max.saturating_sub(3);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
 }
 
 #[cfg(test)]
@@ -375,6 +399,58 @@ mod tests {
             fit("fallow src/a.ts", &items, None),
             "fallow src/a.ts\nfinding a src/a.ts:1 x\n"
         );
+    }
+
+    fn never_called(period_state: Option<&str>) -> InspectCloudFunction {
+        InspectCloudFunction {
+            name: "a".to_owned(),
+            line: 1,
+            stable_id: None,
+            match_kind: fallow_output::InspectCloudMatch::StableId,
+            state: "never_called".to_owned(),
+            period_state: period_state.map(str::to_owned),
+            calls: Some(0),
+            errors: None,
+            cpu_ms_per_hour: None,
+            never_run_ranges: None,
+            summary: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_function_that_ran_in_an_earlier_deployment_is_not_never_called() {
+        let text = prod_text(&never_called(Some("called")), 30);
+        assert_eq!(
+            text,
+            "not called in this deployment, called earlier in 30 days"
+        );
+        assert!(!text.contains("never_called"));
+        assert_eq!(
+            prod_text(&never_called(Some("never_called")), 30),
+            "never_called in 30 days"
+        );
+        assert_eq!(prod_text(&never_called(None), 7), "never_called in 7 days");
+    }
+
+    #[test]
+    fn a_long_status_message_stays_under_the_byte_cap() {
+        let cloud = InspectCloudEvidence::status_only(
+            InspectCloudStatus::Unavailable,
+            format!(
+                "file-context failed with HTTP 418: {}",
+                "\u{e9}".repeat(3000)
+            ),
+            None,
+        );
+        let line = cloud_status_line(&cloud).unwrap();
+        assert!(
+            line.len() <= STATUS_MESSAGE_MAX_BYTES + 40,
+            "{}",
+            line.len()
+        );
+        assert!(line.ends_with("..."));
+        let text = fit("fallow src/a.ts", &[], Some(&line));
+        assert!(text.len() <= COMPACT_MAX_BYTES, "{}", text.len());
     }
 
     #[test]

@@ -98,6 +98,15 @@ pub fn resolve_api_key(
     })
 }
 
+/// The key of a command that writes to the cloud (an upload) or reads a
+/// route that a read-only key cannot open: `--api-key`, then
+/// `$FALLOW_API_KEY`. The stored key is left out, because `fallow cloud
+/// login` stores a read-only key, and the cloud refuses it for these routes.
+pub fn resolve_write_api_key(explicit: Option<&str>) -> Option<ResolvedKey> {
+    let from_env = std::env::var(API_KEY_ENV).ok();
+    select_api_key(explicit, from_env.as_deref(), || None)
+}
+
 /// [`resolve_api_key`] over injected sources. The store is read only when the
 /// flag and the environment have no key.
 fn select_api_key(
@@ -358,6 +367,24 @@ fn store_mode() -> StoreMode {
 
 const MACOS_SECURITY: &str = "/usr/bin/security";
 
+/// The `security -i` command line that stores `key` for `account`. Returns
+/// `None` when a value holds a character that the command parser of
+/// `security -i` can split or end on.
+fn macos_add_command(account: &str, key: &str) -> Option<String> {
+    let safe = |value: &str| {
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_graphic() && ch != '"' && ch != '\\' && ch != '\'')
+    };
+    if !safe(account) || !safe(key) {
+        return None;
+    }
+    Some(format!(
+        "add-generic-password -U -s \"{KEYCHAIN_SERVICE}\" -a \"{account}\" -l \"{KEYCHAIN_LABEL}\" -w \"{key}\"\n"
+    ))
+}
+
 impl Keychain {
     fn read(self, account: &str) -> Option<String> {
         let output = match self {
@@ -392,20 +419,15 @@ impl Keychain {
     fn write(self, account: &str, key: &str) -> bool {
         let (mut command, input) = match self {
             Self::MacOs => {
+                // `security add-generic-password -w` without a value reads the
+                // password from the terminal, not from stdin. So send the whole
+                // command to `security -i` on stdin instead.
+                let Some(input) = macos_add_command(account, key) else {
+                    return false;
+                };
                 let mut command = Command::new(MACOS_SECURITY);
-                command.args([
-                    "add-generic-password",
-                    "-U",
-                    "-s",
-                    KEYCHAIN_SERVICE,
-                    "-a",
-                    account,
-                    "-l",
-                    KEYCHAIN_LABEL,
-                    "-w",
-                ]);
-                // `security` asks for the password two times.
-                (command, format!("{key}\n{key}\n"))
+                command.arg("-i");
+                (command, input)
             }
             Self::SecretTool => {
                 let mut command = Command::new("secret-tool");
@@ -434,7 +456,13 @@ impl Keychain {
             .take()
             .is_some_and(|mut stdin| stdin.write_all(input.as_bytes()).is_ok());
         let succeeded = child.wait().is_ok_and(|status| status.success());
-        wrote && succeeded && self.read(account).as_deref() == Some(key)
+        if wrote && succeeded && self.read(account).as_deref() == Some(key) {
+            return true;
+        }
+        // Do not keep an entry that does not hold this key: reads use the
+        // keychain before the file.
+        self.delete(account);
+        false
     }
 
     fn delete(self, account: &str) -> bool {
@@ -545,6 +573,26 @@ mod tests {
         );
         assert!(keychain.delete(&account));
         assert_eq!(keychain.read(&account), None);
+    }
+
+    #[test]
+    fn macos_write_sends_the_key_in_the_command_line_not_as_a_prompt_answer() {
+        let input = macos_add_command("https://api.fallow.cloud", "fallow_read_k1_abc").unwrap();
+        assert_eq!(
+            input,
+            "add-generic-password -U -s \"fallow-cloud\" -a \"https://api.fallow.cloud\" \
+             -l \"Fallow Cloud API key\" -w \"fallow_read_k1_abc\"\n"
+        );
+        assert_eq!(input.lines().count(), 1, "one command, no prompt answers");
+    }
+
+    #[test]
+    fn macos_write_refuses_values_the_command_parser_can_split() {
+        assert!(macos_add_command("https://api.fallow.cloud", "a b").is_none());
+        assert!(macos_add_command("https://api.fallow.cloud", "a\"b").is_none());
+        assert!(macos_add_command("https://api.fallow.cloud", "a\nb").is_none());
+        assert!(macos_add_command("https://api.fallow.cloud", "").is_none());
+        assert!(macos_add_command("http://x/\\", "key").is_none());
     }
 
     #[test]

@@ -12427,9 +12427,17 @@ line: number
 stable_id?: (string | null)
 match: InspectCloudMatch
 /**
- * Tracking state: `called`, `never_called` or `untracked`.
+ * Tracking state in the current deployment: `called`, `never_called` or
+ * `untracked`.
  */
 state: string
+/**
+ * Tracking state over the whole period, earlier deployments included.
+ * `called` with `state` `never_called` means that the function did not
+ * run in this deployment, but ran in an earlier one. `None` when the
+ * cloud does not say.
+ */
+period_state?: (string | null)
 /**
  * Calls in the period. `None` when not measured.
  */

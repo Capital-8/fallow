@@ -595,3 +595,73 @@ fn inspect_cloud_without_a_repository_names_the_repo_flag() {
     assert!(message.contains("--repo"), "{message}");
     assert!(!message.contains("coverage analyze"), "{message}");
 }
+
+#[test]
+fn cloud_login_names_the_owner_rule_when_the_cloud_mints_no_key() {
+    let (dir, home) = project();
+    let token = r#"{"data":{"licenseJwt":"jwt","apiKeyError":{"code":"owner_required","message":"Only an organization owner can create an API key."}}}"#;
+    let (endpoint, _captured, handle) = serve(vec![
+        (200, DEVICE_START.to_owned()),
+        (200, token.to_owned()),
+    ]);
+    let env = Env {
+        api_url: Some(&endpoint),
+        api_key: None,
+        home: home.path(),
+    };
+    let login = run(
+        &["cloud", "login", "--machine-name", "ci-box"],
+        dir.path(),
+        &env,
+    );
+    handle.join().expect("server joins");
+    assert_eq!(
+        login.code, 2,
+        "stdout={} stderr={}",
+        login.stdout, login.stderr
+    );
+    let text = format!("{}{}", login.stdout, login.stderr);
+    assert!(
+        text.contains("Only an organization owner can create an API key"),
+        "{text}"
+    );
+    assert!(!text.contains("may not support"), "{text}");
+    assert!(
+        !home.path().join(".config/fallow/credentials").exists(),
+        "no key is stored"
+    );
+}
+
+#[test]
+fn an_upload_does_not_use_the_read_only_key_of_cloud_login() {
+    let (dir, home) = project();
+    let config = home.path().join(".config/fallow");
+    std::fs::create_dir_all(&config).unwrap();
+    let endpoint = "http://127.0.0.1:9";
+    std::fs::write(
+        config.join("credentials"),
+        format!(r#"{{"version":1,"keys":{{"{endpoint}":"fallow_read_k1_stored"}}}}"#),
+    )
+    .unwrap();
+    let output = run(
+        &[
+            "coverage",
+            "upload-inventory",
+            "--project-id",
+            "acme/app",
+            "--git-sha",
+            "abc1234",
+            "--allow-dirty",
+        ],
+        dir.path(),
+        &Env {
+            api_url: Some(endpoint),
+            api_key: None,
+            home: home.path(),
+        },
+    );
+    assert_ne!(output.code, 0, "stdout={}", output.stdout);
+    let text = format!("{}{}", output.stdout, output.stderr);
+    assert!(text.contains("no API key"), "{text}");
+    assert!(text.contains("cannot upload"), "{text}");
+}

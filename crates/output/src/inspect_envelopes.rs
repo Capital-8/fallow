@@ -321,8 +321,14 @@ pub struct InspectCloudFunction {
     /// How the local function was paired.
     #[serde(rename = "match")]
     pub match_kind: InspectCloudMatch,
-    /// Tracking state: `called`, `never_called` or `untracked`.
+    /// Tracking state in the current deployment: `called`, `never_called` or
+    /// `untracked`.
     pub state: String,
+    /// Tracking state over the whole period, earlier deployments included.
+    /// `called` with `state` `never_called` means that the function did not
+    /// run in this deployment, but ran in an earlier one. `None` when the
+    /// cloud does not say.
+    pub period_state: Option<String>,
     /// Calls in the period. `None` when not measured.
     pub calls: Option<u64>,
     /// Error counts. `None` when error capture did not cover the function.

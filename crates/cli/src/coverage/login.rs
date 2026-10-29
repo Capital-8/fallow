@@ -74,6 +74,18 @@ struct DeviceStart {
 struct DeviceToken {
     #[serde(default)]
     api_key: Option<IssuedKey>,
+    /// Why the cloud did not create a key, for example `owner_required`
+    /// when the user who approved the code is not an organization owner.
+    #[serde(default)]
+    api_key_error: Option<ApiKeyError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiKeyError {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -87,7 +99,7 @@ struct IssuedKey {
 
 /// One answer of the token poll.
 enum PollOutcome {
-    Issued(Option<IssuedKey>),
+    Issued(DeviceToken),
     Pending,
     SlowDown,
     Failed(String),
@@ -113,16 +125,12 @@ fn run_login(args: &LoginArgs, output: OutputFormat, json_style: JsonStyle) -> E
     );
     eprintln!("This creates a read-only API key for \"{machine_name}\". Waiting for approval...");
 
-    let issued = match poll_for_key(&agent, &base_url, &start) {
-        Ok(issued) => issued,
+    let token = match poll_for_key(&agent, &base_url, &start) {
+        Ok(token) => token,
         Err(message) => return emit_error(&message, 2, output),
     };
-    let Some(issued) = issued else {
-        return emit_error(
-            "Fallow Cloud approved the login but returned no API key. The cloud may not support `fallow cloud login` yet. Create a read-only key at https://fallow.cloud/settings#api-keys and set FALLOW_API_KEY.",
-            2,
-            output,
-        );
+    let Some(issued) = token.api_key else {
+        return emit_error(&no_key_message(token.api_key_error.as_ref()), 2, output);
     };
     let source = match credentials::store_api_key(&base_url, &issued.key) {
         Ok(source) => source,
@@ -221,16 +229,38 @@ fn start_device_flow(
         .map_err(|err| format!("malformed login answer from Fallow Cloud: {err}"))
 }
 
+/// The message of a sign-in that the cloud approved without a key.
+fn no_key_message(error: Option<&ApiKeyError>) -> String {
+    let Some(error) = error else {
+        return "Fallow Cloud approved the login but returned no API key. The cloud may not support `fallow cloud login` yet. Create a read-only key at https://fallow.cloud/settings#api-keys and set FALLOW_API_KEY.".to_owned();
+    };
+    let reason = error
+        .message
+        .as_deref()
+        .map(|message| message.trim().trim_end_matches('.'))
+        .filter(|message| !message.is_empty())
+        .unwrap_or("the cloud gave no reason");
+    let hint = match error.code.as_deref() {
+        Some("owner_required") => {
+            " Only an organization owner can approve a key. Ask an owner to approve the code, or to create a read-only key at https://fallow.cloud/settings#api-keys for FALLOW_API_KEY."
+        }
+        _ => "",
+    };
+    format!(
+        "You signed in, but Fallow Cloud did not create an API key: {reason}.{hint} No key was stored."
+    )
+}
+
 fn poll_for_key(
     agent: &ureq::Agent,
     base_url: &str,
     start: &DeviceStart,
-) -> Result<Option<IssuedKey>, String> {
+) -> Result<DeviceToken, String> {
     let deadline = Instant::now() + Duration::from_secs(start.expires_in);
     let mut interval = Duration::from_secs(start.interval);
     loop {
         match poll_once(agent, base_url, &start.device_code) {
-            PollOutcome::Issued(key) => return Ok(key),
+            PollOutcome::Issued(token) => return Ok(token),
             PollOutcome::Pending => {}
             PollOutcome::SlowDown => interval += Duration::from_secs(SLOW_DOWN_STEP_SECS),
             PollOutcome::Failed(message) => return Err(message),
@@ -265,7 +295,7 @@ fn poll_once(agent: &ureq::Agent, base_url: &str, device_code: &str) -> PollOutc
     };
     if (200..300).contains(&status) {
         return match serde_json::from_str::<DataEnvelope<DeviceToken>>(&body) {
-            Ok(envelope) => PollOutcome::Issued(envelope.data.api_key),
+            Ok(envelope) => PollOutcome::Issued(envelope.data),
             Err(err) => {
                 PollOutcome::Failed(format!("malformed login answer from Fallow Cloud: {err}"))
             }
@@ -350,6 +380,32 @@ mod tests {
         );
         assert!(machine_name(Some("\n\t")).is_err());
         assert_eq!(machine_name(Some("ci-box")).unwrap(), "ci-box");
+    }
+
+    #[test]
+    fn a_key_refusal_names_the_cloud_reason_and_the_owner_rule() {
+        let token: DeviceToken = serde_json::from_str(
+            r#"{"licenseJwt":"jwt","apiKeyError":{"code":"owner_required","message":"Only an owner can create an API key"}}"#,
+        )
+        .unwrap();
+        assert!(token.api_key.is_none());
+        let message = no_key_message(token.api_key_error.as_ref());
+        assert!(
+            message.contains("Only an owner can create an API key"),
+            "{message}"
+        );
+        assert!(message.contains("organization owner"), "{message}");
+        assert!(!message.contains("may not support"), "{message}");
+
+        let other = no_key_message(Some(&ApiKeyError {
+            code: Some("acknowledgement_required".to_owned()),
+            message: Some("Confirm the key in the dashboard.".to_owned()),
+        }));
+        assert!(
+            other.contains("Confirm the key in the dashboard"),
+            "{other}"
+        );
+        assert!(!other.contains(".."), "{other}");
     }
 
     #[test]

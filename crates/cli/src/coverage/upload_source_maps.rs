@@ -114,7 +114,7 @@ fn run_inner(args: &UploadSourceMapsArgs, root: &Path) -> Result<(), UploadSourc
         return Ok(());
     }
 
-    let api_key = resolve_api_key(args.endpoint.as_deref())?;
+    let api_key = resolve_api_key()?;
     upload_maps(args, root, &repo, &git_sha, &api_key, &maps)
 }
 
@@ -506,10 +506,15 @@ fn validate_file_name(file_name: &str) -> Result<(), UploadSourceMapsError> {
     Ok(())
 }
 
-fn resolve_api_key(endpoint: Option<&str>) -> Result<String, UploadSourceMapsError> {
-    crate::coverage::credentials::resolve_api_key(None, endpoint)
+fn resolve_api_key() -> Result<String, UploadSourceMapsError> {
+    crate::coverage::credentials::resolve_write_api_key(None)
         .map(|resolved| resolved.key)
-        .ok_or_else(|| UploadSourceMapsError::Validation("FALLOW_API_KEY is required".to_owned()))
+        .ok_or_else(|| {
+            UploadSourceMapsError::Validation(
+                "FALLOW_API_KEY is required (a live key; the read-only key of `fallow cloud login` cannot upload)"
+                    .to_owned(),
+            )
+        })
 }
 
 #[derive(Debug, Clone)]

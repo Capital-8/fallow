@@ -237,18 +237,17 @@ pub(super) fn take_last_two_segments(path: &str) -> Option<String> {
     (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
 }
 
-pub(super) fn resolve_api_key(
-    explicit: Option<&str>,
-    api_endpoint: Option<&str>,
-) -> Result<String, String> {
-    crate::coverage::credentials::resolve_api_key(explicit, api_endpoint)
+pub(super) fn resolve_api_key(explicit: Option<&str>) -> Result<String, String> {
+    crate::coverage::credentials::resolve_write_api_key(explicit)
         .map(|resolved| resolved.key)
-        .ok_or_else(|| {
-            "no API key. Set $FALLOW_API_KEY or pass --api-key <KEY>. Generate at \
-             https://fallow.cloud/settings#api-keys."
-                .to_owned()
-        })
+        .ok_or_else(|| MISSING_WRITE_KEY.to_owned())
 }
+
+/// The refusal of an upload without a live key. The key that `fallow cloud
+/// login` stores is read-only, so it does not count here.
+const MISSING_WRITE_KEY: &str = "no API key. Set $FALLOW_API_KEY or pass --api-key <KEY> with a live key. \
+     Generate at https://fallow.cloud/settings#api-keys. The read-only key of \
+     `fallow cloud login` cannot upload.";
 
 pub(super) fn endpoint_url(
     override_endpoint: Option<&str>,
@@ -702,7 +701,7 @@ mod tests {
     #[test]
     fn resolve_api_key_trims_explicit_value() {
         assert_eq!(
-            resolve_api_key(Some("  fallow_key_123  "), None).unwrap(),
+            resolve_api_key(Some("  fallow_key_123  ")).unwrap(),
             "fallow_key_123"
         );
     }

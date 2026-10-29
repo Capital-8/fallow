@@ -32,6 +32,10 @@ use crate::coverage::file_context::{
 
 /// Note on a local function without production data.
 pub const UNPAIRED_NOTE: &str = "no production data (new or moved since deploy)";
+/// Note on a local function without a pair when the cloud withheld the
+/// never_called rows. The function can be deployed and tracked.
+pub const WITHHELD_NOTE: &str =
+    "no pair in this read (Fallow Cloud withheld never_called rows; not actionable yet)";
 /// Message of the `no_key` status.
 const NO_KEY_MESSAGE: &str =
     "no Fallow Cloud API key. Run `fallow cloud login`, or set FALLOW_API_KEY.";
@@ -130,21 +134,35 @@ pub fn build_section(
         functions: Vec::new(),
         unpaired_local: Vec::new(),
     };
+    let withheld = context
+        .never_called_withheld
+        .then(|| withheld_message(context.actionability_reason.as_deref()));
     if context.state == "untracked" {
         section.status = InspectCloudStatus::Untracked;
-        section.message = Some(if context.summary.text.is_empty() {
-            "Fallow Cloud has no production data for this file".to_owned()
-        } else {
-            context.summary.text.clone()
+        section.message = Some(match withheld {
+            Some(message) => message,
+            None if context.summary.text.is_empty() => {
+                "Fallow Cloud has no production data for this file".to_owned()
+            }
+            None => context.summary.text.clone(),
         });
         return section;
     }
-    if let Some(truncation) = context.truncation.as_ref() {
-        section.message = Some(format!(
+    let truncated = context.truncation.as_ref().map(|truncation| {
+        format!(
             "Fallow Cloud left out {} functions to fit its size limit; a local function without a pair can still have production data",
             truncation.omitted_functions
-        ));
+        )
+    });
+    let messages: Vec<String> = withheld.iter().chain(truncated.iter()).cloned().collect();
+    if !messages.is_empty() {
+        section.message = Some(messages.join("; "));
     }
+    let unpaired_note = if context.never_called_withheld {
+        WITHHELD_NOTE
+    } else {
+        UNPAIRED_NOTE
+    };
     let pairs = pair_functions(local, &context.functions);
     for (local_fn, pair) in local.iter().zip(pairs) {
         match pair {
@@ -156,11 +174,22 @@ pub fn build_section(
             None => section.unpaired_local.push(InspectCloudUnpairedFunction {
                 name: local_fn.name.clone(),
                 line: local_fn.line,
-                note: UNPAIRED_NOTE.to_owned(),
+                note: unpaired_note.to_owned(),
             }),
         }
     }
     section
+}
+
+/// The section message when the cloud withheld the never_called rows.
+fn withheld_message(reason: Option<&str>) -> String {
+    let reason = reason
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or("the read is not actionable yet");
+    format!(
+        "Fallow Cloud withheld the never_called rows ({reason}); a local function without a pair can still be deployed and tracked"
+    )
 }
 
 fn paired_function(
@@ -194,6 +223,7 @@ fn paired_function(
         stable_id: cloud.stable_id.clone(),
         match_kind,
         state: cloud.state.clone(),
+        period_state: cloud.period_state.clone(),
         calls: if cloud.state == "untracked" {
             None
         } else {
@@ -295,6 +325,7 @@ mod tests {
             line,
             stable_id: line.map(|line| function_identity_id("src/a.ts", name, line)),
             state: "called".to_owned(),
+            period_state: Some("called".to_owned()),
             calls: Some(1),
             errors: None,
             cpu: None,
@@ -343,6 +374,38 @@ mod tests {
         assert_eq!(section.status, InspectCloudStatus::Ok);
         assert!(section.message.unwrap().contains("left out 2 functions"));
         assert_eq!(section.unpaired_local.len(), 1);
+    }
+
+    #[test]
+    fn withheld_never_called_rows_change_the_note_and_the_message() {
+        let body = r#"{"repo":"a/b","state":"observed","latest_sha":"s","period_days":30,"actionable":false,"actionability_reason":"deployment warm-up","never_called_withheld":true,"summary":{"functions":1,"called":1,"never_called":0,"untracked":0,"calls":2,"error_groups":null,"error_events":null,"text":"t"},"functions":[]}"#;
+        let context: FileContext = serde_json::from_str(body).unwrap();
+        let section = build_section("a/b", &context, &[local("a", 1)]);
+        assert_eq!(section.status, InspectCloudStatus::Ok);
+        let message = section.message.unwrap();
+        assert!(message.contains("withheld"), "{message}");
+        assert!(message.contains("deployment warm-up"), "{message}");
+        assert_eq!(section.unpaired_local[0].note, WITHHELD_NOTE);
+        assert_ne!(section.unpaired_local[0].note, UNPAIRED_NOTE);
+    }
+
+    #[test]
+    fn the_period_state_reaches_the_section() {
+        let mut deployed = cloud("a", Some(1));
+        deployed.state = "never_called".to_owned();
+        let context = FileContext {
+            repo: "a/b".to_owned(),
+            state: "observed".to_owned(),
+            latest_sha: None,
+            period_days: Some(30),
+            summary: serde_json::from_str(r#"{"text":"t"}"#).unwrap(),
+            functions: vec![deployed],
+            truncation: None,
+            never_called_withheld: false,
+            actionability_reason: None,
+        };
+        let section = build_section("a/b", &context, &[local("a", 1)]);
+        assert_eq!(section.functions[0].period_state.as_deref(), Some("called"));
     }
 
     #[test]

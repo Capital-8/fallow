@@ -14,9 +14,10 @@ use super::cloud_client::url_encode_query_value;
 use super::cloud_transport::{self, CloudAuth, CloudBody, CloudOutcome, detected_agent_source};
 use super::upload_common::url_encode_path_segment;
 
-/// Total time limit of one attempt. Inspect runs inside editor hooks, so it
-/// waits less than the explicit cloud commands do.
-const FILE_CONTEXT_TIMEOUT_SECS: u64 = 8;
+/// Total time limit of the read, one attempt only. Inspect runs inside
+/// editor hooks with a budget of about 2 s, and the static analysis runs in
+/// parallel with the read. A slower read gives the `unavailable` status.
+const FILE_CONTEXT_TIMEOUT_SECS: u64 = 2;
 const OPERATION: &str = "file-context";
 /// Byte cap that the CLI asks for: the cloud upper limit. The cloud drops
 /// functions to fit its default cap of 12 000 bytes, and a dropped function
@@ -42,6 +43,13 @@ pub struct FileContext {
     /// Present when the cloud left out functions to fit its byte cap.
     #[serde(default)]
     pub truncation: Option<FileContextTruncation>,
+    /// True when the cloud left out the never_called rows, because the read
+    /// is not actionable (for example during the warm-up of a deployment).
+    #[serde(default)]
+    pub never_called_withheld: bool,
+    /// Why the read is not actionable, when the cloud says so.
+    #[serde(default)]
+    pub actionability_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,6 +87,11 @@ pub struct FileContextFunction {
     pub stable_id: Option<String>,
     #[serde(default)]
     pub state: String,
+    /// `called` when the function ran in this deployment or in an earlier
+    /// deployment inside the period. A `never_called` function with
+    /// `period_state` `called` did not run in this deployment only.
+    #[serde(default)]
+    pub period_state: Option<String>,
     #[serde(default)]
     pub calls: Option<u64>,
     #[serde(default)]
@@ -172,7 +185,7 @@ pub fn fetch_file_context(
         url_encode_path_segment(repo),
         url_encode_query_value(path)
     ));
-    let outcome = cloud_transport::send_with_total_timeout(
+    let outcome = cloud_transport::send_once_with_total_timeout(
         &auth,
         &url,
         &CloudBody::None,
