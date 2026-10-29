@@ -13,11 +13,12 @@ use colored::Colorize as _;
 use fallow_api::mutation::split_control_run_failure;
 use fallow_output::{
     MutantResult, MutantStatus, MutationCompletionStatus, MutationInspectOutput,
-    MutationInspectStatus, MutationPlanDisposition, MutationPlanOutput, MutationReport,
-    MutationResumeOutput, MutationScopeKind, MutationScopeOutput, MutationSkippedFile,
-    MutationStaleReason, MutationTypecheckOutput, TestReachClass,
+    MutationInspectStatus, MutationKillMatrix, MutationKillMatrixStatus, MutationPlanDisposition,
+    MutationPlanOutput, MutationReport, MutationResumeOutput, MutationScopeKind,
+    MutationScopeOutput, MutationSkippedFile, MutationStaleReason, MutationTestKillRow,
+    MutationTypecheckOutput, TestReachClass,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::report::{HumanStatus, Level, build_section_header, format_path, human_status_line};
 
@@ -721,6 +722,118 @@ fn typecheck_line(typecheck: &MutationTypecheckOutput) -> String {
     line
 }
 
+fn kill_matrix_reason(reason: &str) -> &str {
+    match reason {
+        "kill-matrix-disabled" => "this run did not collect all killing tests. Use --kill-matrix.",
+        "incomplete-mutant-results" => "some requested test outcomes are missing or inconclusive.",
+        "baseline-failure" => "baseline failures excluded tests and left incomplete evidence.",
+        "partial-mutation-run" => "the mutation run did not finish.",
+        _ => "complete matrix evidence is unavailable.",
+    }
+}
+
+fn kill_matrix_note(note: &str) -> &str {
+    match note {
+        "observed-instrumented-file-only-test" => {
+            "Only this test was observed covering at least one instrumented file."
+        }
+        "static-test-file-only-export-reach" => {
+            "Only this test file reaches a public export in the static import graph. Per-test export coverage is unknown."
+        }
+        "incomplete-observed-evidence" => "Kill sets use incomplete observed evidence.",
+        "static-export-reach-unavailable" => "Static export reach is unavailable.",
+        _ => note,
+    }
+}
+
+fn kill_id_list(ids: &[String]) -> String {
+    if ids.is_empty() {
+        "none".to_owned()
+    } else {
+        ids.join(", ")
+    }
+}
+
+fn render_test_kill_rows(out: &mut String, title: &str, rows: &[&MutationTestKillRow]) {
+    if rows.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "\n{}",
+        build_section_header(title, rows.len(), Level::Info)
+    );
+    for row in rows {
+        let _ = writeln!(out, "  {}", row.test_id);
+        let _ = writeln!(out, "    File: {}", format_path(&row.file));
+        let _ = writeln!(out, "    Kills: {}", kill_id_list(&row.kills));
+        let _ = writeln!(out, "    Unique kills: {}", kill_id_list(&row.unique_kills));
+        let _ = writeln!(
+            out,
+            "    Individual subsumers: {}",
+            kill_id_list(&row.subsuming_tests)
+        );
+        for note in &row.notes {
+            let _ = writeln!(out, "    Note: {}", kill_matrix_note(note));
+        }
+    }
+}
+
+fn render_kill_matrix(out: &mut String, matrix: &MutationKillMatrix) {
+    let status = match matrix.status {
+        MutationKillMatrixStatus::Complete => "complete",
+        MutationKillMatrixStatus::Incomplete => "incomplete",
+        MutationKillMatrixStatus::Unavailable => "unavailable",
+    };
+    let _ = writeln!(out, "\nTest kill evidence: {status}");
+    for reason in &matrix.reasons {
+        let _ = writeln!(out, "  {reason}: {}", kill_matrix_reason(reason));
+    }
+    if matrix.status == MutationKillMatrixStatus::Unavailable {
+        return;
+    }
+    if matrix.status == MutationKillMatrixStatus::Incomplete {
+        out.push_str("  Candidates are unavailable because the kill matrix is incomplete.\n");
+    } else if matrix.candidates.is_empty() {
+        out.push_str("  No redundant-test candidates were observed.\n");
+    } else {
+        out.push_str("  Review each candidate individually. Removing candidates together can remove all tests for a mutant.\n");
+    }
+    let candidates: FxHashSet<&str> = matrix.candidates.iter().map(String::as_str).collect();
+    let without_kills: FxHashSet<&str> = matrix
+        .coverage_without_kills
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let candidate_rows: Vec<_> = matrix
+        .tests
+        .iter()
+        .filter(|row| candidates.contains(row.test_id.as_str()))
+        .collect();
+    let zero_kill_rows: Vec<_> = matrix
+        .tests
+        .iter()
+        .filter(|row| without_kills.contains(row.test_id.as_str()))
+        .collect();
+    let other_rows: Vec<_> = matrix
+        .tests
+        .iter()
+        .filter(|row| {
+            !candidates.contains(row.test_id.as_str())
+                && !without_kills.contains(row.test_id.as_str())
+        })
+        .collect();
+    if matrix.status == MutationKillMatrixStatus::Complete {
+        render_test_kill_rows(out, "Redundant-test candidates for review", &candidate_rows);
+    }
+    render_test_kill_rows(
+        out,
+        "Observed coverage without observed kills",
+        &zero_kill_rows,
+    );
+    render_test_kill_rows(out, "Observed test kills", &other_rows);
+}
+
 /// Renders the human report of a run.
 pub fn render_run(report: &MutationReport, options: &RunReportOptions<'_>) -> String {
     let tested = report.summary.counts.executed();
@@ -736,6 +849,7 @@ pub fn render_run(report: &MutationReport, options: &RunReportOptions<'_>) -> St
     if !report.no_test_files {
         render_no_coverage(&mut out, report);
     }
+    render_kill_matrix(&mut out, &report.kill_matrix);
     render_footer_lines(&mut out, report);
     if let Some(flags) = options.inspect_flags
         && let Some(first) = report
@@ -938,7 +1052,20 @@ pub fn render_inspect(packet: &MutationInspectOutput) -> String {
             let _ = writeln!(out, "{}", more_line(hidden, "file", "files"));
         }
     }
-    if let Some(killed_by) = &packet.killed_by {
+    if packet.kill_matrix_complete || !packet.killing_tests.is_empty() {
+        let title = if packet.kill_matrix_complete {
+            "Killing tests (complete matrix)"
+        } else {
+            "Observed killing tests (incomplete matrix)"
+        };
+        let _ = writeln!(out, "\n{title}");
+        if packet.killing_tests.is_empty() {
+            out.push_str("  No test killed this mutant.\n");
+        }
+        for test in &packet.killing_tests {
+            let _ = writeln!(out, "  {test}");
+        }
+    } else if let Some(killed_by) = &packet.killed_by {
         let _ = writeln!(out, "\nKilled by: {killed_by}");
     }
     out
