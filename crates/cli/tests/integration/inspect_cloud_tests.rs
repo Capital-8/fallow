@@ -633,6 +633,41 @@ fn cloud_login_names_the_owner_rule_when_the_cloud_mints_no_key() {
 }
 
 #[test]
+fn cloud_login_names_the_revoke_step_when_an_earlier_poll_took_the_key() {
+    let (dir, home) = project();
+    let claimed =
+        r#"{"error":true,"code":"already_claimed","message":"This code was already used."}"#;
+    let (endpoint, _captured, handle) = serve(vec![
+        (200, DEVICE_START.to_owned()),
+        (400, claimed.to_owned()),
+    ]);
+    let env = Env {
+        api_url: Some(&endpoint),
+        api_key: None,
+        home: home.path(),
+    };
+    let login = run(
+        &["cloud", "login", "--machine-name", "ci-box"],
+        dir.path(),
+        &env,
+    );
+    handle.join().expect("server joins");
+    assert_eq!(
+        login.code, 2,
+        "stdout={} stderr={}",
+        login.stdout, login.stderr
+    );
+    let text = format!("{}{}", login.stdout, login.stderr);
+    assert!(text.contains("did not reach this machine"), "{text}");
+    assert!(text.contains("fallow cloud login (ci-box)"), "{text}");
+    assert!(text.contains("settings#api-keys"), "{text}");
+    assert!(
+        !home.path().join(".config/fallow/credentials").exists(),
+        "no key is stored"
+    );
+}
+
+#[test]
 fn an_upload_does_not_use_the_read_only_key_of_cloud_login() {
     let (dir, home) = project();
     let config = home.path().join(".config/fallow");

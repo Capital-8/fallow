@@ -2459,7 +2459,7 @@ pub enum CoverageCli {
         #[arg(long, visible_alias = "runtime-coverage-cloud")]
         cloud: bool,
 
-        /// Fallow Cloud API key. Precedence: this flag > $FALLOW_API_KEY.
+        /// Fallow Cloud API key. Order: flag > $FALLOW_API_KEY > `fallow cloud login` key.
         #[arg(long, value_name = "KEY")]
         api_key: Option<String>,
 
@@ -2747,7 +2747,7 @@ pub enum CoverageCli {
     /// `--changed-since`), then $FALLOW_AUDIT_BASE, then the merge-base with
     /// the upstream or the remote default branch.
     ReviewPacket {
-        /// Fallow Cloud API key. Precedence: this flag > $FALLOW_API_KEY.
+        /// Fallow Cloud API key. Order: flag > $FALLOW_API_KEY > `fallow cloud login` key.
         #[arg(long, value_name = "KEY")]
         api_key: Option<String>,
 
@@ -2790,7 +2790,7 @@ pub enum CoverageCli {
     /// base deployment commit with `--base <sha>`; without it, the cloud
     /// picks the previous deployment with production runtime.
     DeploymentChanges {
-        /// Fallow Cloud API key. Precedence: this flag > $FALLOW_API_KEY.
+        /// Fallow Cloud API key. Order: flag > $FALLOW_API_KEY > `fallow cloud login` key.
         #[arg(long, value_name = "KEY")]
         api_key: Option<String>,
 

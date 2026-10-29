@@ -246,6 +246,9 @@ pub fn pair_functions(
     let mut result: Vec<Option<(usize, InspectCloudMatch)>> = vec![None; local.len()];
     let mut cloud_taken = vec![false; cloud.len()];
 
+    let local_keys = ordinal_keys(local.iter().map(|f| (f.name.as_str(), Some(f.line))));
+    let cloud_keys = ordinal_keys(cloud.iter().map(|f| (f.name.as_str(), f.line)));
+
     let mut by_stable_id: FxHashMap<&str, usize> = FxHashMap::default();
     for (index, function) in cloud.iter().enumerate() {
         if let Some(stable_id) = function.stable_id.as_deref() {
@@ -255,14 +258,13 @@ pub fn pair_functions(
     for (local_index, function) in local.iter().enumerate() {
         if let Some(&cloud_index) = by_stable_id.get(function.stable_id.as_str())
             && !cloud_taken[cloud_index]
+            && !is_line_collision(local_keys[local_index], cloud_keys[cloud_index])
         {
             cloud_taken[cloud_index] = true;
             result[local_index] = Some((cloud_index, InspectCloudMatch::StableId));
         }
     }
 
-    let local_keys = ordinal_keys(local.iter().map(|f| (f.name.as_str(), Some(f.line))));
-    let cloud_keys = ordinal_keys(cloud.iter().map(|f| (f.name.as_str(), f.line)));
     let mut cloud_by_key: FxHashMap<(&str, usize, usize), usize> = FxHashMap::default();
     for (index, key) in cloud_keys.iter().enumerate() {
         if let Some(key) = key
@@ -282,6 +284,26 @@ pub fn pair_functions(
         }
     }
     result
+}
+
+/// True when a stable id match on one line pairs two different functions: a
+/// moved function landed on the old line of another same-name function. Both
+/// sides have the same count of same-name functions and the ordinals differ.
+/// Fallow Cloud drops this match too (`isLineCollision`), so the name ordinal
+/// step pairs these functions.
+fn is_line_collision(
+    local: Option<(&str, usize, usize)>,
+    cloud: Option<(&str, usize, usize)>,
+) -> bool {
+    match (local, cloud) {
+        (
+            Some((local_name, local_ordinal, local_count)),
+            Some((cloud_name, cloud_ordinal, cloud_count)),
+        ) => {
+            local_name == cloud_name && local_count == cloud_count && local_ordinal != cloud_ordinal
+        }
+        _ => false,
+    }
 }
 
 /// `(name, ordinal among the same-name functions by line, count of those
@@ -342,6 +364,19 @@ mod tests {
         );
         assert_eq!(pairs[0], Some((1, InspectCloudMatch::StableId)));
         assert_eq!(pairs[1], Some((0, InspectCloudMatch::NameOrdinal)));
+    }
+
+    #[test]
+    fn a_stable_id_on_the_old_line_of_another_function_is_not_a_pair() {
+        // Deployed: cb@2 (A), cb@10 (B). Local: A moved to line 10, B to line 18.
+        // The stable id of local cb@10 equals the one of deployed B, but the
+        // ordinals differ, so the name ordinal step pairs A with A and B with B.
+        let pairs = pair_functions(
+            &[local("cb", 10), local("cb", 18)],
+            &[cloud("cb", Some(2)), cloud("cb", Some(10))],
+        );
+        assert_eq!(pairs[0], Some((0, InspectCloudMatch::NameOrdinal)));
+        assert_eq!(pairs[1], Some((1, InspectCloudMatch::NameOrdinal)));
     }
 
     #[test]

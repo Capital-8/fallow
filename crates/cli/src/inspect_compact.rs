@@ -59,7 +59,11 @@ pub fn render(bundle: &InspectOutput) -> String {
         lines.extend(prod_lines(cloud));
         cloud_status_line(cloud)
     });
-    fit(&format!("fallow {file}"), &lines, status_line.as_deref())
+    fit(
+        &format!("fallow {}", cut_text(file, HEADER_PATH_MAX_BYTES)),
+        &lines,
+        status_line.as_deref(),
+    )
 }
 
 /// Join the lines under [`COMPACT_MAX_BYTES`]. The header and the cloud status
@@ -356,6 +360,11 @@ fn cloud_status_line(cloud: &InspectCloudEvidence) -> Option<String> {
     ))
 }
 
+/// Longest file path in the header line. Together with the status message cap
+/// and the truncated line, the output stays under [`COMPACT_MAX_BYTES`] for
+/// any path.
+const HEADER_PATH_MAX_BYTES: usize = 500;
+
 /// Longest status message in the compact text. A cloud error body can be
 /// long, and the status line always stays in the output.
 const STATUS_MESSAGE_MAX_BYTES: usize = 200;
@@ -390,6 +399,21 @@ mod tests {
         assert!(last.starts_with("truncated "), "{last}");
         let shown = text.lines().filter(|l| l.starts_with("finding ")).count();
         assert_eq!(last, format!("truncated {} more", 100 - shown));
+    }
+
+    #[test]
+    fn a_long_path_and_a_long_status_stay_under_the_cap() {
+        let path = "d/".repeat(600);
+        let status = format!(
+            "cloud no_key: {}",
+            cut_text(&"x".repeat(5000), STATUS_MESSAGE_MAX_BYTES)
+        );
+        let text = fit(
+            &format!("fallow {}", cut_text(&path, HEADER_PATH_MAX_BYTES)),
+            &["finding x".to_owned()],
+            Some(&status),
+        );
+        assert!(text.len() <= COMPACT_MAX_BYTES, "{}", text.len());
     }
 
     #[test]

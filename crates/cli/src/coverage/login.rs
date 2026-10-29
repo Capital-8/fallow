@@ -28,7 +28,9 @@ const REQUEST_TIMEOUT_SECS: u64 = 20;
 /// Extra wait after the cloud answers `slow_down`.
 const SLOW_DOWN_STEP_SECS: u64 = 5;
 /// Longest machine name the cloud accepts.
-const MAX_MACHINE_NAME_CHARS: usize = 64;
+/// The cloud limit of a machine name, counted in UTF-16 code units as the
+/// cloud counts it.
+const MAX_MACHINE_NAME_UNITS: usize = 64;
 /// Machine name when the host name is not known.
 const FALLBACK_MACHINE_NAME: &str = "fallow-cli";
 
@@ -102,7 +104,28 @@ enum PollOutcome {
     Issued(DeviceToken),
     Pending,
     SlowDown,
+    /// The request or its answer was lost. The next poll tries again.
+    Transient(String),
+    /// An earlier poll finished the login, but its answer did not arrive.
+    AlreadyClaimed,
     Failed(String),
+}
+
+/// Lost polls in a row after which the login stops.
+const MAX_TRANSIENT_POLLS: u32 = 3;
+
+fn lowercase_first(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_lowercase().chain(chars).collect()
+    })
+}
+
+/// Revoke steps for a key that the cloud created but this machine did not store.
+fn orphan_key_hint(machine_name: &str) -> String {
+    format!(
+        "Revoke the key \"fallow cloud login ({machine_name})\" at https://fallow.cloud/settings#api-keys, then run `fallow cloud login` again."
+    )
 }
 
 fn run_login(args: &LoginArgs, output: OutputFormat, json_style: JsonStyle) -> ExitCode {
@@ -125,7 +148,7 @@ fn run_login(args: &LoginArgs, output: OutputFormat, json_style: JsonStyle) -> E
     );
     eprintln!("This creates a read-only API key for \"{machine_name}\". Waiting for approval...");
 
-    let token = match poll_for_key(&agent, &base_url, &start) {
+    let token = match poll_for_key(&agent, &base_url, &start, &machine_name) {
         Ok(token) => token,
         Err(message) => return emit_error(&message, 2, output),
     };
@@ -136,7 +159,10 @@ fn run_login(args: &LoginArgs, output: OutputFormat, json_style: JsonStyle) -> E
         Ok(source) => source,
         Err(message) => {
             return emit_error(
-                &format!("failed to store the API key: {message}"),
+                &format!(
+                    "failed to store the API key: {message}. {}",
+                    orphan_key_hint(&machine_name)
+                ),
                 2,
                 output,
             );
@@ -255,14 +281,31 @@ fn poll_for_key(
     agent: &ureq::Agent,
     base_url: &str,
     start: &DeviceStart,
+    machine_name: &str,
 ) -> Result<DeviceToken, String> {
     let deadline = Instant::now() + Duration::from_secs(start.expires_in);
     let mut interval = Duration::from_secs(start.interval);
+    let mut lost = 0;
     loop {
         match poll_once(agent, base_url, &start.device_code) {
             PollOutcome::Issued(token) => return Ok(token),
-            PollOutcome::Pending => {}
+            PollOutcome::Pending => lost = 0,
             PollOutcome::SlowDown => interval += Duration::from_secs(SLOW_DOWN_STEP_SECS),
+            PollOutcome::Transient(message) => {
+                lost += 1;
+                if lost >= MAX_TRANSIENT_POLLS {
+                    return Err(format!(
+                        "{message}. If you approved the code, {}",
+                        lowercase_first(&orphan_key_hint(machine_name))
+                    ));
+                }
+            }
+            PollOutcome::AlreadyClaimed => {
+                return Err(format!(
+                    "the login was approved, but the API key did not reach this machine. {}",
+                    orphan_key_hint(machine_name)
+                ));
+            }
             PollOutcome::Failed(message) => return Err(message),
         }
         if Instant::now() + interval >= deadline {
@@ -283,7 +326,7 @@ fn poll_once(agent: &ureq::Agent, base_url: &str, device_code: &str) -> PollOutc
     {
         Ok(response) => response,
         Err(err) => {
-            return PollOutcome::Failed(sanitize_network_error(&format!(
+            return PollOutcome::Transient(sanitize_network_error(&format!(
                 "failed to check the login: {err}"
             )));
         }
@@ -291,7 +334,9 @@ fn poll_once(agent: &ureq::Agent, base_url: &str, device_code: &str) -> PollOutc
     let status = response.status().as_u16();
     let body = match response.body_mut().read_to_string() {
         Ok(body) => body,
-        Err(err) => return PollOutcome::Failed(format!("failed to read the login answer: {err}")),
+        Err(err) => {
+            return PollOutcome::Transient(format!("failed to read the login answer: {err}"));
+        }
     };
     if (200..300).contains(&status) {
         return match serde_json::from_str::<DataEnvelope<DeviceToken>>(&body) {
@@ -304,6 +349,7 @@ fn poll_once(agent: &ureq::Agent, base_url: &str, device_code: &str) -> PollOutc
     match parse_error_envelope(&body).code() {
         Some("authorization_pending") => PollOutcome::Pending,
         Some("slow_down") => PollOutcome::SlowDown,
+        Some("already_claimed") => PollOutcome::AlreadyClaimed,
         Some("expired_token") => PollOutcome::Failed(
             "the login code expired before it was approved. Run `fallow cloud login` again."
                 .to_owned(),
@@ -340,15 +386,28 @@ fn machine_name(explicit: Option<&str>) -> Result<String, String> {
 }
 
 fn clean_machine_name(raw: &str) -> String {
-    raw.chars()
-        .filter(|ch| !ch.is_control())
-        .collect::<String>()
-        .trim()
-        .chars()
-        .take(MAX_MACHINE_NAME_CHARS)
-        .collect::<String>()
-        .trim()
-        .to_owned()
+    let printable: String = raw.chars().filter(|ch| !is_refused_in_name(*ch)).collect();
+    let mut name = String::new();
+    let mut units = 0;
+    for ch in printable.trim().chars() {
+        units += ch.len_utf16();
+        if units > MAX_MACHINE_NAME_UNITS {
+            break;
+        }
+        name.push(ch);
+    }
+    name.trim().to_owned()
+}
+
+/// The characters that Fallow Cloud refuses in a machine name: control
+/// characters, zero-width and direction marks, line and paragraph separators,
+/// bidi embeddings and isolates, and the byte order mark.
+fn is_refused_in_name(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+        )
 }
 
 fn host_name() -> Option<String> {
@@ -376,10 +435,21 @@ mod tests {
         let long = "a".repeat(100);
         assert_eq!(
             clean_machine_name(&long).chars().count(),
-            MAX_MACHINE_NAME_CHARS
+            MAX_MACHINE_NAME_UNITS
         );
         assert!(machine_name(Some("\n\t")).is_err());
         assert_eq!(machine_name(Some("ci-box")).unwrap(), "ci-box");
+    }
+
+    #[test]
+    fn machine_name_drops_what_the_cloud_refuses_and_counts_utf16_units() {
+        assert_eq!(
+            clean_machine_name("Bart\u{200B}'s\u{202E} Mac\u{FEFF}\u{2066}"),
+            "Bart's Mac"
+        );
+        let emoji = clean_machine_name(&"\u{1F600}".repeat(64));
+        assert_eq!(emoji.encode_utf16().count(), MAX_MACHINE_NAME_UNITS);
+        assert_eq!(emoji.chars().count(), MAX_MACHINE_NAME_UNITS / 2);
     }
 
     #[test]
