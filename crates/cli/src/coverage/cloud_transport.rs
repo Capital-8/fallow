@@ -138,6 +138,22 @@ pub fn send(
     send_with_timing(auth, url, body, operation, CloudTiming::DEFAULT)
 }
 
+/// [`send`] with a shorter total timeout per attempt, for a read that runs
+/// inside an editor hook.
+pub fn send_with_total_timeout(
+    auth: &CloudAuth,
+    url: &str,
+    body: &CloudBody<'_>,
+    operation: &str,
+    total_timeout_secs: u64,
+) -> Result<CloudOutcome, CloudError> {
+    let timing = CloudTiming {
+        total_timeout_secs,
+        ..CloudTiming::DEFAULT
+    };
+    send_with_timing(auth, url, body, operation, timing)
+}
+
 /// Timeouts and retry delay for [`send_with_timing`].
 #[derive(Clone, Copy)]
 struct CloudTiming {

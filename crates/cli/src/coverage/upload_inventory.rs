@@ -195,7 +195,8 @@ fn run_inner(
     }
 
     let api_key =
-        upload_common::resolve_api_key(args.api_key.as_deref()).map_err(UploadError::Validation)?;
+        upload_common::resolve_api_key(args.api_key.as_deref(), args.api_endpoint.as_deref())
+            .map_err(UploadError::Validation)?;
     upload(
         &prepared.project_id,
         args.api_endpoint.as_deref(),

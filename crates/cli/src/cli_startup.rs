@@ -725,6 +725,7 @@ pub fn command_without_global_baseline(command: &Command) -> Option<&'static str
         Command::CiTemplate { .. } => Some("ci-template"),
         Command::Migrate { .. } => Some("migrate"),
         Command::License { .. } => Some("license"),
+        Command::Cloud { .. } => Some("cloud"),
         Command::Telemetry { .. } => Some("telemetry"),
         Command::Coverage { .. } => Some("coverage"),
         Command::SetupHooks { .. } => Some("setup-hooks"),
@@ -774,6 +775,7 @@ fn command_rejects_output_gate(command: Option<&Command>) -> bool {
                 | Command::Flags { .. }
                 | Command::Migrate { .. }
                 | Command::License { .. }
+                | Command::Cloud { .. }
                 | Command::Coverage { .. }
                 | Command::Hooks { .. }
                 | Command::SetupHooks { .. }

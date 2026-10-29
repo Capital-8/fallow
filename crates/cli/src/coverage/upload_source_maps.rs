@@ -114,7 +114,7 @@ fn run_inner(args: &UploadSourceMapsArgs, root: &Path) -> Result<(), UploadSourc
         return Ok(());
     }
 
-    let api_key = resolve_api_key()?;
+    let api_key = resolve_api_key(args.endpoint.as_deref())?;
     upload_maps(args, root, &repo, &git_sha, &api_key, &maps)
 }
 
@@ -506,8 +506,9 @@ fn validate_file_name(file_name: &str) -> Result<(), UploadSourceMapsError> {
     Ok(())
 }
 
-fn resolve_api_key() -> Result<String, UploadSourceMapsError> {
-    env_non_empty("FALLOW_API_KEY")
+fn resolve_api_key(endpoint: Option<&str>) -> Result<String, UploadSourceMapsError> {
+    crate::coverage::credentials::resolve_api_key(None, endpoint)
+        .map(|resolved| resolved.key)
         .ok_or_else(|| UploadSourceMapsError::Validation("FALLOW_API_KEY is required".to_owned()))
 }
 

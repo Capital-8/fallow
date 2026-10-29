@@ -237,24 +237,17 @@ pub(super) fn take_last_two_segments(path: &str) -> Option<String> {
     (!owner.is_empty() && !repo.is_empty()).then(|| format!("{owner}/{repo}"))
 }
 
-pub(super) fn resolve_api_key(explicit: Option<&str>) -> Result<String, String> {
-    if let Some(explicit) = explicit {
-        let trimmed = explicit.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_owned());
-        }
-    }
-    if let Ok(from_env) = std::env::var("FALLOW_API_KEY") {
-        let trimmed = from_env.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_owned());
-        }
-    }
-    Err(
-        "no API key. Set $FALLOW_API_KEY or pass --api-key <KEY>. Generate at \
-         https://fallow.cloud/settings#api-keys."
-            .to_owned(),
-    )
+pub(super) fn resolve_api_key(
+    explicit: Option<&str>,
+    api_endpoint: Option<&str>,
+) -> Result<String, String> {
+    crate::coverage::credentials::resolve_api_key(explicit, api_endpoint)
+        .map(|resolved| resolved.key)
+        .ok_or_else(|| {
+            "no API key. Set $FALLOW_API_KEY or pass --api-key <KEY>. Generate at \
+             https://fallow.cloud/settings#api-keys."
+                .to_owned()
+        })
 }
 
 pub(super) fn endpoint_url(
@@ -709,7 +702,7 @@ mod tests {
     #[test]
     fn resolve_api_key_trims_explicit_value() {
         assert_eq!(
-            resolve_api_key(Some("  fallow_key_123  ")).unwrap(),
+            resolve_api_key(Some("  fallow_key_123  "), None).unwrap(),
             "fallow_key_123"
         );
     }
