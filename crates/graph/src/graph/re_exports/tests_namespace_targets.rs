@@ -1,120 +1,14 @@
-use std::path::PathBuf;
-
 use rustc_hash::FxHashMap;
 
+use super::test_support::{
+    ambient_imports, build_without_entry_points, discovered_files, export, is_used, module,
+    named_import, re_export,
+};
 use super::{ExposedNamespaceTargets, Exposure};
 use crate::graph::ModuleGraph;
-use crate::resolve::{
-    ResolveResult, ResolvedImport, ResolvedModule, ResolvedReExport, ResolvedReplacedModuleTarget,
-};
-use fallow_types::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
-use fallow_types::extract::{
-    ExportInfo, ExportName, ImportInfo, ImportedName, MemberAccess, ReExportInfo, VisibilityTag,
-};
-use oxc_span::Span;
-
-fn module(id: u32, name: &str) -> ResolvedModule {
-    ResolvedModule {
-        file_id: FileId(id),
-        path: PathBuf::from("/project").join(name),
-        ..Default::default()
-    }
-}
-
-fn relative_source(target: &ResolvedModule) -> String {
-    let file_name = target
-        .path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .expect("fixture paths have a UTF-8 file name");
-    format!("./{file_name}")
-}
-
-fn named_export(name: &str) -> ExportInfo {
-    ExportInfo {
-        name: ExportName::Named(name.to_string()),
-        local_name: Some(name.to_string()),
-        is_type_only: false,
-        is_side_effect_used: false,
-        visibility: VisibilityTag::None,
-        expected_unused_reason: None,
-        deprecated: false,
-        deprecated_reason: None,
-        span: Span::default(),
-        members: vec![],
-        super_class: None,
-    }
-}
-
-fn re_export(target: &ResolvedModule, exported_name: &str) -> ResolvedReExport {
-    ResolvedReExport {
-        info: ReExportInfo {
-            source: relative_source(target),
-            imported_name: "*".to_string(),
-            exported_name: exported_name.to_string(),
-            is_type_only: false,
-            span: Span::default(),
-            statement_span: Span::default(),
-            source_span: Span::default(),
-        },
-        target: ResolveResult::InternalModule(target.file_id),
-    }
-}
-
-/// The imports extraction records for `export *` inside a
-/// `declare module '...'` body. A type-only import with an empty local name
-/// marks the ambient form. The `export * as ns` spelling adds a `Default`
-/// import at the same span, which the graph reads as an observation of the
-/// whole namespace object.
-fn ambient_imports(target: &ResolvedModule, namespace_object: bool) -> Vec<ResolvedImport> {
-    let names = if namespace_object {
-        vec![ImportedName::Namespace, ImportedName::Default]
-    } else {
-        vec![ImportedName::Namespace]
-    };
-    names
-        .into_iter()
-        .map(|imported_name| ResolvedImport {
-            info: ImportInfo {
-                source: relative_source(target),
-                imported_name,
-                local_name: String::new(),
-                is_type_only: true,
-                is_type_only_star: false,
-                from_style: false,
-                span: Span::new(25, 65),
-                source_span: Span::new(50, 64),
-            },
-            target: ResolveResult::InternalModule(target.file_id),
-        })
-        .collect()
-}
-
-fn discovered_files(modules: &[ResolvedModule]) -> Vec<DiscoveredFile> {
-    modules
-        .iter()
-        .map(|module| DiscoveredFile {
-            id: module.file_id,
-            path: module.path.clone(),
-            size_bytes: 100,
-        })
-        .collect()
-}
-
-fn build_without_entry_points(modules: &[ResolvedModule]) -> ModuleGraph {
-    let graph = ModuleGraph::build(modules, &[], &discovered_files(modules));
-    assert!(graph.modules.iter().all(|module| !module.is_entry_point()));
-    graph
-}
-
-fn export_is_used(graph: &ModuleGraph, file: FileId, name: &str) -> bool {
-    let export = graph.modules[file.0 as usize]
-        .exports
-        .iter()
-        .find(|export| export.name.to_string() == name)
-        .expect("fixture export must exist");
-    !export.references.is_empty()
-}
+use crate::resolve::ResolvedReplacedModuleTarget;
+use fallow_types::discover::{EntryPoint, EntryPointSource, FileId};
+use fallow_types::extract::MemberAccess;
 
 #[test]
 fn ambient_namespace_forwards_default_namespace_exports_without_entry_points() {
@@ -123,12 +17,12 @@ fn ambient_namespace_forwards_default_namespace_exports_without_entry_points() {
         (Some(false), true, false),
         (Some(true), true, true),
     ] {
-        let mut ambient = module(0, "ambient.ts");
-        let mut leaf = module(1, "leaf.ts");
-        leaf.exports = vec![named_export("leafValue")].into();
-        let mut target = module(2, "target.ts");
-        target.exports = vec![named_export("namedValue")].into();
-        target.re_exports = vec![re_export(&leaf, "default")];
+        let mut ambient = module(0, "ambient");
+        let mut leaf = module(1, "leaf");
+        leaf.exports = vec![export("leafValue")].into();
+        let mut target = module(2, "target");
+        target.exports = vec![export("namedValue")].into();
+        target.re_exports = vec![re_export(&leaf, "*", "default")];
         if let Some(namespace_object) = observation {
             ambient.resolved_imports = ambient_imports(&target, namespace_object);
         }
@@ -136,12 +30,12 @@ fn ambient_namespace_forwards_default_namespace_exports_without_entry_points() {
         let graph = build_without_entry_points(&[ambient, leaf, target]);
 
         assert_eq!(
-            export_is_used(&graph, FileId(2), "namedValue"),
+            is_used(&graph, 2, "namedValue"),
             named_used,
             "ambient observation {observation:?} must preserve the named surface"
         );
         assert_eq!(
-            export_is_used(&graph, FileId(1), "leafValue"),
+            is_used(&graph, 1, "leafValue"),
             default_namespace_used,
             "ambient observation {observation:?}: only a namespace object forwards \
              the target's default namespace"
@@ -152,14 +46,14 @@ fn ambient_namespace_forwards_default_namespace_exports_without_entry_points() {
 #[test]
 fn namespace_exposure_includes_default_after_reaching_the_same_module_through_a_star() {
     for namespace_first in [false, true] {
-        let mut ambient = module(0, "ambient.ts");
-        let mut leaf = module(1, "leaf.ts");
-        leaf.exports = vec![named_export("leafValue")].into();
-        let mut member = module(2, "member.ts");
-        member.re_exports = vec![re_export(&leaf, "default")];
-        let mut seed = module(3, "seed.ts");
-        let star = re_export(&member, "*");
-        let namespace = re_export(&member, "ns");
+        let mut ambient = module(0, "ambient");
+        let mut leaf = module(1, "leaf");
+        leaf.exports = vec![export("leafValue")].into();
+        let mut member = module(2, "member");
+        member.re_exports = vec![re_export(&leaf, "*", "default")];
+        let mut seed = module(3, "seed");
+        let star = re_export(&member, "*", "*");
+        let namespace = re_export(&member, "*", "ns");
         seed.re_exports = if namespace_first {
             vec![namespace, star]
         } else {
@@ -170,7 +64,7 @@ fn namespace_exposure_includes_default_after_reaching_the_same_module_through_a_
         let graph = build_without_entry_points(&[ambient, leaf, member, seed]);
 
         assert!(
-            export_is_used(&graph, FileId(1), "leafValue"),
+            is_used(&graph, 1, "leafValue"),
             "namespace_first = {namespace_first}: namespace exposure must include default"
         );
     }
@@ -180,32 +74,20 @@ fn namespace_exposure_includes_default_after_reaching_the_same_module_through_a_
 /// Route provenance is only tracked when a test root replaces a module. With
 /// `consumer`, the test root reads one member of the namespace.
 fn namespace_re_export_with_route_provenance(consumer: bool) -> ModuleGraph {
-    let mut test_root = module(0, "root.test.ts");
+    let mut test_root = module(0, "root.test");
     if consumer {
-        test_root.resolved_imports = vec![ResolvedImport {
-            info: ImportInfo {
-                source: "./barrel.ts".to_string(),
-                imported_name: ImportedName::Named("ns".to_string()),
-                local_name: "ns".to_string(),
-                is_type_only: false,
-                is_type_only_star: false,
-                from_style: false,
-                span: Span::new(0, 10),
-                source_span: Span::default(),
-            },
-            target: ResolveResult::InternalModule(FileId(2)),
-        }];
+        test_root.resolved_imports = vec![named_import(2, "ns")];
         test_root.member_accesses = vec![MemberAccess {
             object: "ns".to_string(),
             member: "sourceValue".to_string(),
         }]
         .into();
     }
-    let mut source = module(1, "source.ts");
-    source.exports = vec![named_export("sourceValue")].into();
-    let mut barrel = module(2, "barrel.ts");
-    barrel.re_exports = vec![re_export(&source, "ns")];
-    let replaced = module(3, "replaced.ts");
+    let mut source = module(1, "source");
+    source.exports = vec![export("sourceValue")].into();
+    let mut barrel = module(2, "barrel");
+    barrel.re_exports = vec![re_export(&source, "*", "ns")];
+    let replaced = module(3, "replaced");
     let modules = [test_root, source, barrel, replaced];
     let files = discovered_files(&modules);
     let test_roots = [EntryPoint {
@@ -234,7 +116,7 @@ fn namespace_re_export_with_route_provenance(consumer: bool) -> ModuleGraph {
 fn unobserved_namespace_re_export_records_no_reference_route() {
     let graph = namespace_re_export_with_route_provenance(false);
 
-    assert!(!export_is_used(&graph, FileId(1), "sourceValue"));
+    assert!(!is_used(&graph, 1, "sourceValue"));
     assert!(
         graph.reference_routes.graphs.is_empty(),
         "no consumer can use a route for the unobserved namespace re-export"
@@ -247,7 +129,7 @@ fn unobserved_namespace_re_export_records_no_reference_route() {
 fn consumed_namespace_re_export_records_a_reference_route() {
     let graph = namespace_re_export_with_route_provenance(true);
 
-    assert!(export_is_used(&graph, FileId(1), "sourceValue"));
+    assert!(is_used(&graph, 1, "sourceValue"));
     assert!(
         !graph.reference_routes.graphs.is_empty(),
         "the consumer's namespace member access must record its route"

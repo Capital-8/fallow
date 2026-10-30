@@ -1,100 +1,14 @@
-use std::path::PathBuf;
-
+use super::test_support::{build, export, import, is_used, module, re_export, symbol};
 use crate::graph::ModuleGraph;
-use crate::resolve::{ResolveResult, ResolvedImport, ResolvedModule, ResolvedReExport};
-use fallow_types::discover::{DiscoveredFile, EntryPoint, EntryPointSource, FileId};
-use fallow_types::extract::{
-    ExportInfo, ExportName, ImportInfo, ImportedName, ReExportInfo, VisibilityTag,
-};
+use fallow_types::extract::ImportedName;
 
-fn module(id: u32, name: &str) -> ResolvedModule {
-    ResolvedModule {
-        file_id: FileId(id),
-        path: PathBuf::from(format!("/project/{name}.ts")),
-        ..Default::default()
-    }
-}
-
-fn export(name: &str) -> ExportInfo {
-    ExportInfo {
-        name: if name == "default" {
-            ExportName::Default
-        } else {
-            ExportName::Named(name.to_string())
-        },
-        local_name: Some(name.to_string()),
-        is_type_only: false,
-        visibility: VisibilityTag::None,
-        expected_unused_reason: None,
-        span: oxc_span::Span::default(),
-        members: vec![],
-        is_side_effect_used: false,
-        super_class: None,
-        deprecated: false,
-        deprecated_reason: None,
-    }
-}
-
-fn re_export(target: &ResolvedModule, imported: &str, exported: &str) -> ResolvedReExport {
-    ResolvedReExport {
-        info: ReExportInfo {
-            source: target.path.to_string_lossy().into_owned(),
-            imported_name: imported.to_string(),
-            exported_name: exported.to_string(),
-            is_type_only: false,
-            span: oxc_span::Span::default(),
-            statement_span: oxc_span::Span::default(),
-            source_span: oxc_span::Span::default(),
-        },
-        target: ResolveResult::InternalModule(target.file_id),
-    }
-}
-
-fn import(target: &ResolvedModule, imported: ImportedName, local: &str) -> ResolvedImport {
-    ResolvedImport {
-        info: ImportInfo {
-            source: target.path.to_string_lossy().into_owned(),
-            imported_name: imported,
-            local_name: local.to_string(),
-            is_type_only: false,
-            is_type_only_star: false,
-            from_style: false,
-            span: oxc_span::Span::default(),
-            source_span: oxc_span::Span::default(),
-        },
-        target: ResolveResult::InternalModule(target.file_id),
-    }
-}
-
-fn build(modules: &[ResolvedModule], entry: FileId) -> ModuleGraph {
-    let files: Vec<_> = modules
-        .iter()
-        .map(|module| DiscoveredFile {
-            id: module.file_id,
-            path: module.path.clone(),
-            size_bytes: 100,
-        })
-        .collect();
-    let entry_points = vec![EntryPoint {
-        path: modules[entry.0 as usize].path.clone(),
-        source: EntryPointSource::PackageJsonMain,
-    }];
-    ModuleGraph::build(modules, &entry_points, &files)
-}
-
-fn assert_credit(graph: &ModuleGraph, file: FileId, name: &str, expected: bool) {
-    let module = &graph.modules[file.0 as usize];
-    let export = module
-        .exports
-        .iter()
-        .find(|export| export.name.matches_str(name))
-        .expect("the target must export the name");
+fn assert_credit(graph: &ModuleGraph, module: usize, name: &str, expected: bool) {
     assert_eq!(
-        !export.references.is_empty(),
+        is_used(graph, module, name),
         expected,
         "{}:{name} has references {:?}",
-        module.path.display(),
-        export.references
+        graph.modules[module].path.display(),
+        symbol(graph, module, name).references
     );
 }
 
@@ -109,27 +23,27 @@ fn whole_object_graph(imported: ImportedName, exported: &str) -> ModuleGraph {
     barrel.re_exports = vec![re_export(&target, "*", exported)];
     consumer.resolved_imports = vec![import(&barrel, imported, "api")];
     consumer.whole_object_uses = vec!["api".to_string()].into();
-    build(&[consumer, barrel, target, leaf], FileId(0))
+    build(&[consumer, barrel, target, leaf], 0)
 }
 
 #[test]
 fn default_import_whole_object_use_credits_star_source() {
     let graph = whole_object_graph(ImportedName::Default, "default");
 
-    assert_credit(&graph, FileId(2), "direct", true);
+    assert_credit(&graph, 2, "direct", true);
     // The target credits its direct export without the whole-object use, so
     // only the leaf behind its star shows that the namespace object is exposed.
-    assert_credit(&graph, FileId(3), "value", true);
-    assert_credit(&graph, FileId(3), "default", false);
+    assert_credit(&graph, 3, "value", true);
+    assert_credit(&graph, 3, "default", false);
 }
 
 #[test]
 fn named_import_whole_object_use_credits_star_source() {
     let graph = whole_object_graph(ImportedName::Named("ns".to_string()), "ns");
 
-    assert_credit(&graph, FileId(2), "direct", true);
-    assert_credit(&graph, FileId(3), "value", true);
-    assert_credit(&graph, FileId(3), "default", false);
+    assert_credit(&graph, 2, "direct", true);
+    assert_credit(&graph, 3, "value", true);
+    assert_credit(&graph, 3, "default", false);
 }
 
 fn two_names_graph(whole_object_uses: &[&str]) -> ModuleGraph {
@@ -152,23 +66,23 @@ fn two_names_graph(whole_object_uses: &[&str]) -> ModuleGraph {
         .iter()
         .map(|name| (*name).to_string())
         .collect();
-    build(&[consumer, barrel, a, a_leaf, b, b_leaf], FileId(0))
+    build(&[consumer, barrel, a, a_leaf, b, b_leaf], 0)
 }
 
 #[test]
 fn whole_object_use_does_not_credit_another_import() {
     let graph = two_names_graph(&["bApi"]);
 
-    assert_credit(&graph, FileId(3), "aValue", false);
-    assert_credit(&graph, FileId(5), "bValue", true);
+    assert_credit(&graph, 3, "aValue", false);
+    assert_credit(&graph, 5, "bValue", true);
 }
 
 #[test]
 fn distinct_whole_object_imports_credit_both_star_sources() {
     let graph = two_names_graph(&["aApi", "bApi"]);
 
-    assert_credit(&graph, FileId(3), "aValue", true);
-    assert_credit(&graph, FileId(5), "bValue", true);
+    assert_credit(&graph, 3, "aValue", true);
+    assert_credit(&graph, 5, "bValue", true);
 }
 
 #[test]
@@ -185,12 +99,12 @@ fn entry_namespace_exposure_reaches_a_later_named_hop() {
     m1.re_exports = vec![re_export(&x, "ns2", "ns2")];
     entry.re_exports = vec![re_export(&m1, "*", "ns1")];
 
-    let graph = build(&[entry, m1, x, t2, leaf], FileId(0));
+    let graph = build(&[entry, m1, x, t2, leaf], 0);
 
-    assert_credit(&graph, FileId(3), "direct", true);
+    assert_credit(&graph, 3, "direct", true);
     // The named hop exposes t2 only after m1 joins the namespace closure.
-    assert_credit(&graph, FileId(4), "value", true);
-    assert_credit(&graph, FileId(4), "default", false);
+    assert_credit(&graph, 4, "value", true);
+    assert_credit(&graph, 4, "default", false);
 }
 
 fn named_hop_graph(shadowed: bool) -> ModuleGraph {
@@ -206,18 +120,18 @@ fn named_hop_graph(shadowed: bool) -> ModuleGraph {
     if shadowed {
         entry.exports = vec![export("api")].into();
     }
-    build(&[entry, barrel, target, leaf], FileId(0))
+    build(&[entry, barrel, target, leaf], 0)
 }
 
 #[test]
 fn local_export_blocks_a_named_namespace_hop() {
     let exposed = named_hop_graph(false);
-    assert_credit(&exposed, FileId(2), "direct", true);
-    assert_credit(&exposed, FileId(3), "value", true);
+    assert_credit(&exposed, 2, "direct", true);
+    assert_credit(&exposed, 3, "value", true);
 
     // Keep these exact unused assertions. A hop that skips the forwarding,
     // `failed` or `visited` check shows only as a wrong exposure here.
     let shadowed = named_hop_graph(true);
-    assert_credit(&shadowed, FileId(2), "direct", false);
-    assert_credit(&shadowed, FileId(3), "value", false);
+    assert_credit(&shadowed, 2, "direct", false);
+    assert_credit(&shadowed, 3, "value", false);
 }
