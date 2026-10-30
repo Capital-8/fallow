@@ -1,14 +1,12 @@
 //! `fallow coverage` - runtime coverage onboarding and inventory upload.
 //!
-//! Today the subtree holds four commands:
+//! Runtime coverage commands:
 //!
-//! - `setup`: resumable first-run state machine (optional license + sidecar
-//!   + recipe + auto-handoff to `fallow health --runtime-coverage`).
+//! - `setup`: resumable license, sidecar, recipe and first-analysis setup.
 //! - `analyze`: focused runtime coverage analysis. Local mode reads a coverage
 //!   artifact; cloud mode explicitly fetches runtime facts from Fallow Cloud.
 //! - `upload-inventory`: push a static function inventory to Fallow Cloud,
-//!   unlocking the `untracked` filter on the dashboard by pairing runtime
-//!   coverage data with the AST view of "every function that exists".
+//!   pairing runtime coverage with the complete static function list.
 //! - `upload-source-maps`: push build source maps so bundled runtime coverage
 //!   can resolve back to original source files. Each map also carries the
 //!   line starts of its generated script (`x_fallow_line_starts`).
@@ -50,6 +48,7 @@ pub mod credentials;
 pub mod file_context;
 mod generated_line_starts;
 pub mod login;
+mod partial_capture;
 mod setup_cli;
 mod setup_cloud;
 mod source_map_sources;
@@ -57,6 +56,7 @@ pub mod upload_common;
 mod upload_inventory;
 mod upload_source_maps;
 mod upload_static_findings;
+mod vercel_upload;
 
 const COVERAGE_DOCS_URL: &str = "https://fallow.tools/docs/analysis/runtime-coverage/";
 pub use crate::exit_codes::{
