@@ -1,4 +1,4 @@
-use super::test_support::{build, export, import, is_used, module, re_export};
+use super::test_support::{build, export, import, is_used, module, re_export, symbol};
 use crate::graph::ModuleGraph;
 use fallow_types::extract::ImportedName;
 
@@ -8,7 +8,7 @@ fn assert_credit(graph: &ModuleGraph, module: usize, name: &str, expected: bool)
         expected,
         "{}:{name} has references {:?}",
         graph.modules[module].path.display(),
-        super::test_support::symbol(graph, module, name).references
+        symbol(graph, module, name).references
     );
 }
 

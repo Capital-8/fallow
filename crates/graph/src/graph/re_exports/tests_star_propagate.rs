@@ -131,18 +131,13 @@ fn star_keeps_sibling_value_references_off_a_type_source() {
     for source_has_star in [false, true] {
         for triggering_is_type_only in [false, true] {
             let mut consumer = module(0, "a_consumer");
-            let mut type_import = type_import(1, "Item");
-            type_import.info.local_name = "ItemType".to_string();
-            consumer.resolved_imports = vec![type_import, named_import(1, "Item")];
+            let mut aliased_import = type_import(1, "Item");
+            aliased_import.info.local_name = "ItemType".to_string();
+            consumer.resolved_imports = vec![aliased_import, named_import(1, "Item")];
             let mut barrel = module(1, "b_barrel");
-            barrel.re_exports = vec![
-                {
-                    let mut star = re_export(2, "*", "*");
-                    star.info.is_type_only = triggering_is_type_only;
-                    star
-                },
-                re_export(3, "*", "*"),
-            ];
+            let mut triggering_star = re_export(2, "*", "*");
+            triggering_star.info.is_type_only = triggering_is_type_only;
+            barrel.re_exports = vec![triggering_star, re_export(3, "*", "*")];
             let mut source = module(2, "c_source");
             source.exports = vec![type_export("Item")].into();
             if source_has_star {
@@ -196,9 +191,9 @@ fn star_synthesizes_type_for_a_self_re_exported_alias() {
 #[test]
 fn star_keeps_a_shadowed_type_off_an_ambiguous_source() {
     let mut consumer = module(0, "a_consumer");
-    let mut type_import = type_import(2, "Item");
-    type_import.info.local_name = "ItemType".to_string();
-    consumer.resolved_imports = vec![named_import(1, "Item"), type_import];
+    let mut aliased_import = type_import(2, "Item");
+    aliased_import.info.local_name = "ItemType".to_string();
+    consumer.resolved_imports = vec![named_import(1, "Item"), aliased_import];
     let mut value_barrel = module(1, "b_value_barrel");
     value_barrel.re_exports = vec![re_export(3, "*", "*")];
     let mut type_barrel = module(2, "c_type_barrel");
