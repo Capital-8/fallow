@@ -8576,7 +8576,7 @@
     ]
   },
   "plugins": {
-    "count": 150,
+    "count": 151,
     "note": "Built-in framework plugins, auto-activated when their enabler dependency is present; run fallow list --plugins for the set active in a specific project",
     "names": [
       "nextjs",
@@ -8592,6 +8592,7 @@
       "redwoodsdk",
       "tanstack-router",
       "waku",
+      "solid-start",
       "react-native",
       "expo",
       "expo-router",
