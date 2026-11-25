@@ -58,6 +58,7 @@ impl Fixture {
             binary: fallow.to_string_lossy().into_owned(),
             cargo_fallow: cargo_fallow.to_string_lossy().into_owned(),
             tool_router: FallowMcp::tool_router(),
+            tasks: crate::tasks::TaskStore::new(),
         };
         Self { dir, server }
     }

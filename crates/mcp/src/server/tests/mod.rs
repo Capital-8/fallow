@@ -10,4 +10,6 @@ mod run;
 #[cfg(unix)]
 mod rust_route;
 mod server_info;
+#[cfg(unix)]
+mod tasks;
 mod tool_descriptions;
