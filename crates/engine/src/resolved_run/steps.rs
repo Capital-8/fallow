@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use fallow_config::{
-    CommandKind, ConfigInputs, ConfigInputsSnapshot, EnvSnapshot, EnvVar, FallowConfig,
-    ResolvedConfig, WorkspaceDiagnostic, WorkspaceInfo,
+    AnalysisSnapshot, CommandKind, ConfigInputs, ConfigInputsSnapshot, EnvSnapshot, EnvVar,
+    FallowConfig, ResolvedConfig, WorkspaceDiagnostic, WorkspaceInfo,
 };
 use rustc_hash::FxHashSet;
 
@@ -268,19 +268,30 @@ pub(crate) fn validate_command_config(
     command: CommandKind,
     root: &Path,
     config: &FallowConfig,
+    snapshot: AnalysisSnapshot,
 ) -> EngineResult<()> {
     match command {
-        CommandKind::PluginCheck => validate_boundaries_and_rule_packs(root, config),
+        CommandKind::PluginCheck => {
+            validate_snapshot_boundaries_and_rule_packs(root, config, snapshot)
+        }
         CommandKind::CoverageUpload => Ok(()),
-        _ => validate_config(root, config),
+        _ => {
+            validate_external_plugins(root, config)?;
+            validate_snapshot_boundaries_and_rule_packs(root, config, snapshot)
+        }
     }
 }
 
 /// Validate the external plugins, the boundaries and the rule packs.
 pub(crate) fn validate_config(root: &Path, config: &FallowConfig) -> EngineResult<()> {
-    fallow_config::discover_and_validate_external_plugins(root, &config.plugins)
-        .map_err(|errors| joined_config_errors("invalid external plugin definition", &errors))?;
+    validate_external_plugins(root, config)?;
     validate_boundaries_and_rule_packs(root, config)
+}
+
+fn validate_external_plugins(root: &Path, config: &FallowConfig) -> EngineResult<()> {
+    fallow_config::discover_and_validate_external_plugins(root, &config.plugins)
+        .map_err(|errors| joined_config_errors("invalid external plugin definition", &errors))
+        .map(drop)
 }
 
 /// Validate the boundaries and the rule packs.
@@ -288,8 +299,17 @@ pub(crate) fn validate_boundaries_and_rule_packs(
     root: &Path,
     config: &FallowConfig,
 ) -> EngineResult<()> {
+    validate_snapshot_boundaries_and_rule_packs(root, config, AnalysisSnapshot::Current)
+}
+
+/// Validate the boundaries and the rule packs of the given revision.
+fn validate_snapshot_boundaries_and_rule_packs(
+    root: &Path,
+    config: &FallowConfig,
+    snapshot: AnalysisSnapshot,
+) -> EngineResult<()> {
     config
-        .validate_resolved_boundaries(root)
+        .validate_snapshot_boundaries(root, snapshot)
         .map_err(|errors| joined_config_errors("invalid boundary configuration", &errors))?;
     let packs = fallow_config::load_rule_packs(root, &config.rule_packs)
         .map_err(|errors| joined_config_errors("invalid rule pack", &errors))?;
